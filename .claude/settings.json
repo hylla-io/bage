@@ -1,0 +1,62 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ta__schema",
+      "mcp__ta__create",
+      "mcp__ta__update",
+      "mcp__ta__list_sections",
+      "mcp__ta__get",
+      "mcp__ta__search",
+      "mcp__ta__delete",
+      "Bash(go:*)",
+      "Bash(mage:*)"
+    ],
+    "deny": [
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go run:*)",
+      "Bash(go install:*)",
+      "Bash(go fmt:*)",
+      "Bash(go tool:*)",
+      "Bash(go generate:*)",
+      "Bash(go get:*)",
+      "Bash(go work:*)",
+      "Bash(gofmt:*)",
+      "Bash(gofumpt:*)",
+      "Bash(gopls:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "ta"
+  ],
+  "enabledPlugins": {
+    "context7@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"$CLAUDE_PROJECT_DIR/.claude/hooks/ta_action_gate.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"$CLAUDE_PROJECT_DIR/.claude/hooks/post_tooluse_agent_audit.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

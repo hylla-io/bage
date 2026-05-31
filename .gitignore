@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Go build outputs
+/bin/
+coverage.out
+
+# Agent / tool state — track project-level config (.claude/agents/*.md +
+# .claude/settings.json + .claude/hooks/) so subagent personas + tool
+# allowlists travel with the repo. Per-machine variants stay ignored.
+.claude/*.local.json
+.claude/sessions/
+.claude/agent-runs/
+.claude/hooks/ta_gate_debug.log
+.claude/hooks/agent_audit_errors.log
+
+# ta runtime state — track only the schema + bundled agents/config; runtime
+# DBs, logs, and cascade scratch stay ignored.
+.ta/*
+!.ta/schema.toml
+
+# Editor / IDE cruft
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
