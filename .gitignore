@@ -1,9 +1,37 @@
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
-# Go build outputs
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Go build outputs / test binaries
 /bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
 coverage.out
+coverage.txt
+
+# Go workspace files (machine-local, never committed)
+go.work
+go.work.sum
 
 # Agent / tool state — track project-level config (.claude/agents/*.md +
 # .claude/settings.json + .claude/hooks/) so subagent personas + tool
@@ -22,12 +50,22 @@ coverage.out
 # Editor / IDE cruft
 .vscode/
 .idea/
+.zed/
+.fleet/
+.vs/
 *.swp
 *.swo
+*.bak
 
-# Secrets
+# Logs
+*.log
+
+# Secrets — never commit credentials or local env
 .env
-.env.local
+.env.*
+*.env
 *.pem
 *.key
+*.p12
+*.pfx
 graphify-out/
