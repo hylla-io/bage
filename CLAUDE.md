@@ -2,9 +2,11 @@
 
 Project-local guidance for working inside the `bage` tree. Global rules (Tillsyn coordination, Section 0 reasoning, evidence sources, worktree hygiene, output style) live at `~/.claude/CLAUDE.md` and are NOT duplicated here.
 
+**Shorthand / domain language:** see [`CONTEXT.md`](CONTEXT.md) for the project glossary. In particular **`omp`** = oh-my-pi (`can1357/oh-my-pi`), the hash-anchored editor Båge's drift discipline must match in capability + safety; **`region_hash`** is Båge's per-block content anchor. All dispatched subagents working on edit/drift/concurrency must speak this shorthand.
+
 ## Architecture & Cascade Tracking
 
-Freshly-bootstrapped Go-only sibling. The cross-project agent-dispatch + persona architecture (per-persona `settings.json` + `bin/agent-dispatch.sh` + `.claude/hooks/`) was sync'd from the source-of-truth sibling `ta`; the sync file-list + dev bootstrap checklist live in `R_SHIP_HANDOFF.md`. Per `feedback_no_sibling_git_mutations`, orch never runs git here — dev owns git history.
+Freshly-bootstrapped Go-only sibling. The cross-project agent-dispatch + persona architecture (per-persona `settings.json` + `bin/agent-dispatch.sh` + `.claude/hooks/`) was sync'd from the source-of-truth sibling `ta`; the sync file-list + dev bootstrap checklist live in `R_SHIP_HANDOFF.md`. Per separate-repo discipline, `bage` has its own `.git` + remote: **orch DOES commit and push `bage`** to bage's own origin. The rule is only that bage's git stays SEPARATE — never bundle bage changes into a sibling repo's commit (`hylla`, `ta`), and run any sibling git op against that sibling's own checkout/remote.
 
 - **Cascade tracking uses the `ta` MCP** (`mcp__ta__*` on `.ta/`-managed records), **NEVER `tillsyn` MCP** — only the `tillsyn` repo has Tillsyn MCP wired. Any leftover textual `mcp__tillsyn__*` ref in a persona body is INERT here.
 - **`ta` records are the work-tracking source of truth.** Built-in `TaskCreate`/`TaskUpdate` are fine for granular sub-steps or tiny reminders — anything durable goes in a `ta` record.

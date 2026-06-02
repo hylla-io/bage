@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "graphify": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with",
+        "graphifyy",
+        "--with",
+        "mcp",
+        "-m",
+        "graphify.serve",
+        "/Users/evanschultz/Documents/Code/hylla/bage/main/graphify-out/graph.json"
+      ]
+    }
+  }
+}

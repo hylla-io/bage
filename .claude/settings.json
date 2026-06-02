@@ -9,7 +9,9 @@
       "mcp__ta__search",
       "mcp__ta__delete",
       "Bash(go:*)",
-      "Bash(mage:*)"
+      "Bash(mage:*)",
+      "WebSearch",
+      "WebFetch"
     ],
     "deny": [
       "Bash(go build:*)",
@@ -20,7 +22,6 @@
       "Bash(go fmt:*)",
       "Bash(go tool:*)",
       "Bash(go generate:*)",
-      "Bash(go get:*)",
       "Bash(go work:*)",
       "Bash(gofmt:*)",
       "Bash(gofumpt:*)",
@@ -28,9 +29,7 @@
     ]
   },
   "enableAllProjectMcpServers": true,
-  "enabledMcpjsonServers": [
-    "ta"
-  ],
+  "enabledMcpjsonServers": ["ta"],
   "enabledPlugins": {
     "context7@claude-plugins-official": true,
     "gopls-lsp@claude-plugins-official": true
