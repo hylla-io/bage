@@ -98,3 +98,13 @@ The `ta` MCP server pins one project per process. Either:
   ```json
   {"mcpServers":{"ta":{"command":"ta","args":["--project","/abs/path/to/project"]}}}
   ```
+
+## Dogfooding — use bage to edit bage
+
+Orch AND subagents edit files in THIS repo with **bage itself** (`bage apply` / `bage rename`, built from `cmd/bage`). Built-in Edit is a **fallback only** — used when bage genuinely cannot do it.
+
+- **Edits to existing files → `bage apply`** (`--file`, `--line`/`--lines`/`--start`/`--end`, `--text`/`--text-file`, optional `--region-hash`, `--lang` empty = auto-detect). Symbol renames → `bage rename` (LSP).
+- **Honest constraint:** bage has no read and no create-file — it edits existing files only. READING and CREATING NEW FILES use built-in tools (the documented fallback); do not pretend otherwise.
+- **Report findings:** any bage friction/bug goes in `BAGE_DOGFOOD_FINDINGS.md`, then gets fixed (TDD).
+- **Test parity:** when dogfooding sharpens Go, update tests + code for ALL other file types/langs to match — do not let them fall behind.
+- Goal: dogfood until bage is proven excellent for every lang/file type, and right for what Hylla needs (keep `hylla/polyglot-foundation/BAGE_UPDATE.md` current).
