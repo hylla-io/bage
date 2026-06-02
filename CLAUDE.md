@@ -108,3 +108,9 @@ Orch AND subagents edit files in THIS repo with **bage itself** (`bage apply` / 
 - **Report findings:** any bage friction/bug goes in `BAGE_DOGFOOD_FINDINGS.md`, then gets fixed (TDD).
 - **Test parity:** when dogfooding sharpens Go, update tests + code for ALL other file types/langs to match — do not let them fall behind.
 - Goal: dogfood until bage is proven excellent for every lang/file type, and right for what Hylla needs (keep `hylla/polyglot-foundation/BAGE_UPDATE.md` current).
+
+## Git workflow & versioning
+
+- **All work goes on a branch → PR → CI green → merge.** Never push code directly to `main` (the repo is public; the PR + `mage ci` check is the gate).
+- **Delete merged branches immediately — local AND remote**: `git branch -d <branch> && git push origin --delete <branch>`. Never leave a merged branch lying around (in the worktree dirs, locally, or on the remote).
+- **Semver bumps follow CODE, never docs.** Tag a new version on `main` after a merged PR that changes CODE: a feature → bump MINOR (`v0.N.0`), a fix → bump PATCH (`v0.x.P`); while pre-1.0, a breaking change also bumps MINOR. A **doc-only** PR (README, CONTRIBUTING, CLAUDE.md, SPEC, code comments) gets **NO version bump and NO tag**. Tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
