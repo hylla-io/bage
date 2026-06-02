@@ -12,6 +12,7 @@ import (
 	"github.com/hylla-io/bage/internal/hashing"
 	"github.com/hylla-io/bage/internal/locator"
 	"github.com/hylla-io/bage/internal/lsp"
+	"github.com/hylla-io/bage/internal/normalize"
 	"github.com/hylla-io/bage/internal/parser"
 	"github.com/hylla-io/bage/internal/parser/treesitter"
 	"github.com/hylla-io/bage/internal/region"
@@ -130,6 +131,29 @@ func NewParser() ParserPort { return treesitter.New() }
 // falling back to the grammar-free text mode (never LangUnknown) so any file can
 // be opened and losslessly round-tripped. See parser.LangForPath.
 func LangForPath(path string) Lang { return parser.LangForPath(path) }
+
+// Normalize applies Båge's canonical content-normalization rule and returns a
+// new slice: drop all carriage returns, strip trailing horizontal whitespace per
+// line, then strip ALL leading BOMs LAST (the idempotency fixpoint). Hylla MUST
+// use this exact rule so the normalized hashes agree cross-system — it is the
+// single source of truth for the contract (HYLLA_NODE_CONTRACT §4).
+func Normalize(b []byte) []byte { return normalize.Normalize(b) }
+
+// RawHash returns the digest of the RAW bytes (gates byte-offset validity),
+// encoded as 16-char zero-padded lowercase hex by h. Pass XXHasher{} to match
+// the contract.
+func RawHash(h Hasher, raw []byte) string { return hashing.RawHash(h, raw) }
+
+// NormHash returns the digest of Normalize(raw) — the content anchor used for
+// file_norm_hash, encoded as 16-char zero-padded lowercase hex by h. Pass
+// XXHasher{} to match the contract.
+func NormHash(h Hasher, raw []byte) string { return hashing.NormHash(h, raw) }
+
+// RegionHash returns the region_hash for src[start:end]: the normalized-bytes
+// digest (XXHasher %016x) that anchors a region by content, byte-identical to
+// what Hylla stores per node (HYLLA_NODE_CONTRACT §4). This is the cross-system
+// identity/conflict anchor; Hylla computes the same string for the same bytes.
+func RegionHash(src []byte, start, end int) string { return region.HashRegion(src, start, end) }
 
 // Config configures an Editor. WALDir and Lang are required; Hasher defaults to
 // XXHasher{} when nil. Formatter and Linter are optional pipeline steps run over
