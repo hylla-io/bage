@@ -117,6 +117,34 @@ func TestRunApplyLineRangeReplacesLine(t *testing.T) {
 	}
 }
 
+// TestRunApplyLineIsNewlineAgnostic asserts line addressing replaces line
+// CONTENT and preserves structure: a surrounding blank line survives, and
+// --text behaves identically with or without a trailing newline (it never merges
+// the line into the next or injects a blank line). Regression for a dogfood-found
+// bug where `--line N --text x` (no newline) merged line N into N+1.
+func TestRunApplyLineIsNewlineAgnostic(t *testing.T) {
+	const src = "package main\n\nvar x = 1\n\nvar y = 2\n"
+	const want = "package main\n\nvar x = 99\n\nvar y = 2\n"
+
+	for _, text := range []string{"var x = 99", "var x = 99\n"} {
+		path := writeTemp(t, src)
+		var stdout, stderr bytes.Buffer
+		err := run(context.Background(), []string{
+			"apply", "--file", path, "--line", "3", "--text", text,
+		}, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("run apply (text=%q): %v\nstderr: %s", text, err, stderr.String())
+		}
+		got := readFile(t, path)
+		if got != want {
+			t.Fatalf("text=%q:\n got: %q\nwant: %q", text, got, want)
+		}
+		if !parses(t, got) {
+			t.Fatalf("text=%q: edited file does not parse:\n%s", text, got)
+		}
+	}
+}
+
 // TestRunApplyRegionHashRelocatesAfterShift anchors the edit with a region_hash
 // and supplies a STALE byte range after the target moved (a benign shift). The
 // resolver must reparse, match the region_hash to the relocated node, and apply

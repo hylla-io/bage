@@ -99,7 +99,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		end        = fs.Int("end", -1, "exclusive end byte of the region to replace")
 		text       = fs.String("text", "", "replacement text for the region")
 		regionHash = fs.String("region-hash", "", "optional region_hash anchoring the region by content")
-		langStr    = fs.String("lang", "go", "source language (currently only 'go')")
+		langStr    = fs.String("lang", "", "source language by canonical name (e.g. go, python, markdown); empty = auto-detect from --file path")
 		fmtCmd     = fs.String("fmt", "", "optional formatter command run on the staged bytes")
 		lintCmd    = fs.String("lint", "", "optional linter command run on the staged bytes")
 	)
@@ -141,7 +141,15 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		WALDir:    os.TempDir(),
 	}
 
-	edits := []region.Edit{{Region: reg, NewText: *text}}
+	newText := *text
+	if *line >= 0 || *lines != "" {
+		// Line addressing replaces line CONTENT — the trailing newline is
+		// structural and preserved by applyRegion — so a trailing newline in
+		// --text would double it. Strip one so `--text "x"` and `--text "x\n"`
+		// behave identically and never merge or split lines.
+		newText = strings.TrimSuffix(newText, "\n")
+	}
+	edits := []region.Edit{{Region: reg, NewText: newText}}
 	anchors := []region.FileAnchor{fileAnchor(*file, live, hasher)}
 
 	plan, err := sess.Prepare(ctx, edits, anchors)
@@ -189,13 +197,23 @@ func applyRegion(file string, live []byte, line int, lines string, start, end in
 			return region.Region{}, err
 		}
 		li := region.NewLineIndex(live)
-		return li.ResolveLines(region.Region{
+		reg := li.ResolveLines(region.Region{
 			Path:       file,
 			StartByte:  region.LineSentinel,
 			StartLine:  startLine,
 			EndLine:    endLine,
 			RegionHash: regionHash,
-		}), nil
+		})
+		// A resolved line range spans THROUGH the final line's trailing newline.
+		// Exclude that newline so --text replaces the line CONTENT and the line
+		// structure survives even when --text has no trailing newline (otherwise
+		// `--line 5 --text x` would merge line 5 into line 6). A final line with
+		// no trailing newline is left as-is.
+		if reg.EndByte > reg.StartByte && reg.EndByte <= len(live) && live[reg.EndByte-1] == '\n' {
+			reg.EndByte--
+			reg = li.FillLineCols(reg)
+		}
+		return reg, nil
 	default:
 		return region.Region{}, errors.New("bage apply: one of --line, --lines, or --start/--end is required")
 	}
@@ -428,16 +446,22 @@ func printResults(stdout io.Writer, results []region.EditResult) {
 	}
 }
 
-// parseLang maps the --lang flag to a parser.Lang. Only Go is supported in the
-// foundation drop; any other value is an explicit usage error rather than a
-// silent fallthrough to LangUnknown.
+// parseLang maps the --lang flag to a parser.Lang. An EMPTY string resolves to
+// LangUnknown, which tells the session to auto-detect each file's language from
+// its path via parser.LangForPath — so `bage apply` works on any file type
+// without naming the language. A non-empty value must match a known language's
+// canonical name (e.g. "go", "python", "markdown", "text"); anything else is an
+// explicit usage error rather than a silent fallthrough.
 func parseLang(s string) (parser.Lang, error) {
-	switch s {
-	case "go":
-		return parser.LangGo, nil
-	default:
-		return parser.LangUnknown, fmt.Errorf("bage apply: unsupported --lang %q (only 'go')", s)
+	if s == "" {
+		return parser.LangUnknown, nil
 	}
+	for l := parser.LangGo; l <= parser.LangText; l++ {
+		if l.String() == s {
+			return l, nil
+		}
+	}
+	return parser.LangUnknown, fmt.Errorf("bage apply: unsupported --lang %q", s)
 }
 
 // atoiPositive parses s as an integer that must be >= 1, used for 1-based line
