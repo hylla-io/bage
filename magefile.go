@@ -150,6 +150,37 @@ func Cover() error {
 	return run("go", "tool", "cover", "-func=coverage.out")
 }
 
+// LSP runs the containerized language-server integration suite (TestLSPContainerRename).
+// It is SLOW: each language row pulls a base image, installs the server, and
+// round-trips a real rename, so it lives outside `mage ci`. Unlike the default
+// suite it sets BAGE_REQUIRE_DOCKER=1, which suppresses the in-test skip — a
+// missing Docker provider then FAILS loudly instead of letting a green run hide
+// absent LSP coverage. Requires a running container provider (Docker).
+func LSP() error {
+	if err := os.Setenv("BAGE_REQUIRE_DOCKER", "1"); err != nil {
+		return fmt.Errorf("lsp: set BAGE_REQUIRE_DOCKER: %w", err)
+	}
+	return runGoTest("./internal/lsp/", "-run", "TestLSPContainerRename", "-count=1", "-timeout", "30m")
+}
+
+// Fuzz actively fuzzes Båge's property-based targets for a short burst each: the
+// lossless text round-trip and the normalize idempotency that region_hash
+// depends on. Each runs in its own `go test -fuzz` invocation (the tool fuzzes
+// one target at a time). Orchestrator surface; not part of the fast CI gate.
+func Fuzz() error {
+	targets := []struct{ pkg, fn string }{
+		{"./internal/normalize/", "FuzzNormalizeIdempotent"},
+		{"./internal/parser/treesitter/", "FuzzTextFallbackLossless"},
+	}
+	for _, tgt := range targets {
+		fmt.Fprintf(os.Stderr, "== fuzzing %s %s ==\n", tgt.pkg, tgt.fn)
+		if err := run("go", "test", "-run", "^$", "-fuzz", "^"+tgt.fn+"$", "-fuzztime", "10s", tgt.pkg); err != nil {
+			return fmt.Errorf("fuzz %s: %w", tgt.fn, err)
+		}
+	}
+	return nil
+}
+
 // runGoTest invokes `go test -json [extraArgs] [$MAGE_GO_TEST_FLAGS] <pkg>` and
 // pipes the event stream through laslig/gotestout for TTY-aware rendering. NO
 // race detection or coverage in the baseline — callers add `-race`/`-cover`/etc.

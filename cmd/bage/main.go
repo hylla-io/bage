@@ -1,12 +1,493 @@
-// Command bage is the entrypoint for the bage CLI.
+// Command bage is the standalone entrypoint for the Båge round-trip file
+// editor (SPEC §6 standalone mode): files + LSP, no graph, sharing the same
+// region/session edit engine as integrated mode.
 //
-// Bootstrap skeleton — replace with the real implementation once bage's
-// domain is decided. Present so `mage build` has an entrypoint to compile and
-// the canonical magefile's cmd/*/main.go glob resolves.
+// main stays thin — it parses os.Args and delegates to run, the testable core
+// that wires the treesitter parser, an xxHash hasher, and optional format/lint
+// commands into a session and applies region-anchored edits (SPEC §8).
 package main
 
-import "fmt"
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
+	"go.lsp.dev/uri"
+
+	"github.com/hylla-io/bage/internal/format"
+	"github.com/hylla-io/bage/internal/hashing"
+	"github.com/hylla-io/bage/internal/locator"
+	"github.com/hylla-io/bage/internal/lsp"
+	"github.com/hylla-io/bage/internal/parser"
+	"github.com/hylla-io/bage/internal/parser/treesitter"
+	"github.com/hylla-io/bage/internal/region"
+	"github.com/hylla-io/bage/internal/session"
+)
+
+// usage is the top-level usage string printed when no subcommand, an unknown
+// subcommand, or a usage error is encountered.
+const usage = `bage — round-trip file editor (standalone)
+
+usage:
+  bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD]
+  bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
+
+apply replaces a region of F with text. The region is addressed by a single
+line (--line), a 1-based inclusive line range (--lines L1-L2), or a raw byte
+range (--start/--end). An optional --region-hash anchors the region by content
+so a benign concurrent shift re-resolves and a real conflict hard-rejects. The
+optional formatter and linter run on the staged bytes; the result must still
+parse. On drift, conflict, lint, or parse failure nothing is written. On success
+the per-edit EditResult (changed byte range, recomputed hashes, new line range)
+is printed.
+
+rename drives an LSP server (default gopls) to rename the symbol at the
+zero-based (line, col) UTF-16 position in F to NAME, converts the resulting
+WorkspaceEdit into region-anchored edits (each grounded against the file's live
+bytes via a computed region_hash), and applies every affected file atomically
+via the same Prepare/Commit engine. On drift, conflict, or parse failure nothing
+is written.`
+
+// main wires the process entrypoint to run and maps any error to exit code 1.
 func main() {
-	fmt.Println("bage: bootstrap skeleton — not yet implemented")
+	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		os.Exit(1)
+	}
+}
+
+// run is the testable CLI core. It dispatches on the first argument to a
+// subcommand handler, writing results to stdout and errors to stderr. It
+// returns a non-nil error (already reported to stderr) when the command fails,
+// so main can map that to a non-zero exit without re-printing.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, usage)
+		return errors.New("bage: no subcommand")
+	}
+
+	switch args[0] {
+	case "apply":
+		return runApply(ctx, args[1:], stdout, stderr)
+	case "rename":
+		return runRename(ctx, args[1:], stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, usage)
+		return fmt.Errorf("bage: unknown subcommand %q", args[0])
+	}
+}
+
+// runApply parses the apply flags, builds a single region-anchored Edit plus the
+// file's drift anchor, and drives a session Prepare/Commit. On any error it
+// prints a clear message to stderr and returns the error; on success it prints
+// each resulting EditResult to stdout. Nothing is written on drift, conflict,
+// lint, or parse failure.
+func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		file       = fs.String("file", "", "path of the file to edit (required)")
+		line       = fs.Int("line", -1, "1-based line to replace (mutually exclusive with --lines / --start)")
+		lines      = fs.String("lines", "", "1-based inclusive line range L1-L2 to replace")
+		start      = fs.Int("start", -1, "inclusive start byte of the region to replace")
+		end        = fs.Int("end", -1, "exclusive end byte of the region to replace")
+		text       = fs.String("text", "", "replacement text for the region")
+		regionHash = fs.String("region-hash", "", "optional region_hash anchoring the region by content")
+		langStr    = fs.String("lang", "go", "source language (currently only 'go')")
+		fmtCmd     = fs.String("fmt", "", "optional formatter command run on the staged bytes")
+		lintCmd    = fs.String("lint", "", "optional linter command run on the staged bytes")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("bage apply: %w", err)
+	}
+
+	if *file == "" {
+		fmt.Fprintln(stderr, "bage apply: --file is required")
+		return errors.New("bage apply: --file is required")
+	}
+
+	lang, err := parseLang(*langStr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
+	}
+
+	live, err := os.ReadFile(*file)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage apply: read %q: %v\n", *file, err)
+		return fmt.Errorf("bage apply: read %q: %w", *file, err)
+	}
+
+	reg, err := applyRegion(*file, live, *line, *lines, *start, *end, *regionHash)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
+	}
+
+	hasher := hashing.XXHasher{}
+	sess := &session.Session{
+		Parser:    treesitter.New(),
+		Hasher:    hasher,
+		Formatter: formatterFor(*fmtCmd),
+		Linter:    linterFor(*lintCmd),
+		Lang:      lang,
+		WALDir:    os.TempDir(),
+	}
+
+	edits := []region.Edit{{Region: reg, NewText: *text}}
+	anchors := []region.FileAnchor{fileAnchor(*file, live, hasher)}
+
+	plan, err := sess.Prepare(ctx, edits, anchors)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage apply: %v\n", err)
+		return fmt.Errorf("bage apply: prepare: %w", err)
+	}
+	results, err := sess.Commit(plan)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage apply: %v\n", err)
+		return fmt.Errorf("bage apply: commit: %w", err)
+	}
+
+	printResults(stdout, results)
+	return nil
+}
+
+// applyRegion builds the region-anchored target from the apply flags. Exactly
+// one addressing mode must be supplied: a single line (--line), a 1-based
+// inclusive line range (--lines), or a raw byte range (--start/--end). Line
+// addressing is resolved to a concrete byte range against the live bytes via a
+// LineIndex; the optional region_hash is attached unchanged so the resolver can
+// verify content and relocate a benign shift.
+func applyRegion(file string, live []byte, line int, lines string, start, end int, regionHash string) (region.Region, error) {
+	byteMode := start >= 0 || end >= 0
+	lineMode := line >= 0 || lines != ""
+
+	switch {
+	case byteMode && lineMode:
+		return region.Region{}, errors.New("bage apply: choose one of --line/--lines or --start/--end, not both")
+	case byteMode:
+		if start < 0 || end < 0 {
+			return region.Region{}, errors.New("bage apply: --start and --end are both required for byte addressing")
+		}
+		li := region.NewLineIndex(live)
+		return li.FillLineCols(region.Region{
+			Path:       file,
+			StartByte:  start,
+			EndByte:    end,
+			RegionHash: regionHash,
+		}), nil
+	case lineMode:
+		startLine, endLine, err := parseLineRange(line, lines)
+		if err != nil {
+			return region.Region{}, err
+		}
+		li := region.NewLineIndex(live)
+		return li.ResolveLines(region.Region{
+			Path:       file,
+			StartByte:  region.LineSentinel,
+			StartLine:  startLine,
+			EndLine:    endLine,
+			RegionHash: regionHash,
+		}), nil
+	default:
+		return region.Region{}, errors.New("bage apply: one of --line, --lines, or --start/--end is required")
+	}
+}
+
+// parseLineRange resolves the single-line / line-range flags to a 1-based
+// inclusive [startLine, endLine]. --line and --lines are mutually exclusive;
+// --lines must be "L1-L2" with L1 <= L2 and both >= 1.
+func parseLineRange(line int, lines string) (startLine, endLine int, err error) {
+	if line >= 0 && lines != "" {
+		return 0, 0, errors.New("bage apply: choose one of --line or --lines, not both")
+	}
+	if line >= 0 {
+		if line < 1 {
+			return 0, 0, errors.New("bage apply: --line must be >= 1")
+		}
+		return line, line, nil
+	}
+	lo, hi, ok := strings.Cut(lines, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("bage apply: --lines %q must be L1-L2", lines)
+	}
+	startLine, err = atoiPositive(strings.TrimSpace(lo))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bage apply: --lines start: %w", err)
+	}
+	endLine, err = atoiPositive(strings.TrimSpace(hi))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bage apply: --lines end: %w", err)
+	}
+	if startLine > endLine {
+		return 0, 0, fmt.Errorf("bage apply: --lines %q has start past end", lines)
+	}
+	return startLine, endLine, nil
+}
+
+// runRename parses the rename flags, drives an LSP rename, converts the server's
+// WorkspaceEdit into region-anchored edits grounded against each file's live
+// bytes (per-edit region_hash computed from the targeted byte range), and applies
+// them all atomically via a single session Prepare/Commit. On any error it prints
+// a clear message to stderr and returns it; on success it prints each affected
+// file's EditResult(s) to stdout. Nothing is written on drift, parse, or LSP
+// failure.
+func runRename(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("rename", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		file    = fs.String("file", "", "path of the file containing the symbol (required)")
+		line    = fs.Int("line", -1, "zero-based line of the symbol (required)")
+		col     = fs.Int("col", -1, "zero-based UTF-16 column of the symbol (required)")
+		newName = fs.String("new", "", "new name for the symbol (required)")
+		lspCmd  = fs.String("lsp", "gopls", "LSP server command to drive the rename")
+		langStr = fs.String("lang", "go", "source language (currently only 'go')")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("bage rename: %w", err)
+	}
+
+	if *file == "" {
+		fmt.Fprintln(stderr, "bage rename: --file is required")
+		return errors.New("bage rename: --file is required")
+	}
+	if *line < 0 || *col < 0 {
+		fmt.Fprintln(stderr, "bage rename: --line and --col are required and must be >= 0")
+		return errors.New("bage rename: --line/--col required")
+	}
+	if *newName == "" {
+		fmt.Fprintln(stderr, "bage rename: --new is required")
+		return errors.New("bage rename: --new is required")
+	}
+
+	lang, err := parseLang(*langStr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
+	}
+
+	command := strings.Fields(*lspCmd)
+	if len(command) == 0 {
+		fmt.Fprintln(stderr, "bage rename: --lsp must name a server command")
+		return errors.New("bage rename: empty --lsp")
+	}
+
+	abs, err := filepath.Abs(*file)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: resolve %q: %v\n", *file, err)
+		return fmt.Errorf("bage rename: resolve %q: %w", *file, err)
+	}
+
+	content, err := os.ReadFile(abs)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: read %q: %v\n", abs, err)
+		return fmt.Errorf("bage rename: read %q: %w", abs, err)
+	}
+
+	client, err := lsp.NewClient(ctx, command)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: start lsp %q: %v\n", command[0], err)
+		return fmt.Errorf("bage rename: start lsp: %w", err)
+	}
+	defer func() { _ = client.Close(ctx) }()
+
+	rootURI := uri.File(filepath.Dir(abs))
+	if err := client.Initialize(ctx, rootURI); err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: initialize: %w", err)
+	}
+
+	we, err := client.Rename(ctx, abs, string(content), uint32(*line), uint32(*col), *newName)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: %w", err)
+	}
+
+	fileEdits, err := lsp.WorkspaceEditToFileEdits(we, os.ReadFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: convert: %w", err)
+	}
+	if len(fileEdits) == 0 {
+		fmt.Fprintln(stderr, "bage rename: server returned no edits")
+		return errors.New("bage rename: no edits")
+	}
+
+	hasher := hashing.XXHasher{}
+	edits, anchors, err := renameEdits(fileEdits, hasher)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: %w", err)
+	}
+
+	sess := &session.Session{
+		Parser: treesitter.New(),
+		Hasher: hasher,
+		Lang:   lang,
+		WALDir: os.TempDir(),
+	}
+
+	plan, err := sess.Prepare(ctx, edits, anchors)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: prepare: %w", err)
+	}
+	results, err := sess.Commit(plan)
+	if err != nil {
+		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		return fmt.Errorf("bage rename: commit: %w", err)
+	}
+
+	printResults(stdout, results)
+	return nil
+}
+
+// renameEdits converts a flat slice of byte-range FileEdits (from the LSP
+// WorkspaceEdit) into region-anchored edits plus one FileAnchor per file. Each
+// FileEdit becomes a Region whose byte range carries a region_hash computed from
+// that file's live bytes, so Resolve verifies content (Exact in place; benign
+// shift re-resolves; real conflict rejects). Files are read once each and the
+// per-file anchor is built from those live bytes. Edits are returned in a
+// deterministic (path, then start-byte) order.
+func renameEdits(fileEdits []locator.FileEdit, hasher hashing.Hasher) ([]region.Edit, []region.FileAnchor, error) {
+	byPath := make(map[string][]locator.FileEdit)
+	for _, e := range fileEdits {
+		byPath[e.Path] = append(byPath[e.Path], e)
+	}
+
+	paths := make([]string, 0, len(byPath))
+	for p := range byPath {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var edits []region.Edit
+	anchors := make([]region.FileAnchor, 0, len(paths))
+	for _, p := range paths {
+		live, err := os.ReadFile(p)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read %q: %w", p, err)
+		}
+		li := region.NewLineIndex(live)
+
+		group := byPath[p]
+		sort.SliceStable(group, func(i, j int) bool { return group[i].StartByte < group[j].StartByte })
+		for _, fe := range group {
+			if fe.StartByte < 0 || fe.EndByte < fe.StartByte || fe.EndByte > len(live) {
+				return nil, nil, fmt.Errorf("edit byte range [%d:%d] out of bounds for %q (len %d)", fe.StartByte, fe.EndByte, p, len(live))
+			}
+			reg := li.FillLineCols(region.Region{
+				Path:       p,
+				StartByte:  fe.StartByte,
+				EndByte:    fe.EndByte,
+				RegionHash: region.HashRegion(live, fe.StartByte, fe.EndByte),
+			})
+			edits = append(edits, region.Edit{Region: reg, NewText: fe.NewText})
+		}
+		anchors = append(anchors, fileAnchor(p, live, hasher))
+	}
+	return edits, anchors, nil
+}
+
+// fileAnchor builds the per-file drift gate (SPEC §8.1): the raw-byte hash gates
+// byte-offset validity and the normalized hash classifies whitespace-only drift,
+// both computed from the file's current live bytes.
+func fileAnchor(path string, live []byte, hasher hashing.Hasher) region.FileAnchor {
+	return region.FileAnchor{
+		Path:     path,
+		RawHash:  hashing.RawHash(hasher, live),
+		NormHash: hashing.NormHash(hasher, live),
+	}
+}
+
+// printResults writes one line per EditResult (sorted by path then changed
+// start offset) describing the changed byte range, the new 1-based line range,
+// and the recomputed region/file hashes — the write-back contract a coordinator
+// (or a human) reads back (SPEC §8.2).
+func printResults(stdout io.Writer, results []region.EditResult) {
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Path != results[j].Path {
+			return results[i].Path < results[j].Path
+		}
+		return results[i].ChangedStart < results[j].ChangedStart
+	})
+	for _, r := range results {
+		fmt.Fprintf(stdout,
+			"applied %s bytes [%d:%d] lines [%d:%d] region=%s raw=%s norm=%s\n",
+			r.Path, r.ChangedStart, r.ChangedEnd, r.NewStartLine, r.NewEndLine,
+			r.NewRegionHash, r.NewFileRawHash, r.NewFileNormHash)
+	}
+}
+
+// parseLang maps the --lang flag to a parser.Lang. Only Go is supported in the
+// foundation drop; any other value is an explicit usage error rather than a
+// silent fallthrough to LangUnknown.
+func parseLang(s string) (parser.Lang, error) {
+	switch s {
+	case "go":
+		return parser.LangGo, nil
+	default:
+		return parser.LangUnknown, fmt.Errorf("bage apply: unsupported --lang %q (only 'go')", s)
+	}
+}
+
+// atoiPositive parses s as an integer that must be >= 1, used for 1-based line
+// numbers. It returns a clear error for non-numeric or non-positive input.
+func atoiPositive(s string) (int, error) {
+	n := 0
+	if s == "" {
+		return 0, errors.New("empty number")
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("invalid number %q", s)
+		}
+		n = n*10 + int(r-'0')
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("line %q must be >= 1", s)
+	}
+	return n, nil
+}
+
+// formatterFor returns a CmdFormatter for the given command string, or nil to
+// skip formatting when the string is empty. The command is split on spaces
+// into name + args (sufficient for simple commands like "gofmt" or "cat").
+func formatterFor(cmd string) format.Formatter {
+	name, args, ok := splitCmd(cmd)
+	if !ok {
+		return nil
+	}
+	return format.CmdFormatter{Name: name, Args: args}
+}
+
+// linterFor returns a CmdLinter for the given command string, or nil to skip
+// linting when the string is empty.
+func linterFor(cmd string) format.Linter {
+	name, args, ok := splitCmd(cmd)
+	if !ok {
+		return nil
+	}
+	return format.CmdLinter{Name: name, Args: args}
+}
+
+// splitCmd splits a command string into its executable name and arguments on
+// runs of whitespace. It returns ok=false for an empty (or whitespace-only)
+// string so callers can skip the corresponding step. It is sufficient for the
+// simple commands the CLI accepts (e.g. "gofmt", "cat").
+func splitCmd(cmd string) (name string, args []string, ok bool) {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return "", nil, false
+	}
+	return fields[0], fields[1:], true
 }

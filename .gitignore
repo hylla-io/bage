@@ -30,3 +30,4 @@ coverage.out
 .env.local
 *.pem
 *.key
+graphify-out/
