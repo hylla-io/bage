@@ -79,6 +79,28 @@ mage lsp      # containerized LSP-rename suite (requires Docker)
 mage fuzz     # property fuzzing (normalize idempotency, text-fallback losslessness)
 ```
 
+## Dogfooding
+
+Båge edits Båge. Every change to a file in this repo is made **through Båge itself**
+(`bage apply` / `bage rename`), not an external editor — the project is its own first
+integration test. The built-in editor of your agent harness is a **fallback only**, used
+for the two things Båge deliberately cannot do yet:
+
+- **Reading** a file (Båge has no read command — it is an editor, not a viewer).
+- **Creating** a new file (Båge edits existing files only; `apply` resolves a region in a
+  file that must already exist).
+
+Everything else — surgical edits to existing source, docs, config, even this README — goes
+through `bage apply` with a byte/line region and a `--text` / `--text-file` replacement, so
+the round-trip and region-anchor machinery is exercised on real content on every commit.
+
+Friction or bugs found while dogfooding are logged in
+[`BAGE_DOGFOOD_FINDINGS.md`](BAGE_DOGFOOD_FINDINGS.md) and fixed test-first. This loop has
+already caught a line-newline edit bug and a missing `--text-file` flag. When dogfooding
+sharpens one language, the fix lands with test parity across the other file types so the
+rest never falls behind.
+
 ## License
+
 
 See [LICENSE](LICENSE).
