@@ -98,6 +98,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		start      = fs.Int("start", -1, "inclusive start byte of the region to replace")
 		end        = fs.Int("end", -1, "exclusive end byte of the region to replace")
 		text       = fs.String("text", "", "replacement text for the region")
+		textFile   = fs.String("text-file", "", "read replacement text from this file instead of --text (for large/multi-line edits)")
 		regionHash = fs.String("region-hash", "", "optional region_hash anchoring the region by content")
 		langStr    = fs.String("lang", "", "source language by canonical name (e.g. go, python, markdown); empty = auto-detect from --file path")
 		fmtCmd     = fs.String("fmt", "", "optional formatter command run on the staged bytes")
@@ -142,6 +143,14 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	newText := *text
+	if *textFile != "" {
+		b, rerr := os.ReadFile(*textFile)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "bage apply: read --text-file %q: %v\n", *textFile, rerr)
+			return fmt.Errorf("bage apply: read --text-file %q: %w", *textFile, rerr)
+		}
+		newText = string(b)
+	}
 	if *line >= 0 || *lines != "" {
 		// Line addressing replaces line CONTENT — the trailing newline is
 		// structural and preserved by applyRegion — so a trailing newline in

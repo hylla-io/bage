@@ -145,6 +145,33 @@ func TestRunApplyLineIsNewlineAgnostic(t *testing.T) {
 	}
 }
 
+// TestRunApplyTextFile applies replacement text read from --text-file instead of
+// --text, the path for large/multi-line edits. Line mode still strips one
+// trailing newline, so the result is clean.
+func TestRunApplyTextFile(t *testing.T) {
+	const src = "package main\n\nvar X = 1\n"
+	path := writeTemp(t, src)
+	tf := filepath.Join(t.TempDir(), "repl.txt")
+	if err := os.WriteFile(tf, []byte("var X = 42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{
+		"apply", "--file", path, "--line", "3", "--text-file", tf,
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run apply --text-file: %v\nstderr: %s", err, stderr.String())
+	}
+	got := readFile(t, path)
+	if !strings.Contains(got, "var X = 42") || strings.Contains(got, "var X = 1\n") {
+		t.Fatalf("--text-file not applied:\n%s", got)
+	}
+	if !parses(t, got) {
+		t.Fatalf("edited file does not parse:\n%s", got)
+	}
+}
+
 // TestRunApplyRegionHashRelocatesAfterShift anchors the edit with a region_hash
 // and supplies a STALE byte range after the target moved (a benign shift). The
 // resolver must reparse, match the region_hash to the relocated node, and apply
