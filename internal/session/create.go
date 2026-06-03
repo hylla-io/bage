@@ -39,6 +39,11 @@ const (
 	// OpDelete is a delete op: unlink an existing file, gated by the expected
 	// raw_hash drift anchor, capturing the prior bytes for restore (ADR-0004).
 	OpDelete
+	// OpMove is a relocate op: anchored-DELETE(Path) + anchored-CREATE(To) as one
+	// atomic-on-recovery unit, preserving the source bytes unchanged at the
+	// destination (ADR-0004). The source is gated by the raw_hash drift anchor
+	// (like delete); the destination is gated by non-existence (like create).
+	OpMove
 )
 
 // String returns a stable lowercase label for the op kind.
@@ -48,6 +53,8 @@ func (k OpKind) String() string {
 		return "create"
 	case OpDelete:
 		return "delete"
+	case OpMove:
+		return "move"
 	default:
 		return "unknown"
 	}
@@ -61,16 +68,21 @@ func (k OpKind) String() string {
 type Op struct {
 	// Kind tags which lifecycle operation this is.
 	Kind OpKind
-	// Path is the target file path.
+	// Path is the target file path. For OpMove it is the SOURCE path being moved.
 	Path string
+	// To is the destination path for OpMove: the source bytes are relocated here
+	// unchanged. Its anchor is non-existence (To must NOT already exist, no
+	// clobber). Empty for OpCreate/OpDelete.
+	To string
 	// Content is the full bytes of the new file (OpCreate).
 	Content string
 	// Lang optionally forces the language for the parse floor; LangUnknown (the
 	// zero value) means auto-detect from Path.
 	Lang parser.Lang
-	// ExpectedRawHash is the delete drift gate (OpDelete): the live file must
-	// still hash (hashing.RawHash) to this value or the delete HARD-REJECTS,
-	// never discarding bytes the caller did not see. Empty for OpCreate.
+	// ExpectedRawHash is the drift gate for OpDelete and the SOURCE of OpMove: the
+	// live file must still hash (hashing.RawHash) to this value or the op
+	// HARD-REJECTS, never discarding (delete) or relocating (move) bytes the caller
+	// did not see. Empty for OpCreate.
 	ExpectedRawHash string
 }
 

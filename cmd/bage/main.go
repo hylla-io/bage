@@ -38,6 +38,7 @@ usage:
   bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD]
   bage create --file F (--text T | --text-file P) [--lang go] [--fmt CMD] [--lint CMD]
   bage delete --file F [--raw-hash H]
+  bage move   --from F --to G [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
 
 create writes a NEW file F from --text (or --text-file). Its anchor is
@@ -55,6 +56,17 @@ the expected hash is computed from the live bytes (delete-current — no drift
 protection). The FULL prior bytes are captured in the WAL BEFORE the unlink, so a
 crash restores the file. A missing F rejects. On success a confirmation line
 (path + confirmed raw hash) is printed; on any reject nothing is unlinked.
+
+move relocates file F to G, preserving F's bytes unchanged at G (relocate-only;
+no import fixup in this slice). The SOURCE anchor is the expected raw_hash drift
+gate: with --raw-hash the live F must still hash to H or the move HARD-REJECTS
+(never relocating bytes the caller did not see); without --raw-hash the expected
+hash is computed from the live bytes (relocate-current — no drift protection). The
+DESTINATION anchor is non-existence: if G already exists the move HARD-REJECTS and
+G is never clobbered. Missing parent directories of G are created. The move is
+WAL-logged with F's bytes so a crash converges to fully-moved without losing the
+source. A missing F rejects. On success a confirmation line (from + to + confirmed
+raw hash) is printed; on any reject nothing moves.
 
 apply replaces a region of F with text. The region is addressed by a single
 line (--line), a 1-based inclusive line range (--lines L1-L2), or a raw byte
@@ -96,6 +108,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runCreate(ctx, args[1:], stdout, stderr)
 	case "delete":
 		return runDelete(ctx, args[1:], stdout, stderr)
+	case "move":
+		return runMove(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
 	default:
@@ -412,6 +426,76 @@ func runDelete(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 
 	fmt.Fprintf(stdout, "deleted %s raw=%s\n", res.Path, res.RawHash)
+	return nil
+}
+
+// runMove parses the move flags and drives session.MoveFile to relocate file
+// --from to --to, preserving the source bytes unchanged (ADR-0004, SPEC §10;
+// relocate-only, no import fixup in this slice). The SOURCE drift gate is the
+// expected raw_hash: with --raw-hash the engine enforces it (a live mismatch
+// HARD-REJECTS and nothing moves); without --raw-hash the expected hash is computed
+// from the live bytes (relocate-current — documented as no drift protection). The
+// DESTINATION non-existence anchor is enforced by the engine: a pre-existing --to
+// rejects with ErrExists and is never clobbered. On any error it prints a clear
+// message to stderr and returns it; on success it prints a concise confirmation
+// line (from + to + confirmed raw hash). Nothing moves on any reject.
+func runMove(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("move", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		from    = fs.String("from", "", "source path to move (required; must exist)")
+		to      = fs.String("to", "", "destination path (required; must not already exist)")
+		rawHash = fs.String("raw-hash", "", "expected raw content hash of the live source (drift gate); empty = compute from live bytes (relocate-current, no drift protection)")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("bage move: %w", err)
+	}
+
+	if *from == "" {
+		fmt.Fprintln(stderr, "bage move: --from is required")
+		return errors.New("bage move: --from is required")
+	}
+	if *to == "" {
+		fmt.Fprintln(stderr, "bage move: --to is required")
+		return errors.New("bage move: --to is required")
+	}
+
+	hasher := hashing.XXHasher{}
+
+	// Resolve the expected source raw_hash: an explicit --raw-hash is the caller's
+	// drift anchor; an empty one means relocate-current, so we read the live bytes
+	// and compute the anchor from them (no drift protection — documented). A read
+	// failure here (e.g. a missing source) rejects before anything moves.
+	expected := *rawHash
+	if expected == "" {
+		live, err := os.ReadFile(*from)
+		if err != nil {
+			fmt.Fprintf(stderr, "bage move: read %q: %v\n", *from, err)
+			return fmt.Errorf("bage move: read %q: %w", *from, err)
+		}
+		expected = hashing.RawHash(hasher, live)
+	}
+
+	sess := &session.Session{
+		Parser: treesitter.New(),
+		Hasher: hasher,
+		WALDir: os.TempDir(),
+	}
+
+	res, err := sess.MoveFile(ctx, session.Op{
+		Kind:            session.OpMove,
+		Path:            *from,
+		To:              *to,
+		ExpectedRawHash: expected,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "bage move: %v\n", err)
+		return fmt.Errorf("bage move: %w", err)
+	}
+
+	fmt.Fprintf(stdout, "moved %s -> %s raw=%s\n", res.From, res.Dest.Path, res.Dest.NewFileRawHash)
 	return nil
 }
 

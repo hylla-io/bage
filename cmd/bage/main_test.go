@@ -362,6 +362,103 @@ func TestRunDeleteMatchingRawHash(t *testing.T) {
 	}
 }
 
+// TestRunMoveRelocatesFile moves a file via the CLI with no --raw-hash
+// (relocate-current: the expected source hash is computed from the live bytes),
+// and asserts the source is gone, the destination holds the exact bytes, and a
+// confirmation line naming both paths is printed.
+func TestRunMoveRelocatesFile(t *testing.T) {
+	dir := t.TempDir()
+	const src = "package main\n\nfunc main() {}\n"
+	from := filepath.Join(dir, "from.go")
+	if err := os.WriteFile(from, []byte(src), 0o644); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	to := filepath.Join(dir, "to.go")
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"move", "--from", from, "--to", to}, &stdout, &stderr); err != nil {
+		t.Fatalf("run move: %v\nstderr: %s", err, stderr.String())
+	}
+	if _, statErr := os.Stat(from); !os.IsNotExist(statErr) {
+		t.Fatalf("move left the source behind: stat err = %v", statErr)
+	}
+	if got := readFile(t, to); got != src {
+		t.Fatalf("destination bytes = %q, want exact source %q", got, src)
+	}
+	if !strings.Contains(stdout.String(), from) || !strings.Contains(stdout.String(), to) {
+		t.Fatalf("confirmation line did not name both paths:\n%s", stdout.String())
+	}
+}
+
+// TestRunMoveRawHashGate proves the --raw-hash SOURCE drift gate: a move whose
+// supplied --raw-hash does NOT match the live source HARD-REJECTS and nothing
+// moves — the source is intact and no destination is created.
+func TestRunMoveRawHashGate(t *testing.T) {
+	dir := t.TempDir()
+	const src = "package main\n\nfunc main() {}\n"
+	from := filepath.Join(dir, "from.go")
+	if err := os.WriteFile(from, []byte(src), 0o644); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	to := filepath.Join(dir, "to.go")
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{
+		"move", "--from", from, "--to", to, "--raw-hash", "deadbeefnotthehash",
+	}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("move with stale --raw-hash = nil error, want reject (stderr: %q)", stderr.String())
+	}
+	if got := readFile(t, from); got != src {
+		t.Fatalf("drift-rejected move altered the source:\n%s", got)
+	}
+	if _, statErr := os.Stat(to); !os.IsNotExist(statErr) {
+		t.Fatalf("drift-rejected move created a destination: stat err = %v", statErr)
+	}
+}
+
+// TestRunMoveRejectsExistingDest proves the destination non-existence anchor at
+// the CLI: a move onto an existing --to HARD-REJECTS and the destination is never
+// clobbered.
+func TestRunMoveRejectsExistingDest(t *testing.T) {
+	dir := t.TempDir()
+	from := filepath.Join(dir, "from.go")
+	if err := os.WriteFile(from, []byte("package src\n"), 0o644); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	const destContent = "DO NOT CLOBBER\n"
+	to := filepath.Join(dir, "dest.txt")
+	if err := os.WriteFile(to, []byte(destContent), 0o644); err != nil {
+		t.Fatalf("seed dest: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"move", "--from", from, "--to", to}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("move onto existing dest = nil error, want reject (stderr: %q)", stderr.String())
+	}
+	if got := readFile(t, to); got != destContent {
+		t.Fatalf("destination clobbered: %q, want %q", got, destContent)
+	}
+}
+
+// TestRunMoveRequiresFromAndTo verifies the CLI rejects a move missing --from or
+// --to with a diagnostic on stderr.
+func TestRunMoveRequiresFromAndTo(t *testing.T) {
+	for _, args := range [][]string{
+		{"move", "--to", "x.go"},
+		{"move", "--from", "x.go"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if err := run(context.Background(), args, &stdout, &stderr); err == nil {
+			t.Fatalf("move %v = nil error, want reject", args)
+		}
+		if stderr.Len() == 0 {
+			t.Fatalf("move %v: expected diagnostic on stderr, got none", args)
+		}
+	}
+}
+
 // TestRunRenameWithGopls drives the full rename flow against a live gopls. It is
 // skipped when gopls is not on PATH so the suite stays hermetic. It writes a tiny
 // module to a temp dir, renames a local variable, and asserts the file is updated

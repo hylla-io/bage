@@ -52,6 +52,25 @@ type Intent struct {
 	// intents; the `omitempty` tag keeps older records (written before Deletes
 	// existed) decoding cleanly so Replay over a mixed log keeps working.
 	Deletes []string `json:"deletes,omitempty"`
+	// Moves lists the {From,To} relocations this intent is performing. A move is a
+	// DELETE(From)+CREATE(To) as one atomic-on-recovery unit (ADR-0004): the source
+	// bytes are captured in Originals[From] BEFORE the destination is claimed and
+	// the source unlinked, so a crash converges to fully-moved or fully-original
+	// and the source bytes are never lost. Nil for non-move intents; the
+	// `omitempty` tag keeps older records (written before Moves existed) decoding
+	// cleanly so Replay over a mixed log keeps working.
+	Moves []Move `json:"moves,omitempty"`
+}
+
+// Move is one source->destination relocation recorded in an Intent. From is the
+// source path being removed; To is the destination path being created with the
+// source's bytes (captured in Intent.Originals[From]). Recover uses the pair to
+// converge a crashed move (ADR-0004).
+type Move struct {
+	// From is the source path the move removes.
+	From string `json:"from"`
+	// To is the destination path the move creates with the source bytes.
+	To string `json:"to"`
 }
 
 // Append durably records one intent. It creates dir if needed, then opens
