@@ -291,6 +291,8 @@ func TestRunUsageErrors(t *testing.T) {
 		{"rename missing new", []string{"rename", "--file", "/tmp/x.go", "--line", "0", "--col", "0"}},
 		{"rename unknown lang", []string{"rename", "--file", "/tmp/x.go", "--line", "0", "--col", "0", "--new", "x", "--lang", "rust"}},
 		{"rename empty lsp", []string{"rename", "--file", "/tmp/x.go", "--line", "0", "--col", "0", "--new", "x", "--lsp", "  "}},
+		{"delete missing file", []string{"delete", "--raw-hash", "abc"}},
+		{"delete nonexistent", []string{"delete", "--file", "/tmp/does-not-exist-bage-delete-test.go"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,6 +304,61 @@ func TestRunUsageErrors(t *testing.T) {
 				t.Fatal("expected diagnostic on stderr, got none")
 			}
 		})
+	}
+}
+
+// TestRunDeleteRemovesFile deletes a file via the CLI with no --raw-hash
+// (delete-current: the expected hash is computed from the live bytes), and
+// asserts the file is gone and a confirmation line naming the path is printed.
+func TestRunDeleteRemovesFile(t *testing.T) {
+	path := writeTemp(t, "package main\n\nfunc main() {}\n")
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"delete", "--file", path}, &stdout, &stderr); err != nil {
+		t.Fatalf("run delete: %v\nstderr: %s", err, stderr.String())
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("delete left the file behind: stat err = %v", statErr)
+	}
+	if !strings.Contains(stdout.String(), path) {
+		t.Fatalf("confirmation line did not name the path:\n%s", stdout.String())
+	}
+}
+
+// TestRunDeleteRawHashGate proves the --raw-hash drift gate: a delete whose
+// supplied --raw-hash does NOT match the live bytes HARD-REJECTS and the file is
+// STILL THERE — nothing is unlinked.
+func TestRunDeleteRawHashGate(t *testing.T) {
+	const src = "package main\n\nfunc main() {}\n"
+	path := writeTemp(t, src)
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{
+		"delete", "--file", path, "--raw-hash", "deadbeefnotthehash",
+	}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("delete with stale --raw-hash = nil error, want reject (stderr: %q)", stderr.String())
+	}
+	if got := readFile(t, path); got != src {
+		t.Fatalf("drift-rejected delete altered the file:\n%s", got)
+	}
+}
+
+// TestRunDeleteMatchingRawHash deletes a file whose supplied --raw-hash matches
+// the live bytes: the drift gate is satisfied and the file is removed.
+func TestRunDeleteMatchingRawHash(t *testing.T) {
+	const src = "package main\n\nfunc main() {}\n"
+	path := writeTemp(t, src)
+	want := hashing.RawHash(hashing.XXHasher{}, []byte(src))
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{
+		"delete", "--file", path, "--raw-hash", want,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("run delete with matching --raw-hash: %v\nstderr: %s", err, stderr.String())
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("delete left the file behind: stat err = %v", statErr)
 	}
 }
 

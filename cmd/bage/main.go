@@ -37,6 +37,7 @@ const usage = `bage — round-trip file editor (standalone)
 usage:
   bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD]
   bage create --file F (--text T | --text-file P) [--lang go] [--fmt CMD] [--lint CMD]
+  bage delete --file F [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
 
 create writes a NEW file F from --text (or --text-file). Its anchor is
@@ -46,6 +47,14 @@ under its language (auto-detected from F unless --lang is given); the optional
 formatter and linter run on the staged bytes first. The create is WAL-logged so
 a crash unlinks the half-created file. On success the whole-file EditResult
 (new raw/norm hashes, line range) is printed.
+
+delete unlinks an existing file F. Its anchor is the expected raw_hash drift
+gate: with --raw-hash the live file must still hash to H or the delete
+HARD-REJECTS (never discarding bytes the caller did not see); without --raw-hash
+the expected hash is computed from the live bytes (delete-current — no drift
+protection). The FULL prior bytes are captured in the WAL BEFORE the unlink, so a
+crash restores the file. A missing F rejects. On success a confirmation line
+(path + confirmed raw hash) is printed; on any reject nothing is unlinked.
 
 apply replaces a region of F with text. The region is addressed by a single
 line (--line), a 1-based inclusive line range (--lines L1-L2), or a raw byte
@@ -85,6 +94,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runApply(ctx, args[1:], stdout, stderr)
 	case "create":
 		return runCreate(ctx, args[1:], stdout, stderr)
+	case "delete":
+		return runDelete(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
 	default:
@@ -339,6 +350,68 @@ func runCreate(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 
 	printResults(stdout, []region.EditResult{res})
+	return nil
+}
+
+// runDelete parses the delete flags and drives session.DeleteFile to unlink an
+// existing file F (ADR-0004, SPEC §10). The drift gate is the expected raw_hash:
+// with --raw-hash the engine enforces it (a live mismatch HARD-REJECTS and
+// nothing is unlinked); without --raw-hash the expected hash is computed from the
+// live bytes (delete-current — documented as no drift protection). The FULL prior
+// bytes are WAL-captured before the unlink so a crash restores the file. A missing
+// F rejects. On any error it prints a clear message to stderr and returns it; on
+// success it prints a concise confirmation line (path + confirmed raw hash).
+func runDelete(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		file    = fs.String("file", "", "path of the file to delete (required; must exist)")
+		rawHash = fs.String("raw-hash", "", "expected raw content hash of the live file (drift gate); empty = compute from live bytes (delete-current, no drift protection)")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("bage delete: %w", err)
+	}
+
+	if *file == "" {
+		fmt.Fprintln(stderr, "bage delete: --file is required")
+		return errors.New("bage delete: --file is required")
+	}
+
+	hasher := hashing.XXHasher{}
+
+	// Resolve the expected raw_hash: an explicit --raw-hash is the caller's drift
+	// anchor; an empty one means delete-current, so we read the live bytes and
+	// compute the anchor from them (no drift protection — documented). A read
+	// failure here (e.g. a missing file) rejects before anything is unlinked.
+	expected := *rawHash
+	if expected == "" {
+		live, err := os.ReadFile(*file)
+		if err != nil {
+			fmt.Fprintf(stderr, "bage delete: read %q: %v\n", *file, err)
+			return fmt.Errorf("bage delete: read %q: %w", *file, err)
+		}
+		expected = hashing.RawHash(hasher, live)
+	}
+
+	sess := &session.Session{
+		Parser: treesitter.New(),
+		Hasher: hasher,
+		WALDir: os.TempDir(),
+	}
+
+	res, err := sess.DeleteFile(ctx, session.Op{
+		Kind:            session.OpDelete,
+		Path:            *file,
+		ExpectedRawHash: expected,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "bage delete: %v\n", err)
+		return fmt.Errorf("bage delete: %w", err)
+	}
+
+	fmt.Fprintf(stdout, "deleted %s raw=%s\n", res.Path, res.RawHash)
 	return nil
 }
 

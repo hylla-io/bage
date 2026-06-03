@@ -36,6 +36,9 @@ const (
 	// OpCreate is a create-from-non-existence op: bring a new file into being
 	// with the given content, rejecting if the path already exists.
 	OpCreate OpKind = iota
+	// OpDelete is a delete op: unlink an existing file, gated by the expected
+	// raw_hash drift anchor, capturing the prior bytes for restore (ADR-0004).
+	OpDelete
 )
 
 // String returns a stable lowercase label for the op kind.
@@ -43,6 +46,8 @@ func (k OpKind) String() string {
 	switch k {
 	case OpCreate:
 		return "create"
+	case OpDelete:
+		return "delete"
 	default:
 		return "unknown"
 	}
@@ -63,6 +68,10 @@ type Op struct {
 	// Lang optionally forces the language for the parse floor; LangUnknown (the
 	// zero value) means auto-detect from Path.
 	Lang parser.Lang
+	// ExpectedRawHash is the delete drift gate (OpDelete): the live file must
+	// still hash (hashing.RawHash) to this value or the delete HARD-REJECTS,
+	// never discarding bytes the caller did not see. Empty for OpCreate.
+	ExpectedRawHash string
 }
 
 // CreateFile creates a new file from op, returning a whole-file EditResult a

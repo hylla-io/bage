@@ -390,6 +390,15 @@ func (s *Session) Rollback(plan *Plan) error {
 // §1.2 converge-on-crash). It then clears the WAL. A crash between Prepare and
 // Commit leaves a WAL record whose Originals undo the half-done edit; a crash
 // after Commit cleared the WAL leaves nothing to replay.
+//
+// The same Originals loop is the delete undo: a DELETE intent (ADR-0004) records
+// every deleted path's FULL prior bytes in Originals BEFORE the unlink, so a
+// crash in the window between that durable record and the unlink is recovered by
+// writing those bytes back — restoring the deleted file. A delete that already
+// landed (file gone, bytes captured) is re-created with its original content; a
+// delete that never reached the unlink leaves the file present and the restore
+// is a harmless rewrite of identical bytes. (Intent.Deletes marks the lifecycle
+// op; the restore mechanism is Originals, shared with the edit-undo path.)
 func (s *Session) Recover(_ context.Context, dir string) error {
 	intents, err := wal.Replay(dir)
 	if err != nil {
