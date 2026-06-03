@@ -200,6 +200,12 @@ type Node struct {
 	EndPoint Point
 	// Named reports whether the node is a named node (vs. an anonymous token).
 	Named bool
+	// Missing reports whether the node is a MISSING node — a zero-width node the
+	// parser inserts to recover from a syntax error (e.g. an absent closing
+	// brace). A MISSING node has a normal Kind, so this flag is the only way to
+	// distinguish it from a genuine token; parse-health diagnostics surface it
+	// alongside ERROR-kind nodes (SPEC §10.5).
+	Missing bool
 	// Children are the node's direct child nodes in source order.
 	Children []*Node
 }

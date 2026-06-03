@@ -41,6 +41,7 @@ usage:
   bage move   --from F --to G [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
   bage show   --file F [--json]
+  bage diagnose --file F [--lsp CMD] [--json]
 
 show is the READ view: it parses F with the shared parser and emits, for every
 addressable block (the Outline), its kind, name, 1-based line range, byte range,
@@ -92,7 +93,18 @@ zero-based (line, col) UTF-16 position in F to NAME, converts the resulting
 WorkspaceEdit into region-anchored edits (each grounded against the file's live
 bytes via a computed region_hash), and applies every affected file atomically
 via the same Prepare/Commit engine. On drift, conflict, or parse failure nothing
-is written.`
+is written.
+
+diagnose SURFACES problems in F without fixing them — the host/agent decides what
+to do. It reports from two sources: (1) parse-health, ALWAYS and LSP-free — every
+ERROR/MISSING node the shared tree-sitter parser finds (the same signal the edit
+parse-floor uses), with 1-based line/col + byte range; a clean parse reports none,
+and the grammar-free text fallback always parses so it never reports a defect.
+(2) LSP diagnostics, only when --lsp names a server — diagnose opens F in that
+server (textDocument/didOpen) and collects its published diagnostics, each with
+severity, 1-based range, message, and source. Reporting problems is SUCCESS: exit
+code is 0 even WITH findings; non-zero is reserved for usage/IO/LSP-start errors.
+Default output is human-readable; --json emits the structured view.`
 
 // main wires the process entrypoint to run and maps any error to exit code 1.
 func main() {
@@ -124,6 +136,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runRename(ctx, args[1:], stdout, stderr)
 	case "show":
 		return runShow(ctx, args[1:], stdout, stderr)
+	case "diagnose":
+		return runDiagnose(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage)
 		return fmt.Errorf("bage: unknown subcommand %q", args[0])
