@@ -432,19 +432,34 @@ func (s *Session) Rollback(plan *Plan) error {
 // delete that never reached the unlink leaves the file present and the restore
 // is a harmless rewrite of identical bytes. (Intent.Deletes marks the lifecycle
 // op; the restore mechanism is Originals, shared with the edit-undo path.)
+//
+// A UNIFIED BATCH intent (Intent.Batch true, Session.ApplyBatch) converges the
+// WHOLE batch BACKWARD to fully-before: its edits/deletes/creates undo as above and
+// its MOVES also undo (the source is restored in place from Originals[From] and the
+// destination is removed), so a crash mid-batch can never leave the half-applied
+// state where the move completed forward while the other ops rolled back (ADR-0004
+// §10.1). A SINGLE-OP MoveFile intent (Batch false) keeps the forward-converge
+// semantics described above.
 func (s *Session) Recover(_ context.Context, dir string) error {
 	intents, err := wal.Replay(dir)
 	if err != nil {
 		return fmt.Errorf("session: recover replay: %w", err)
 	}
 	for _, in := range intents {
-		// A move's source bytes live in Originals[From], but a move converges
-		// FORWARD (to fully-moved), not backward — so the generic Originals restore
-		// below must NOT rewrite a move source. Collect every move-source path and
-		// skip it in the restore loop; the move convergence below handles it.
+		// A move's source bytes live in Originals[From]. For a SINGLE-OP move
+		// (in.Batch false) the move converges FORWARD (to fully-moved), so the
+		// generic Originals restore below must NOT rewrite a move source — the
+		// forward convergence handles it. For a UNIFIED BATCH intent (in.Batch true,
+		// ADR-0004 §10.1) the WHOLE batch converges BACKWARD, so the move source IS
+		// restored in place by the generic loop below and the move dest is unlinked
+		// — never the half-state where the move completes while the batch's other
+		// ops roll back. Collect move sources to skip in the restore loop ONLY for a
+		// single-op forward-converging move.
 		moveSrc := make(map[string]struct{}, len(in.Moves))
-		for _, mv := range in.Moves {
-			moveSrc[mv.From] = struct{}{}
+		if !in.Batch {
+			for _, mv := range in.Moves {
+				moveSrc[mv.From] = struct{}{}
+			}
 		}
 
 		for path, original := range in.Originals {
@@ -456,23 +471,38 @@ func (s *Session) Recover(_ context.Context, dir string) error {
 			}
 		}
 
-		// A move intent converges to FULLY-MOVED (ADR-0004): the destination must
-		// hold the source bytes (from Originals[From], the backstop that guarantees
-		// the bytes are never lost) and the source must be gone. A crash could have
-		// stopped before the dest was written, after the dest was written but before
-		// the source was unlinked, or after the unlink — this converges all three to
-		// the same fully-moved end state. The dest is (re)written from the durable
-		// originals, then the source is unlinked; an already-gone source is fine.
-		for _, mv := range in.Moves {
-			original, ok := in.Originals[mv.From]
-			if !ok {
-				return fmt.Errorf("session: recover move %q->%q: missing original bytes", mv.From, mv.To)
+		if in.Batch {
+			// BATCH intent: converge every move BACKWARD (undo). The source bytes
+			// were already restored in place by the generic Originals loop above, so
+			// here we only remove the destination the crashed apply may have written.
+			// An already-gone destination (the crash stopped before the dest write)
+			// is not an error. This makes a crashed batch land deterministically
+			// fully-before.
+			for _, mv := range in.Moves {
+				if rerr := os.Remove(mv.To); rerr != nil && !os.IsNotExist(rerr) {
+					return fmt.Errorf("session: recover batch undo move dest %q: %w", mv.To, rerr)
+				}
 			}
-			if werr := atomicwrite.Write(mv.To, original); werr != nil {
-				return fmt.Errorf("session: recover move write dest %q: %w", mv.To, werr)
-			}
-			if rerr := os.Remove(mv.From); rerr != nil && !os.IsNotExist(rerr) {
-				return fmt.Errorf("session: recover move unlink src %q: %w", mv.From, rerr)
+		} else {
+			// SINGLE-OP move intent converges to FULLY-MOVED (ADR-0004): the
+			// destination must hold the source bytes (from Originals[From], the
+			// backstop that guarantees the bytes are never lost) and the source must
+			// be gone. A crash could have stopped before the dest was written, after
+			// the dest was written but before the source was unlinked, or after the
+			// unlink — this converges all three to the same fully-moved end state.
+			// The dest is (re)written from the durable originals, then the source is
+			// unlinked; an already-gone source is fine.
+			for _, mv := range in.Moves {
+				original, ok := in.Originals[mv.From]
+				if !ok {
+					return fmt.Errorf("session: recover move %q->%q: missing original bytes", mv.From, mv.To)
+				}
+				if werr := atomicwrite.Write(mv.To, original); werr != nil {
+					return fmt.Errorf("session: recover move write dest %q: %w", mv.To, werr)
+				}
+				if rerr := os.Remove(mv.From); rerr != nil && !os.IsNotExist(rerr) {
+					return fmt.Errorf("session: recover move unlink src %q: %w", mv.From, rerr)
+				}
 			}
 		}
 

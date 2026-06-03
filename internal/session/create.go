@@ -44,6 +44,13 @@ const (
 	// destination (ADR-0004). The source is gated by the raw_hash drift anchor
 	// (like delete); the destination is gated by non-existence (like create).
 	OpMove
+	// OpEdit is a region-anchored edit op: replace the bytes of a content-anchored
+	// region with new text, gated by the region's region_hash (the same drift gate
+	// the []region.Edit Prepare/Commit path uses). It lets an edit be carried as an
+	// Op so a heterogeneous []Op batch (Session.ApplyBatch) can mix edits with
+	// create/delete/move as ONE all-or-nothing change (ADR-0004 §10.1). The edit
+	// payload lives in Op.Edit; the other op kinds leave it nil.
+	OpEdit
 )
 
 // String returns a stable lowercase label for the op kind.
@@ -55,6 +62,8 @@ func (k OpKind) String() string {
 		return "delete"
 	case OpMove:
 		return "move"
+	case OpEdit:
+		return "edit"
 	default:
 		return "unknown"
 	}
@@ -84,6 +93,11 @@ type Op struct {
 	// HARD-REJECTS, never discarding (delete) or relocating (move) bytes the caller
 	// did not see. Empty for OpCreate.
 	ExpectedRawHash string
+	// Edit carries the region-anchored edit for OpEdit: the content-anchored region
+	// (gated by its region_hash) and the replacement text. It is nil for every other
+	// op kind. Path mirrors Edit.Region.Path so the batch can lock and key the op by
+	// path uniformly. (ADR-0004 §10.1.)
+	Edit *region.Edit
 }
 
 // CreateFile creates a new file from op, returning a whole-file EditResult a

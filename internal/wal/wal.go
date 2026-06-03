@@ -60,6 +60,17 @@ type Intent struct {
 	// `omitempty` tag keeps older records (written before Moves existed) decoding
 	// cleanly so Replay over a mixed log keeps working.
 	Moves []Move `json:"moves,omitempty"`
+	// Batch marks a UNIFIED BATCH intent (Session.ApplyBatch, ADR-0004 §10.1): a
+	// heterogeneous []Op applied as ONE all-or-nothing change. Its recovery model
+	// is INTERNALLY ONE-DIRECTIONAL — Recover converges a batch intent fully
+	// BACKWARD (to the pre-batch state), so a Move inside a batch is UNDONE
+	// (restore Originals[From] at From, remove To) in the same backward direction
+	// as the batch's edits/deletes/creates, never converged forward. A single-op
+	// MoveFile leaves this false and keeps its own FORWARD-converge semantics, so a
+	// batch can never produce the half-applied state where the move completes while
+	// the other ops roll back. The `omitempty` tag keeps older records decoding
+	// cleanly (absent key => false => single-op semantics).
+	Batch bool `json:"batch,omitempty"`
 }
 
 // Move is one source->destination relocation recorded in an Intent. From is the
