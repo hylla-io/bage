@@ -45,6 +45,32 @@ type Intent struct {
 	// crash recovery or rollback each path is unlinked, undoing a half-created
 	// file. Nil for edit-only intents (ADR-0004).
 	Creates []string `json:"creates,omitempty"`
+	// Deletes lists the paths this intent is removing. It is the inverse of
+	// Creates: a delete's undo is a content RESTORE, so each deleted path's FULL
+	// prior bytes are captured in Originals before the unlink, and a crash or
+	// rollback restores them from there on recovery (ADR-0004). Nil for non-delete
+	// intents; the `omitempty` tag keeps older records (written before Deletes
+	// existed) decoding cleanly so Replay over a mixed log keeps working.
+	Deletes []string `json:"deletes,omitempty"`
+	// Moves lists the {From,To} relocations this intent is performing. A move is a
+	// DELETE(From)+CREATE(To) as one atomic-on-recovery unit (ADR-0004): the source
+	// bytes are captured in Originals[From] BEFORE the destination is claimed and
+	// the source unlinked, so a crash converges to fully-moved or fully-original
+	// and the source bytes are never lost. Nil for non-move intents; the
+	// `omitempty` tag keeps older records (written before Moves existed) decoding
+	// cleanly so Replay over a mixed log keeps working.
+	Moves []Move `json:"moves,omitempty"`
+}
+
+// Move is one source->destination relocation recorded in an Intent. From is the
+// source path being removed; To is the destination path being created with the
+// source's bytes (captured in Intent.Originals[From]). Recover uses the pair to
+// converge a crashed move (ADR-0004).
+type Move struct {
+	// From is the source path the move removes.
+	From string `json:"from"`
+	// To is the destination path the move creates with the source bytes.
+	To string `json:"to"`
 }
 
 // Append durably records one intent. It creates dir if needed, then opens
@@ -73,6 +99,37 @@ func Append(dir string, in Intent) error {
 	}
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("wal: fsync %q: %w", path, err)
+	}
+
+	// Fsync the PARENT DIRECTORY too. Syncing the file content alone does not
+	// make the directory entry durable: when wal.log was just created, a
+	// power-loss crash could lose the directory entry and thus the whole record,
+	// even though f.Sync returned — leaving a caller that already acted on
+	// Append's success (e.g. delete, which unlinks the target right after) with
+	// UNRECOVERABLE bytes. Syncing the directory closes that window, so the
+	// WAL-before-unlink ordering is a true crash guarantee for delete, and the
+	// same hardening strengthens the create and edit paths that share Append.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("wal: fsync dir %q: %w", dir, err)
+	}
+	return nil
+}
+
+// syncDir fsyncs the directory at dir so a newly-created or renamed entry within
+// it (here wal.log) becomes durable, not just the file's content. It opens the
+// directory read-only, fsyncs it, and closes it, wrapping any failure with %w so
+// the caller never silently treats an undurable directory as committed.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("wal: open dir %q: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("wal: sync dir %q: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("wal: close dir %q: %w", dir, err)
 	}
 	return nil
 }

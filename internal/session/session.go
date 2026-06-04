@@ -143,6 +143,39 @@ func (s *Session) fileLock(path string) *sync.Mutex {
 	return mu
 }
 
+// lockPaths acquires the per-file writer mutexes for every given path in a
+// DETERMINISTIC SORTED order and returns an unlock function that releases them in
+// reverse. Sorting the acquisition order is the deadlock-free invariant: two
+// concurrent ops touching the same pair of files (e.g. a move A->B racing a move
+// B->A) always take the locks in the same global order, so neither can hold one
+// while waiting on the other. Duplicate paths are de-duplicated so a degenerate
+// same-path pair takes a single lock once (a self-lock would deadlock). Callers
+// must defer the returned unlock.
+func (s *Session) lockPaths(paths ...string) func() {
+	seen := make(map[string]struct{}, len(paths))
+	uniq := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		uniq = append(uniq, p)
+	}
+	sort.Strings(uniq)
+
+	held := make([]*sync.Mutex, 0, len(uniq))
+	for _, p := range uniq {
+		mu := s.fileLock(p)
+		mu.Lock()
+		held = append(held, mu)
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].Unlock()
+		}
+	}
+}
+
 // Prepare optimistically stages every region-anchored edit and records one WAL
 // intent. It holds no lock. For each file it reads the live bytes, resolves every
 // edit via region.Resolve (a Conflict/Ambiguous resolve yields a *ConflictError
@@ -390,17 +423,59 @@ func (s *Session) Rollback(plan *Plan) error {
 // §1.2 converge-on-crash). It then clears the WAL. A crash between Prepare and
 // Commit leaves a WAL record whose Originals undo the half-done edit; a crash
 // after Commit cleared the WAL leaves nothing to replay.
+//
+// The same Originals loop is the delete undo: a DELETE intent (ADR-0004) records
+// every deleted path's FULL prior bytes in Originals BEFORE the unlink, so a
+// crash in the window between that durable record and the unlink is recovered by
+// writing those bytes back — restoring the deleted file. A delete that already
+// landed (file gone, bytes captured) is re-created with its original content; a
+// delete that never reached the unlink leaves the file present and the restore
+// is a harmless rewrite of identical bytes. (Intent.Deletes marks the lifecycle
+// op; the restore mechanism is Originals, shared with the edit-undo path.)
 func (s *Session) Recover(_ context.Context, dir string) error {
 	intents, err := wal.Replay(dir)
 	if err != nil {
 		return fmt.Errorf("session: recover replay: %w", err)
 	}
 	for _, in := range intents {
+		// A move's source bytes live in Originals[From], but a move converges
+		// FORWARD (to fully-moved), not backward — so the generic Originals restore
+		// below must NOT rewrite a move source. Collect every move-source path and
+		// skip it in the restore loop; the move convergence below handles it.
+		moveSrc := make(map[string]struct{}, len(in.Moves))
+		for _, mv := range in.Moves {
+			moveSrc[mv.From] = struct{}{}
+		}
+
 		for path, original := range in.Originals {
+			if _, isMoveSrc := moveSrc[path]; isMoveSrc {
+				continue
+			}
 			if werr := atomicwrite.Write(path, original); werr != nil {
 				return fmt.Errorf("session: recover restore %q: %w", path, werr)
 			}
 		}
+
+		// A move intent converges to FULLY-MOVED (ADR-0004): the destination must
+		// hold the source bytes (from Originals[From], the backstop that guarantees
+		// the bytes are never lost) and the source must be gone. A crash could have
+		// stopped before the dest was written, after the dest was written but before
+		// the source was unlinked, or after the unlink — this converges all three to
+		// the same fully-moved end state. The dest is (re)written from the durable
+		// originals, then the source is unlinked; an already-gone source is fine.
+		for _, mv := range in.Moves {
+			original, ok := in.Originals[mv.From]
+			if !ok {
+				return fmt.Errorf("session: recover move %q->%q: missing original bytes", mv.From, mv.To)
+			}
+			if werr := atomicwrite.Write(mv.To, original); werr != nil {
+				return fmt.Errorf("session: recover move write dest %q: %w", mv.To, werr)
+			}
+			if rerr := os.Remove(mv.From); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("session: recover move unlink src %q: %w", mv.From, rerr)
+			}
+		}
+
 		// A create intent's undo is UNLINK: a crash between the durable WAL
 		// record and the WAL clear leaves a half-created file on disk, so
 		// removing each Creates path converges back to non-existence (ADR-0004,

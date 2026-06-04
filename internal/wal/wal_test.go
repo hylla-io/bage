@@ -9,6 +9,37 @@ import (
 	"github.com/hylla-io/bage/internal/locator"
 )
 
+// TestAppendSyncsParentDir verifies the durability hardening: Append fsyncs the
+// WAL's PARENT DIRECTORY after fsyncing the record file, so a power-loss crash
+// cannot leave the wal.log's directory entry non-durable (record lost) while a
+// caller has already acted on Append's success — e.g. delete unlinking the
+// target. The directory fsync is performed by syncDir; this exercises both that
+// a successful Append round-trips through it AND that syncDir surfaces (never
+// swallows) a directory it cannot open, so the durability step is real.
+func TestAppendSyncsParentDir(t *testing.T) {
+	t.Run("append survives the added dir sync", func(t *testing.T) {
+		dir := t.TempDir()
+		in := Intent{ID: "synced", Deletes: []string{"/x/gone.go"}, Originals: map[string][]byte{"/x/gone.go": {1, 2, 3}}}
+		if err := Append(dir, in); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		got, err := Replay(dir)
+		if err != nil {
+			t.Fatalf("Replay: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "synced" {
+			t.Fatalf("Replay = %#v, want one synced intent", got)
+		}
+	})
+
+	t.Run("syncDir surfaces an unopenable directory", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "nope")
+		if err := syncDir(missing); err == nil {
+			t.Fatalf("syncDir(%q) = nil, want error for a missing directory", missing)
+		}
+	})
+}
+
 // TestReplayTornTrailingRecord verifies that a torn final record (a crash
 // mid-Append) does not discard the cleanly-committed records before it.
 func TestReplayTornTrailingRecord(t *testing.T) {
