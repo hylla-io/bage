@@ -40,6 +40,16 @@ usage:
   bage delete --file F [--raw-hash H]
   bage move   --from F --to G [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
+  bage show   --file F [--json]
+
+show is the READ view: it parses F with the shared parser and emits, for every
+addressable block (the Outline), its kind, name, 1-based line range, byte range,
+and region_hash — the SAME region_hash bage apply --region-hash verifies+accepts
+for that exact byte range (the round-trip anchor an agent echoes back). It also
+emits the file's raw_hash + norm_hash. A grammar-backed file lists its
+declarations; a text-fallback file lists its line-blocks; an empty file yields an
+empty outline plus the file hashes. Default output is human-readable; --json
+emits structured JSON. show is strictly READ-ONLY — it writes nothing to disk.
 
 create writes a NEW file F from --text (or --text-file). Its anchor is
 non-existence: if F already exists the create HARD-REJECTS and nothing is
@@ -112,6 +122,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runMove(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
+	case "show":
+		return runShow(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage)
 		return fmt.Errorf("bage: unknown subcommand %q", args[0])
