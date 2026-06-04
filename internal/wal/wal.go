@@ -22,6 +22,14 @@ const logName = "wal.log"
 // the original bytes of each affected file (for restore-on-failure), and the
 // expected raw and normalized content hashes per file (for drift detection)
 // so a recovering process has everything needed to reapply or roll back.
+//
+// The Creates field is an ADDITIVE extension for file-lifecycle create ops
+// (ADR-0004): it records the paths a create intent is bringing into existence
+// so a crash or rollback can UNLINK each half-created file (create's undo is
+// unlink, not a content restore). It is the zero value (nil) for edit-only
+// intents, and because the field carries `omitempty` an old edit-only record
+// written before Creates existed still unmarshals cleanly (the absent key
+// decodes to nil), so Replay over a mixed log keeps working.
 type Intent struct {
 	// ID uniquely identifies this intent.
 	ID string `json:"id"`
@@ -33,6 +41,10 @@ type Intent struct {
 	ExpectedRawHash map[string]string `json:"expected_raw_hash"`
 	// ExpectedNormHash maps each file path to its expected normalized hash.
 	ExpectedNormHash map[string]string `json:"expected_norm_hash"`
+	// Creates lists the paths this intent is creating from non-existence. On
+	// crash recovery or rollback each path is unlinked, undoing a half-created
+	// file. Nil for edit-only intents (ADR-0004).
+	Creates []string `json:"creates,omitempty"`
 }
 
 // Append durably records one intent. It creates dir if needed, then opens

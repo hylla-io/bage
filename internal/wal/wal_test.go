@@ -206,3 +206,44 @@ func strMapEqual(a, b map[string]string) bool {
 	}
 	return true
 }
+
+// TestAppendReplayCreates verifies the additive Creates field round-trips
+// through Append/Replay so a create intent's unlink targets survive a crash.
+func TestAppendReplayCreates(t *testing.T) {
+	dir := t.TempDir()
+	in := Intent{ID: "create-1", Creates: []string{"/a/new.go", "/a/sub/other.txt"}}
+	if err := Append(dir, in); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	got, err := Replay(dir)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Replay len = %d, want 1", len(got))
+	}
+	if !reflect.DeepEqual(got[0].Creates, in.Creates) {
+		t.Fatalf("Creates = %#v, want %#v", got[0].Creates, in.Creates)
+	}
+}
+
+// TestReplayOldEditOnlyRecord verifies that a legacy edit-only record written
+// before the Creates field existed still unmarshals (Creates decodes to nil),
+// proving the extension is backward-compatible.
+func TestReplayOldEditOnlyRecord(t *testing.T) {
+	dir := t.TempDir()
+	legacy := `{"id":"old","edits":[],"originals":{"a.go":"eA=="},"expected_raw_hash":{"a.go":"h"},"expected_norm_hash":{"a.go":"n"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, logName), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy log: %v", err)
+	}
+	got, err := Replay(dir)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "old" {
+		t.Fatalf("Replay = %#v, want one legacy intent", got)
+	}
+	if got[0].Creates != nil {
+		t.Fatalf("Creates = %#v, want nil for legacy record", got[0].Creates)
+	}
+}

@@ -296,6 +296,13 @@ func (s *Session) resolveEdits(path string, live []byte, edits []region.Edit) ([
 // rejects). It returns nil when the staged bytes are valid. It mutates nothing
 // on disk — it operates purely on the preview bytes.
 func (s *Session) formatLintParse(ctx context.Context, path string, spliced []byte) error {
+	return s.formatLintParseLang(ctx, path, s.langFor(path), spliced)
+}
+
+// formatLintParseLang is formatLintParse with an EXPLICIT language, so the
+// create path can honour a per-op Lang override while reusing the identical
+// format → lint → parse-floor sequence. path is used only for error context.
+func (s *Session) formatLintParseLang(ctx context.Context, path string, lang parser.Lang, spliced []byte) error {
 	if s.Formatter != nil {
 		formatted, ferr := s.Formatter.Format(ctx, spliced)
 		if ferr != nil {
@@ -308,7 +315,7 @@ func (s *Session) formatLintParse(ctx context.Context, path string, spliced []by
 			return fmt.Errorf("session: lint %q: %w", path, lerr)
 		}
 	}
-	_, tree, perr := edit.Reparse(ctx, s.Parser, s.langFor(path), spliced, nil, nil)
+	_, tree, perr := edit.Reparse(ctx, s.Parser, lang, spliced, nil, nil)
 	if perr != nil {
 		return fmt.Errorf("session: reparse %q: %w", path, perr)
 	}
@@ -392,6 +399,16 @@ func (s *Session) Recover(_ context.Context, dir string) error {
 		for path, original := range in.Originals {
 			if werr := atomicwrite.Write(path, original); werr != nil {
 				return fmt.Errorf("session: recover restore %q: %w", path, werr)
+			}
+		}
+		// A create intent's undo is UNLINK: a crash between the durable WAL
+		// record and the WAL clear leaves a half-created file on disk, so
+		// removing each Creates path converges back to non-existence (ADR-0004,
+		// files-as-truth). A path already gone (the create never landed) is not
+		// an error.
+		for _, path := range in.Creates {
+			if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("session: recover unlink %q: %w", path, rerr)
 			}
 		}
 	}

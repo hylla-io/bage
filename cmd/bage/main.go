@@ -36,7 +36,16 @@ const usage = `bage — round-trip file editor (standalone)
 
 usage:
   bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD]
+  bage create --file F (--text T | --text-file P) [--lang go] [--fmt CMD] [--lint CMD]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
+
+create writes a NEW file F from --text (or --text-file). Its anchor is
+non-existence: if F already exists the create HARD-REJECTS and nothing is
+clobbered. Missing parent directories are created. The new content must parse
+under its language (auto-detected from F unless --lang is given); the optional
+formatter and linter run on the staged bytes first. The create is WAL-logged so
+a crash unlinks the half-created file. On success the whole-file EditResult
+(new raw/norm hashes, line range) is printed.
 
 apply replaces a region of F with text. The region is addressed by a single
 line (--line), a 1-based inclusive line range (--lines L1-L2), or a raw byte
@@ -74,6 +83,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "apply":
 		return runApply(ctx, args[1:], stdout, stderr)
+	case "create":
+		return runCreate(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
 	default:
@@ -257,6 +268,78 @@ func parseLineRange(line int, lines string) (startLine, endLine int, err error) 
 		return 0, 0, fmt.Errorf("bage apply: --lines %q has start past end", lines)
 	}
 	return startLine, endLine, nil
+}
+
+// runCreate parses the create flags and drives session.CreateFile to bring a
+// NEW file into existence (ADR-0004, SPEC §10). The content comes from --text or
+// --text-file (mutually exclusive). The non-existence anchor is enforced by the
+// engine: a pre-existing F rejects with ErrExists and is never clobbered. The
+// language is auto-detected from F unless --lang names one. On any error it
+// prints a clear message to stderr and returns it; on success it prints the
+// whole-file EditResult to stdout via the same printResults contract as apply.
+func runCreate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		file     = fs.String("file", "", "path of the file to create (required; must not already exist)")
+		text     = fs.String("text", "", "full content of the new file")
+		textFile = fs.String("text-file", "", "read the new file's content from this file instead of --text (for large/multi-line content)")
+		langStr  = fs.String("lang", "", "source language by canonical name (e.g. go, python, markdown); empty = auto-detect from --file path")
+		fmtCmd   = fs.String("fmt", "", "optional formatter command run on the staged bytes")
+		lintCmd  = fs.String("lint", "", "optional linter command run on the staged bytes")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("bage create: %w", err)
+	}
+
+	if *file == "" {
+		fmt.Fprintln(stderr, "bage create: --file is required")
+		return errors.New("bage create: --file is required")
+	}
+	if *text != "" && *textFile != "" {
+		fmt.Fprintln(stderr, "bage create: choose one of --text or --text-file, not both")
+		return errors.New("bage create: --text and --text-file are mutually exclusive")
+	}
+
+	lang, err := parseLang(*langStr)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
+	}
+
+	content := *text
+	if *textFile != "" {
+		b, rerr := os.ReadFile(*textFile)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "bage create: read --text-file %q: %v\n", *textFile, rerr)
+			return fmt.Errorf("bage create: read --text-file %q: %w", *textFile, rerr)
+		}
+		content = string(b)
+	}
+
+	sess := &session.Session{
+		Parser:    treesitter.New(),
+		Hasher:    hashing.XXHasher{},
+		Formatter: formatterFor(*fmtCmd),
+		Linter:    linterFor(*lintCmd),
+		Lang:      lang,
+		WALDir:    os.TempDir(),
+	}
+
+	res, err := sess.CreateFile(ctx, session.Op{
+		Kind:    session.OpCreate,
+		Path:    *file,
+		Content: content,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "bage create: %v\n", err)
+		return fmt.Errorf("bage create: %w", err)
+	}
+
+	printResults(stdout, []region.EditResult{res})
+	return nil
 }
 
 // runRename parses the rename flags, drives an LSP rename, converts the server's
