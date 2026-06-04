@@ -103,8 +103,8 @@ The `ta` MCP server pins one project per process. Either:
 
 Orch AND subagents edit files in THIS repo with **bage itself** (`bage apply` / `bage rename`, built from `cmd/bage`). Built-in Edit is a **fallback only** — used when bage genuinely cannot do it.
 
-- **Edits to existing files → `bage apply`** (`--file`, `--line`/`--lines`/`--start`/`--end`, `--text`/`--text-file`, optional `--region-hash`, `--lang` empty = auto-detect). Symbol renames → `bage rename` (LSP).
-- **Honest constraint:** bage has no read and no create-file — it edits existing files only. READING and CREATING NEW FILES use built-in tools (the documented fallback); do not pretend otherwise.
+- **Edits to existing files → `bage apply`** (`--file`, `--line`/`--lines`/`--start`/`--end`, `--text`/`--text-file`, optional `--region-hash`, `--lang` empty = auto-detect). **New files → `bage create`.** Lifecycle → `bage delete` / `bage move` (raw_hash-gated). Symbol renames → `bage rename` (LSP). Inspect → `bage show` (blocks + `region_hash` map) / `bage diagnose` (parse/LSP health).
+- **Honest constraint:** bage now **creates** (`bage create`), **shows** structure (`bage show`), and does **lifecycle** (delete/move) — so the only remaining built-in fallback is **raw whole-file reading** (bage has no `cat`; `bage show` gives the addressable view). Do NOT reach for built-in Write to create a file when `bage create` works.
 - **Report findings:** any bage friction/bug goes in `BAGE_DOGFOOD_FINDINGS.md`, then gets fixed (TDD).
 - **Test parity:** when dogfooding sharpens Go, update tests + code for ALL other file types/langs to match — do not let them fall behind.
 - Goal: dogfood until bage is proven excellent for every lang/file type, and right for what Hylla needs (keep `hylla/polyglot-foundation/BAGE_UPDATE.md` current).

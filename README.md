@@ -2,7 +2,7 @@
 
 > **Båge** (Swedish for *bow / arc*) — a bidirectional code-graph round-trip file editor.
 
-Status: v0.1.0 — first tagged release (agent-IDE polyglot lib).
+Status: v0.2.0 — agent-IDE polyglot lib with file-lifecycle ops (create / delete / move / batch / show / diagnose).
 
 Båge edits source files **surgically and losslessly**. An agent (or a host like
 [Hylla](https://github.com/hylla-io)) targets a content-anchored *region* of a file, sends
@@ -55,8 +55,13 @@ The hash primitives a host mirrors for cross-system agreement are exported:
 ## CLI
 
 ```sh
-bage apply  --file path --lines 3-5 --text "new text" [--lang go] [--region-hash HASH]
-bage rename --file path --line L --col C --new newName   # LSP-driven (needs a language server)
+bage apply    --file path --lines 3-5 --text "new text" [--lang go] [--region-hash HASH]
+bage create   --file path --text "..." [--lang go]         # create a new file (rejects if it exists)
+bage delete   --file path [--raw-hash HASH]                # delete, gated on the file's raw_hash
+bage move     --from path --to path2 [--raw-hash HASH]     # relocate (src drift gate + no-clobber dest)
+bage show     --file path [--json]                         # read view: blocks + region_hash map
+bage diagnose --file path [--lsp CMD] [--json]             # parse-health (+ optional LSP diagnostics)
+bage rename   --file path --line L --col C --new newName   # LSP-driven (needs a language server)
 ```
 
 `--lang` is optional; empty auto-detects from the file path.
@@ -81,14 +86,15 @@ mage fuzz     # property fuzzing (normalize idempotency, text-fallback losslessn
 
 ## Dogfooding
 
-Båge edits Båge. Every change to a file in this repo is made **through Båge itself**
-(`bage apply` / `bage rename`), not an external editor — the project is its own first
-integration test. The built-in editor of your agent harness is a **fallback only**, used
-for the two things Båge deliberately cannot do yet:
+Båge edits Båge. Every change to a file in this repo is made **through Båge itself** —
+`bage apply` for edits, `bage create` for new files, `bage delete` / `bage move` for
+lifecycle, `bage rename` for symbols — not an external editor, so the project is its own
+first integration test. `bage show` exposes a file's addressable blocks + `region_hash` map
+(the read view an agent edits against), and `bage diagnose` surfaces parse/LSP problems. The
+built-in editor of your agent harness is now a **fallback only** for one thing:
 
-- **Reading** a file (Båge has no read command — it is an editor, not a viewer).
-- **Creating** a new file (Båge edits existing files only; `apply` resolves a region in a
-  file that must already exist).
+- **Raw whole-file reading** — Båge has no `cat` that dumps raw bytes (`bage show` gives the
+  structured block + hash view); use the harness's reader when you need the raw content.
 
 Everything else — surgical edits to existing source, docs, config, even this README — goes
 through `bage apply` with a byte/line region and a `--text` / `--text-file` replacement, so
