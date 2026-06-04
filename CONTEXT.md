@@ -120,3 +120,17 @@ byte-addressable formats — one parser, so the graph and files can never disagr
 structure. Non-byte-addressable formats (ebooks, docx, pdf) are Hylla's own, not
 Båge's.
 _Avoid_: the parser, tree-sitter (that is one possible engine, not the subsystem)
+
+**File-lifecycle op**:
+Creating, deleting, or moving a file — managing the file's existence and location, as
+opposed to a surgical edit that changes its contents. Rides the same anchored two-phase
+engine as an edit and can be mixed with edits in one all-or-nothing change.
+_Avoid_: file operation, IO op (too broad — these are the existence/location ops specifically)
+
+**Clobber**:
+Silently overwriting or destroying file content the caller has not seen. The failure
+create and delete refuse: create rejects an existing path, delete rejects a file whose
+content has drifted from the expected fingerprint. The lifecycle-op form of "reject,
+never corrupt."
+_Avoid_: overwrite (an overwrite anchored to the expected fingerprint is legitimate; a
+clobber is the unguarded, destructive kind)

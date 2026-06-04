@@ -170,3 +170,31 @@ Under `LangText` the adapter builds a `document` root spanning the whole file wi
 - `OpenFile(ctx, path) (*OpenedFile, error)` — read + `LangForPath` + parse; `Close()` frees the native tree.
 - `Outline(tree) []Symbol` — documentSymbol-like listing: named declaration nodes (grammar-agnostic, by node kind) with byte + 1-based line ranges; for the text fallback (`Native==nil`) it returns one `line` Symbol per source line.
 - `LangForPath` is re-exported on the facade so callers branch on language without importing `internal/*`.
+
+## 10. File-lifecycle ops: create / delete / move / batch (ADR-0004)
+
+Båge edits existing files (§8) **and** manages their lifecycle. All lifecycle ops ride the
+same anchored two-phase engine — there is no second, weaker write path.
+
+### §10.1 The `Op` batch
+- The transaction unit generalizes from `[]Edit` to `[]Op`, a tagged sum `Edit | Create | Delete | Move`. One `Prepare`/`Commit`/`Rollback` stages and applies a **heterogeneous** batch as one logical change; `apply`/`rename` are the `Edit`-only / rename-only cases.
+- Per-file locks are acquired in deterministic sorted order (deadlock-free); every op's anchor is validated and every write staged as a sibling temp before any flip.
+
+### §10.2 Per-op anchors (the content-hash promise, extended)
+- **Create** — anchored by **non-existence**. Existing path with content → **hard reject** (never clobber). Optional overwrite asserts the current `raw_hash` (same gate as §8).
+- **Delete** / move-**source** — anchored by the expected **`raw_hash`**. Drift → **hard reject**. Prior bytes are WAL-captured for rollback before unlinking.
+- **Move** — `= anchored-delete(source) + anchored-create(dest)`, atomic. MVP = relocate + (Hylla) re-identify; breakage → diagnostics (§10.5). Opt-in `--fixup` reuses the `rename` → `WorkspaceEdit` → atomic-batch path for LSP import fixups.
+
+### §10.3 "Atomic" defined honestly
+POSIX has no multi-file atomic flip. Cross-file all-or-nothing is **WAL-backed, on recovery**: the WAL records batch intent + undo bytes; `Recover` drives a crashed mid-flip batch to fully-before or fully-after, never half. **File-first ordering** keeps the graph leg from leading durable file state. The WAL therefore extends to record op kind + undo bytes (deleted/overwritten content).
+
+### §10.4 Gate boundary (Båge vs caller)
+Båge's gate is the **mechanical per-file parse floor** (staged bytes must still parse → else hard reject) plus **caller-configured format/lint hooks Båge executes on the staged bytes**. **Project-level correctness — whole-module compile/run, tests + `-race`, and commit *timing* — is the caller's (Hylla's); Båge never runs the build or tests.** The `Prepare`/`Commit` split hands the caller the commit-timing lever.
+
+### §10.5 Read + diagnostics + scope edges
+- **`show`** — emits a file's region + `region_hash` map (the addressable-block read view). Standalone/MCP-facing; in integrated mode Hylla's graph is the read side.
+- **Diagnostics** — after an edit/move, LSP `publishDiagnostics` + the parse result ride the result envelope. Båge surfaces; the caller fixes.
+- **Out of scope by design**: text search (ripgrep/harness), standalone directory ops (`create` makes parent dirs, `delete` reaps empty dirs), an undo stack (git = history, WAL = crash-recovery), and a full LSP nav server (nav = graph edges integrated / optional thin LSP passthrough standalone). LSP scope is **write-adjacent only**: rename, `willRenameFiles`, diagnostics.
+
+### §10.6 Graph-agnostic + open
+Ops are locator-addressed primitives. Hylla originates them from a graph mutation in integrated mode; an MCP wrapper originates them in standalone mode. Hylla-side deltas (create → N new nodes, delete → close node versions, move → re-identify + content-version referencers, mixed-op → one graph mutation, the gate boundary) are tracked in `hylla/polyglot-foundation/BAGE_UPDATE.md` + `BAGE_INTEGRATION_PLAN_ADJUSTMENT.md`.
