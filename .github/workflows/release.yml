@@ -1,8 +1,8 @@
 name: release
 
-# Tag push (vX.Y.Z) cuts a real release. Manual workflow_dispatch runs a snapshot
-# dry-run that builds every target (incl. the zig CGO cross-compiles) WITHOUT
-# publishing — use it to prove the cross-build before ever tagging.
+# Tag push (vX.Y.Z) cuts a source-only release (source tarball + checksums +
+# changelog; no prebuilt binaries — see .goreleaser.yml). workflow_dispatch runs
+# a no-publish snapshot dry-run.
 on:
   push:
     tags:
@@ -28,10 +28,6 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           cache: true
-      - name: Set up zig (CGO cross-compiler)
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
       - name: Install mage
         shell: bash
         run: |
@@ -40,7 +36,7 @@ jobs:
       - name: Run canonical CI gate
         shell: bash
         run: mage ci
-      - name: GoReleaser (release on tag, snapshot dry-run on manual)
+      - name: GoReleaser (source-only release on tag, snapshot dry-run on manual)
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
