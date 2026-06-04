@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,11 @@ type Client struct {
 	conn jsonrpc2.Conn
 	stds io.Closer // combined stdio pipe closer
 	ver  int32
+	// diags carries server→client textDocument/publishDiagnostics notifications
+	// from the read-loop handler to a waiting Diagnostics call. It is buffered so
+	// a server that publishes before anyone is collecting does not block the read
+	// loop. nil only on a zero-value Client (constructors always set it).
+	diags chan []protocol.Diagnostic
 }
 
 // serverIO bundles a subprocess's stdin (writer) and stdout (reader) into a
@@ -82,8 +88,42 @@ func NewClient(ctx context.Context, command []string) (*Client, error) {
 // cmd stays nil and Close skips the subprocess wait.
 func newClientWithTransport(ctx context.Context, rwc io.ReadWriteCloser) *Client {
 	conn := jsonrpc2.NewConn(jsonrpc2.NewStream(rwc))
-	conn.Go(ctx, jsonrpc2.MethodNotFoundHandler)
-	return &Client{conn: conn, stds: rwc}
+	c := &Client{
+		conn:  conn,
+		stds:  rwc,
+		diags: make(chan []protocol.Diagnostic, diagBuffer),
+	}
+	conn.Go(ctx, c.handle)
+	return c
+}
+
+// diagBuffer is the depth of the publishDiagnostics queue. A server may publish
+// several rounds (initial + refined) before a Diagnostics call collects; a small
+// buffer keeps the read loop from blocking without unbounded growth. Excess
+// notifications past the buffer are dropped (the latest authoritative set is what
+// matters), never blocking the connection's read loop.
+const diagBuffer = 8
+
+// handle is the Client's JSON-RPC read-loop handler. It intercepts the
+// server→client textDocument/publishDiagnostics NOTIFICATION (pushed after
+// didOpen, not as a request response), decodes its diagnostics, and forwards them
+// to any waiting Diagnostics call via c.diags; the notification is then
+// acknowledged. Every other request falls through to MethodNotFoundHandler, the
+// same minimal behavior the rename path relies on. A decode failure or a full
+// diags buffer is non-fatal: the notification is acknowledged and dropped so the
+// read loop never stalls.
+func (c *Client) handle(ctx context.Context, reply jsonrpc2.Replier, req jsonrpc2.Request) error {
+	if req.Method() == protocol.MethodTextDocumentPublishDiagnostics {
+		var params protocol.PublishDiagnosticsParams
+		if err := json.Unmarshal(req.Params(), &params); err == nil {
+			select {
+			case c.diags <- params.Diagnostics:
+			default: // buffer full: drop rather than block the read loop.
+			}
+		}
+		return reply(ctx, nil, nil)
+	}
+	return jsonrpc2.MethodNotFoundHandler(ctx, reply, req)
 }
 
 // NewClientFromConn wires a Client over an already-established bidirectional

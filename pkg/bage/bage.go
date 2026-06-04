@@ -55,6 +55,58 @@ type ConflictError = session.ConflictError
 // errors.Is without inspecting the path. See session.ErrConflict.
 var ErrConflict = session.ErrConflict
 
+// Op is a tagged file-lifecycle operation a host drives through the facade:
+// Create (from non-existence), Delete (raw_hash-gated), Move (anchored
+// delete+create), or Edit (region_hash-gated). It is the public surface of the
+// session engine's lifecycle spine (ADR-0004 §10) so a host like Hylla can drive
+// create/delete/move/batch WITHOUT importing internal/*. See session.Op.
+type Op = session.Op
+
+// OpKind tags which file-lifecycle operation an Op is. See session.OpKind.
+type OpKind = session.OpKind
+
+// Re-exported file-lifecycle op kinds. Each tags an Op for Create/Delete/Move/
+// ApplyBatch; see session for the canonical definitions.
+const (
+	// OpCreate is a create-from-non-existence op: bring a new file into being,
+	// rejecting if the path already exists.
+	OpCreate = session.OpCreate
+	// OpDelete is a delete op: unlink an existing file gated by its expected
+	// raw_hash, capturing the prior bytes for restore.
+	OpDelete = session.OpDelete
+	// OpMove is a relocate op: anchored delete of the source plus anchored create
+	// of the destination as one atomic-on-recovery unit.
+	OpMove = session.OpMove
+	// OpEdit is a region-anchored edit op carried as an Op so a heterogeneous
+	// ApplyBatch can mix edits with create/delete/move.
+	OpEdit = session.OpEdit
+)
+
+// DeleteResult is the success signal a host reads after a Delete to close that
+// file's node versions: the deleted path and the confirmed raw_hash the live
+// bytes matched at unlink time. See session.DeleteResult.
+type DeleteResult = session.DeleteResult
+
+// MoveResult is the signal a host reads after a Move so it can re-identify the
+// moved file's nodes: the removed source path plus the destination's whole-file
+// EditResult over the relocated bytes. See session.MoveResult.
+type MoveResult = session.MoveResult
+
+// BatchResult is the per-op outcome a host reads after a successful ApplyBatch,
+// in input order, so it can map each op to its graph effect. Exactly one inner
+// result field is populated, selected by Kind. See session.BatchResult.
+type BatchResult = session.BatchResult
+
+// ErrExists is the sentinel returned when Create (or a Move destination) targets
+// a path that already exists: Båge never clobbers, so callers match the reject
+// with errors.Is(err, ErrExists). See session.ErrExists.
+var ErrExists = session.ErrExists
+
+// ErrNotFound is the sentinel returned when Delete or Move targets a path that
+// does not exist: there is nothing to delete/move, distinct from a drift reject.
+// Callers match it with errors.Is(err, ErrNotFound). See session.ErrNotFound.
+var ErrNotFound = session.ErrNotFound
+
 // Lang enumerates the source languages a parser adapter can parse. See
 // parser.Lang.
 type Lang = parser.Lang
@@ -269,6 +321,50 @@ func (e *Editor) Apply(ctx context.Context, edits []Edit, anchors []FileAnchor) 
 		return nil, fmt.Errorf("bage: apply commit: %w", err)
 	}
 	return results, nil
+}
+
+// Create brings a new file into being from op (op.Kind must be OpCreate),
+// returning a whole-file EditResult a host can ingest. The path's anchor is
+// NON-EXISTENCE: an existing path HARD-REJECTS with ErrExists (matchable via
+// errors.Is) and is never clobbered. The staged op.Content clears the same
+// format/lint/parse floor edits clear, and the create is WAL-logged so a crash
+// unlinks the half-created file. It delegates to the session create leg.
+func (e *Editor) Create(ctx context.Context, op Op) (EditResult, error) {
+	return e.sess.CreateFile(ctx, op)
+}
+
+// Delete unlinks the file named by op (op.Kind must be OpDelete), returning a
+// DeleteResult a host can ingest to close that file's node versions. Its anchor
+// is the expected raw_hash drift gate: the live bytes must still hash to
+// op.ExpectedRawHash or the delete HARD-REJECTS with a *ConflictError (matchable
+// via errors.Is(err, ErrConflict)) and never discards bytes the caller did not
+// see; a missing path rejects with ErrNotFound. The full prior bytes are
+// WAL-captured before the unlink so a crash can restore them. It delegates to the
+// session delete leg.
+func (e *Editor) Delete(ctx context.Context, op Op) (DeleteResult, error) {
+	return e.sess.DeleteFile(ctx, op)
+}
+
+// Move relocates op.Path to op.To (op.Kind must be OpMove), preserving the source
+// bytes unchanged, and returns a MoveResult a host can ingest. It composes the
+// delete and create anchors: the SOURCE is gated by op.ExpectedRawHash (drift
+// HARD-REJECTS with a *ConflictError; a missing source rejects with ErrNotFound)
+// and the DESTINATION by non-existence (an existing op.To HARD-REJECTS with
+// ErrExists, no clobber). It is RELOCATE-ONLY (no LSP import-fixup) and delegates
+// to the session move leg.
+func (e *Editor) Move(ctx context.Context, op Op) (MoveResult, error) {
+	return e.sess.MoveFile(ctx, op)
+}
+
+// ApplyBatch applies a heterogeneous []Op (Edit + Create + Delete + Move) as ONE
+// all-or-nothing change a host maps to ONE graph mutation, returning one
+// BatchResult per op in input order. If ANY op fails its anchor (region_hash/
+// raw_hash drift, clobber, parse/lint floor) or fails to apply, the ENTIRE batch
+// is rejected and the filesystem is left EXACTLY as before — no op half-applied;
+// a crash mid-commit converges via Recover to fully-before or fully-after. An
+// empty batch is a hard reject. It delegates to the session batch leg.
+func (e *Editor) ApplyBatch(ctx context.Context, ops []Op) ([]BatchResult, error) {
+	return e.sess.ApplyBatch(ctx, ops)
 }
 
 // Rename performs an LSP-driven rename of the symbol at the zero-based

@@ -309,6 +309,7 @@ func newNode(n *ts.Node) *parser.Node {
 		StartPoint: toPoint(n.StartPosition()),
 		EndPoint:   toPoint(n.EndPosition()),
 		Named:      n.IsNamed(),
+		Missing:    n.IsMissing(),
 	}
 }
 
