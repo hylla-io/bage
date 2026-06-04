@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
@@ -29,6 +30,11 @@ type Client struct {
 	// a server that publishes before anyone is collecting does not block the read
 	// loop. nil only on a zero-value Client (constructors always set it).
 	diags chan []protocol.Diagnostic
+	// renameDeadline bounds how long Rename retries a still-indexing server before
+	// giving up; renameRetry is the pause between attempts. Both default via the
+	// constructors and are overridable in tests.
+	renameDeadline time.Duration
+	renameRetry    time.Duration
 }
 
 // serverIO bundles a subprocess's stdin (writer) and stdout (reader) into a
@@ -89,9 +95,11 @@ func NewClient(ctx context.Context, command []string) (*Client, error) {
 func newClientWithTransport(ctx context.Context, rwc io.ReadWriteCloser) *Client {
 	conn := jsonrpc2.NewConn(jsonrpc2.NewStream(rwc))
 	c := &Client{
-		conn:  conn,
-		stds:  rwc,
-		diags: make(chan []protocol.Diagnostic, diagBuffer),
+		conn:           conn,
+		stds:           rwc,
+		diags:          make(chan []protocol.Diagnostic, diagBuffer),
+		renameDeadline: defaultRenameDeadline,
+		renameRetry:    defaultRenameRetry,
 	}
 	conn.Go(ctx, c.handle)
 	return c
@@ -103,6 +111,14 @@ func newClientWithTransport(ctx context.Context, rwc io.ReadWriteCloser) *Client
 // notifications past the buffer are dropped (the latest authoritative set is what
 // matters), never blocking the connection's read loop.
 const diagBuffer = 8
+
+// defaultRenameDeadline bounds how long Rename waits for a still-indexing
+// language server to become ready before giving up.
+const defaultRenameDeadline = 30 * time.Second
+
+// defaultRenameRetry is the pause between rename attempts while waiting for the
+// server to become ready.
+const defaultRenameRetry = 300 * time.Millisecond
 
 // handle is the Client's JSON-RPC read-loop handler. It intercepts the
 // server→client textDocument/publishDiagnostics NOTIFICATION (pushed after
@@ -191,11 +207,40 @@ func (c *Client) Rename(ctx context.Context, path, content string, line, col uin
 		},
 		NewName: newName,
 	}
-	var we protocol.WorkspaceEdit
-	if _, err := c.conn.Call(ctx, protocol.MethodTextDocumentRename, params, &we); err != nil {
-		return protocol.WorkspaceEdit{}, fmt.Errorf("lsp: rename %q: %w", path, err)
+
+	// A language server still building its index (e.g. rust-analyzer on a cold
+	// crate) answers a rename before it can resolve references — either with an
+	// error or with an empty edit. Neither is a real "no references" verdict, so
+	// retry until the server is ready or the deadline is spent. gopls is fast
+	// enough to succeed on the first attempt; this only adds latency for servers
+	// that need warm-up.
+	deadline := time.Now().Add(c.renameDeadline)
+	var lastErr error
+	for {
+		var we protocol.WorkspaceEdit
+		if _, err := c.conn.Call(ctx, protocol.MethodTextDocumentRename, params, &we); err != nil {
+			lastErr = err
+		} else if workspaceEditHasChanges(we) {
+			return we, nil
+		} else {
+			lastErr = fmt.Errorf("server returned no edits (still indexing?)")
+		}
+		if time.Now().After(deadline) {
+			return protocol.WorkspaceEdit{}, fmt.Errorf("lsp: rename %q: not ready after %s: %w", path, c.renameDeadline, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return protocol.WorkspaceEdit{}, fmt.Errorf("lsp: rename %q: %w", path, ctx.Err())
+		case <-time.After(c.renameRetry):
+		}
 	}
-	return we, nil
+}
+
+// workspaceEditHasChanges reports whether we carries at least one edit. An empty
+// WorkspaceEdit from a rename means the server has not yet resolved the symbols
+// references (still indexing); Rename treats that as not-ready and retries.
+func workspaceEditHasChanges(we protocol.WorkspaceEdit) bool {
+	return len(we.Changes) > 0 || len(we.DocumentChanges) > 0
 }
 
 // languageIDForPath maps a file path's extension to the LSP textDocument
