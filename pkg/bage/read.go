@@ -4,23 +4,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/hylla-io/bage/internal/hashing"
 	"github.com/hylla-io/bage/internal/region"
 )
 
 // Block is one Outline Symbol enriched with its content anchor and, optionally,
-// its raw bytes. RegionHash is the region_hash that anchors the block by content
-// (byte-identical to what Hylla stores per node); Content is the source slice for
-// the block's byte range, populated only when ReadBlocks is asked to include it.
-// Block embeds Symbol, so every Symbol field (Kind, Name, byte/line ranges) is
-// promoted onto the Block.
+// its raw bytes. It is a FLAT struct (deliberately not an embed) so both JSON and
+// TOON render it cleanly: JSON keys stay snake_case with no leaked Go field names
+// or nested object, and a slice of Blocks is a uniform array that TOON emits in
+// its compact tabular form (the token win). RegionHash is the region_hash that
+// anchors the block by content (byte-identical to what Hylla stores per node);
+// Content is the source slice for the block's byte range, populated only when
+// ReadBlocks is asked to include it.
 type Block struct {
-	Symbol
+	// Kind is the grammar node kind (e.g. "function_declaration"), "line" for the
+	// text fallback, or "range" for a line/byte-addressed read.
+	Kind string `json:"kind" toon:"kind"`
+	// Name is the declared identifier, best-effort; "" when none was found.
+	Name string `json:"name" toon:"name"`
+	// StartLine is the 1-based start line of the block.
+	StartLine int `json:"start_line" toon:"start_line"`
+	// EndLine is the 1-based end line of the block.
+	EndLine int `json:"end_line" toon:"end_line"`
+	// StartByte is the inclusive start byte offset of the block.
+	StartByte int `json:"start_byte" toon:"start_byte"`
+	// EndByte is the exclusive end byte offset of the block.
+	EndByte int `json:"end_byte" toon:"end_byte"`
 	// RegionHash anchors the block by content; see region.HashRegion.
-	RegionHash string `json:"region_hash"`
+	RegionHash string `json:"region_hash" toon:"region_hash"`
 	// Content is the raw source for the block's byte range; "" unless requested.
-	Content string `json:"content,omitempty"`
+	Content string `json:"content,omitempty" toon:"content,omitempty"`
 }
 
 // ReadBlocks returns one Block per Outline Symbol of opened, in source order:
@@ -44,7 +59,12 @@ func ReadBlocks(opened *OpenedFile, includeContent bool) []Block {
 			content = string(src[sym.StartByte:sym.EndByte])
 		}
 		blocks = append(blocks, Block{
-			Symbol:     sym,
+			Kind:       sym.Kind,
+			Name:       sym.Name,
+			StartLine:  sym.StartLine,
+			EndLine:    sym.EndLine,
+			StartByte:  sym.StartByte,
+			EndByte:    sym.EndByte,
 			RegionHash: region.HashRegion(src, sym.StartByte, sym.EndByte),
 			Content:    content,
 		})
@@ -55,12 +75,12 @@ func ReadBlocks(opened *OpenedFile, includeContent bool) []Block {
 // ReadOptions selects what an Editor.Read returns. The zero value reads the whole
 // file's structure with no raw content. IncludeContent populates each Block's
 // Content with its source slice; Symbol, when non-empty, filters the returned
-// Blocks to those whose embedded Symbol.Name matches exactly. Line/EndLine and
+// Blocks to those whose Name matches exactly. Line/EndLine and
 // StartByte/EndByte address a sub-range (see Read for the addressing rule).
 type ReadOptions struct {
 	// IncludeContent populates each returned Block's Content with its raw bytes.
 	IncludeContent bool
-	// Symbol, when non-empty, keeps only Blocks whose Symbol.Name equals it.
+	// Symbol, when non-empty, keeps only Blocks whose Name equals it.
 	Symbol string
 	// Line is the 1-based start line of a sub-range read (0 = unset; lines are
 	// 1-based). When EndLine > Line the read spans the inclusive [Line, EndLine].
@@ -81,15 +101,41 @@ type ReadOptions struct {
 // when requested, raw content.
 type ReadResult struct {
 	// Path is the file path that was read (as supplied by the caller).
-	Path string `json:"path"`
+	Path string `json:"path" toon:"path"`
 	// Lang is the detected source language's string name.
-	Lang string `json:"lang"`
+	Lang string `json:"lang" toon:"lang"`
 	// RawHash is the whole-file raw-bytes digest (byte-offset validity gate).
-	RawHash string `json:"raw_hash"`
+	RawHash string `json:"raw_hash" toon:"raw_hash"`
 	// NormHash is the whole-file normalized-bytes digest (content anchor).
-	NormHash string `json:"norm_hash"`
+	NormHash string `json:"norm_hash" toon:"norm_hash"`
 	// Blocks are the file's Outline blocks, optionally filtered by ReadOptions.
-	Blocks []Block `json:"blocks"`
+	Blocks []Block `json:"blocks" toon:"blocks"`
+}
+
+// RenderText writes the human-readable read view of r to w: a header line
+// "<path> lang=<lang> raw=<raw> norm=<norm> blocks=<N>" followed by one line per
+// Block — "  <kind> <name> lines [<sl>:<el>] bytes [<sb>:<eb>] region=<H>" — where
+// an empty Block.Name renders as "-". This is byte-identical to the text output
+// cmd/bage show emits, so the CLI and any RenderText-aware host share one format.
+// Implementing RenderText makes ReadResult text-renderable without importing
+// pkg/render.
+func (r ReadResult) RenderText(w io.Writer) error {
+	if _, err := fmt.Fprintf(w, "%s lang=%s raw=%s norm=%s blocks=%d\n",
+		r.Path, r.Lang, r.RawHash, r.NormHash, len(r.Blocks)); err != nil {
+		return err
+	}
+	for _, b := range r.Blocks {
+		name := b.Name
+		if name == "" {
+			name = "-"
+		}
+		if _, err := fmt.Fprintf(w,
+			"  %s %s lines [%d:%d] bytes [%d:%d] region=%s\n",
+			b.Kind, name, b.StartLine, b.EndLine, b.StartByte, b.EndByte, b.RegionHash); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Read opens path with the shared parser, lists its Blocks, and returns a
@@ -109,7 +155,7 @@ type ReadResult struct {
 // that range; its Content is the range's raw bytes when opts.IncludeContent is
 // set (bounds-guarded). Otherwise, when opts.IncludeContent is set each Block's
 // Content is populated; when opts.Symbol is non-empty the Blocks are filtered to
-// those whose embedded Symbol.Name matches exactly. It reuses OpenFile,
+// those whose Name matches exactly. It reuses OpenFile,
 // ReadBlocks, ResolveRange, and the Editor's hasher; the opened file is closed
 // before Read returns.
 func (e *Editor) Read(ctx context.Context, path string, opts ReadOptions) (ReadResult, error) {
@@ -188,13 +234,11 @@ func (e *Editor) rangeBlock(src []byte, opts ReadOptions, lineMode bool) (Block,
 		content = string(src[reg.StartByte:reg.EndByte])
 	}
 	return Block{
-		Symbol: Symbol{
-			Kind:      "range",
-			StartByte: reg.StartByte,
-			EndByte:   reg.EndByte,
-			StartLine: reg.StartLine,
-			EndLine:   reg.EndLine,
-		},
+		Kind:       "range",
+		StartByte:  reg.StartByte,
+		EndByte:    reg.EndByte,
+		StartLine:  reg.StartLine,
+		EndLine:    reg.EndLine,
 		RegionHash: region.HashRegion(src, reg.StartByte, reg.EndByte),
 		Content:    content,
 	}, nil

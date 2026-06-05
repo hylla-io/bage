@@ -10,7 +10,6 @@ import (
 	"os"
 
 	"github.com/hylla-io/bage/internal/hashing"
-	"github.com/hylla-io/bage/internal/region"
 	"github.com/hylla-io/bage/pkg/bage"
 )
 
@@ -60,8 +59,8 @@ type showView struct {
 
 // runShow parses the show flags and emits the READ view of --file: it opens and
 // parses the file via the shared parser (pkg/bage.OpenFile), builds the Outline
-// (pkg/bage.Outline), and for each block computes the region_hash via the SAME
-// path apply verifies (region.HashRegion), alongside the file's raw/norm hashes.
+// of addressable blocks via the shared pkg/bage.ReadBlocks (each block carries
+// the region_hash apply verifies), alongside the file's raw/norm hashes.
 // Default output is human-readable; --json emits the structured showView. show is
 // strictly READ-ONLY — it writes nothing to disk, ever. On any error it prints a
 // clear message to stderr and returns it.
@@ -107,16 +106,16 @@ func runShow(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		NormHash: hashing.NormHash(hasher, src),
 		Outline:  make([]showBlock, 0),
 	}
-	for _, sym := range bage.Outline(opened.Tree) {
+	for _, blk := range bage.ReadBlocks(opened, false) {
 		view.Outline = append(view.Outline, showBlock{
-			Kind:      sym.Kind,
-			Name:      sym.Name,
-			StartLine: sym.StartLine,
-			EndLine:   sym.EndLine,
-			StartByte: sym.StartByte,
-			EndByte:   sym.EndByte,
-			// SAME path apply verifies, so the hash round-trips exactly.
-			RegionHash: region.HashRegion(src, sym.StartByte, sym.EndByte),
+			Kind:      blk.Kind,
+			Name:      blk.Name,
+			StartLine: blk.StartLine,
+			EndLine:   blk.EndLine,
+			StartByte: blk.StartByte,
+			EndByte:   blk.EndByte,
+			// SAME region_hash apply verifies, so the hash round-trips exactly.
+			RegionHash: blk.RegionHash,
 		})
 	}
 

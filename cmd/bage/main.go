@@ -40,6 +40,7 @@ usage:
   bage delete --file F [--raw-hash H]
   bage move   --from F --to G [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
+  bage read   --file F [--line L | --lines L1-L2 | --start S --end E] [--symbol NAME] [--content] [--format text|json|toon]
   bage show   --file F [--json]
   bage diagnose --file F [--lsp CMD] [--json]
 
@@ -134,6 +135,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runMove(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
+	case "read":
+		return runRead(ctx, args[1:], stdout, stderr)
 	case "show":
 		return runShow(ctx, args[1:], stdout, stderr)
 	case "diagnose":

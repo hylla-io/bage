@@ -1,14 +1,46 @@
 package bage_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/hylla-io/bage/internal/hashing"
 	"github.com/hylla-io/bage/internal/region"
 	"github.com/hylla-io/bage/pkg/bage"
 )
+
+// TestReadResultJSONShape pins the wire shape: Block is flat, so JSON keys are
+// snake_case with no leaked Go field names and no nested Symbol object. That flat
+// shape is also what lets a slice of Blocks render in TOON's compact tabular form.
+func TestReadResultJSONShape(t *testing.T) {
+	rr := bage.ReadResult{
+		Path: "p", Lang: "go", RawHash: "r", NormHash: "n",
+		Blocks: []bage.Block{{
+			Kind: "function_declaration", Name: "Foo",
+			StartLine: 1, EndLine: 2, StartByte: 0, EndByte: 10, RegionHash: "h",
+		}},
+	}
+	b, err := json.Marshal(rr)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	s := string(b)
+	for _, want := range []string{`"kind"`, `"name"`, `"start_line"`, `"end_line"`, `"start_byte"`, `"end_byte"`, `"region_hash"`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %s in %s", want, s)
+		}
+	}
+	for _, bad := range []string{`"Symbol"`, `"Kind"`, `"StartByte"`} {
+		if strings.Contains(s, bad) {
+			t.Errorf("unexpected snake_case-violating key %s in %s", bad, s)
+		}
+	}
+}
 
 // TestReadBlocks proves ReadBlocks anchors each Outline Symbol with the same
 // region_hash region.HashRegion produces, honors includeContent for both Go
@@ -61,9 +93,11 @@ func TestReadBlocks(t *testing.T) {
 			for i, sym := range outline {
 				wantHash := region.HashRegion(opened.Tree.Source, sym.StartByte, sym.EndByte)
 
-				// (3) Block embeds the Symbol fields.
-				if noContent[i].Symbol != sym {
-					t.Errorf("block %d: Symbol = %+v, want %+v", i, noContent[i].Symbol, sym)
+				// (3) Block carries the Symbol's fields (flattened).
+				if noContent[i].Kind != sym.Kind || noContent[i].Name != sym.Name ||
+					noContent[i].StartByte != sym.StartByte || noContent[i].EndByte != sym.EndByte ||
+					noContent[i].StartLine != sym.StartLine || noContent[i].EndLine != sym.EndLine {
+					t.Errorf("block %d: fields = %+v, want symbol %+v", i, noContent[i], sym)
 				}
 
 				// (1) RegionHash matches region.HashRegion for the matching Symbol.
@@ -144,6 +178,49 @@ func TestEditorRead(t *testing.T) {
 		if res.Blocks[i].Content != "" {
 			t.Errorf("block %d: Content = %q, want empty", i, res.Blocks[i].Content)
 		}
+	}
+}
+
+// TestReadResultRenderText proves ReadResult.RenderText emits exactly the same
+// lines cmd/bage show's printShowText produces: a header line
+// "<path> lang=<lang> raw=<raw> norm=<norm> blocks=<N>" then one
+// "  <kind> <name> lines [<sl>:<el>] bytes [<sb>:<eb>] region=<H>" per block,
+// with an empty name rendered as "-". The want string is built independently
+// from the ReadResult fields so the test pins the precise show format.
+func TestReadResultRenderText(t *testing.T) {
+	p := writeTemp(t, "main.go", goReadSrc)
+	ed, err := bage.Open(bage.Config{WALDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer ed.Close()
+
+	res, err := ed.Read(context.Background(), p, bage.ReadOptions{})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(res.Blocks) == 0 {
+		t.Fatalf("no blocks")
+	}
+
+	var want bytes.Buffer
+	fmt.Fprintf(&want, "%s lang=%s raw=%s norm=%s blocks=%d\n",
+		res.Path, res.Lang, res.RawHash, res.NormHash, len(res.Blocks))
+	for _, b := range res.Blocks {
+		name := b.Name
+		if name == "" {
+			name = "-"
+		}
+		fmt.Fprintf(&want, "  %s %s lines [%d:%d] bytes [%d:%d] region=%s\n",
+			b.Kind, name, b.StartLine, b.EndLine, b.StartByte, b.EndByte, b.RegionHash)
+	}
+
+	var got bytes.Buffer
+	if err := res.RenderText(&got); err != nil {
+		t.Fatalf("RenderText: %v", err)
+	}
+	if got.String() != want.String() {
+		t.Errorf("RenderText mismatch:\n got: %q\nwant: %q", got.String(), want.String())
 	}
 }
 
