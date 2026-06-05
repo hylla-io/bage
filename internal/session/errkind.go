@@ -1,6 +1,10 @@
 package session
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"io"
+)
 
 // Kind is a stable, machine-readable classification of a session error, used by
 // hosts (CLI exit codes, Hylla) to react to a failure without inspecting wrapped
@@ -54,4 +58,36 @@ func KindOf(err error) Kind {
 	default:
 		return KindIO
 	}
+}
+
+// ErrorEnvelope is the machine- and human-renderable projection of a session
+// error: its stable Kind, the offending path (when known), and the underlying
+// error message. Hosts marshal it to JSON for Hylla or render it as a single
+// diagnostic line for the CLI via RenderText.
+type ErrorEnvelope struct {
+	// Kind is the stable classification from KindOf.
+	Kind Kind `json:"kind"`
+	// Path is the file the failure concerns, omitted from JSON when empty.
+	Path string `json:"path,omitempty"`
+	// Message is the underlying error's text.
+	Message string `json:"message"`
+}
+
+// Envelope projects err into an ErrorEnvelope: it classifies err via KindOf,
+// records err.Error() as the message, and lifts the Path from a wrapped
+// *ConflictError when one is present in the chain.
+func Envelope(err error) ErrorEnvelope {
+	env := ErrorEnvelope{Kind: KindOf(err), Message: err.Error()}
+	if ce := (*ConflictError)(nil); errors.As(err, &ce) {
+		env.Path = ce.Path
+	}
+	return env
+}
+
+// RenderText writes the envelope as a single "bage: <kind>: <message>" line to
+// w. It implements the render.TextRenderable contract by method shape alone, so
+// this package imports only io and fmt — never pkg/render.
+func (e ErrorEnvelope) RenderText(w io.Writer) error {
+	_, err := fmt.Fprintf(w, "bage: %s: %s\n", e.Kind, e.Message)
+	return err
 }

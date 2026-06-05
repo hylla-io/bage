@@ -80,7 +80,7 @@ func (s *Session) DeleteFile(_ context.Context, op Op) (DeleteResult, error) {
 	// delete HARD-REJECTS and never discards bytes the caller did not see.
 	liveRaw := hashing.RawHash(s.Hasher, live)
 	if liveRaw != op.ExpectedRawHash {
-		return DeleteResult{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift"}
+		return DeleteResult{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift", kind: KindDrift}
 	}
 
 	// Capture the FULL prior bytes in a durable WAL record BEFORE the unlink, so a
