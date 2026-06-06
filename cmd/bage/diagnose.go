@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,42 +14,43 @@ import (
 
 	"github.com/hylla-io/bage/internal/lsp"
 	"github.com/hylla-io/bage/pkg/bage"
+	"github.com/hylla-io/bage/pkg/render"
 )
 
 // parseDefectView is one parse-health defect in the diagnose read view: an
 // ERROR/MISSING node with 1-based line/col and a half-open byte range. It mirrors
-// bage.ParseDefect with JSON tags for --json.
+// bage.ParseDefect with json+toon tags for --format json|toon.
 type parseDefectView struct {
 	// Kind is "ERROR" or "MISSING".
-	Kind string `json:"kind"`
+	Kind string `json:"kind" toon:"kind"`
 	// Line is the 1-based line of the defect.
-	Line int `json:"line"`
+	Line int `json:"line" toon:"line"`
 	// Col is the 1-based column of the defect.
-	Col int `json:"col"`
+	Col int `json:"col" toon:"col"`
 	// StartByte is the inclusive start byte offset.
-	StartByte int `json:"start_byte"`
+	StartByte int `json:"start_byte" toon:"start_byte"`
 	// EndByte is the exclusive end byte offset.
-	EndByte int `json:"end_byte"`
+	EndByte int `json:"end_byte" toon:"end_byte"`
 }
 
 // lspDiagnosticView is one LSP-reported diagnostic in the diagnose read view:
 // severity, 1-based range, message, and source. It mirrors lsp.Diagnostic with
-// JSON tags for --json.
+// json+toon tags for --format json|toon.
 type lspDiagnosticView struct {
 	// Severity is the human label ("Error", "Warning", "Information", "Hint").
-	Severity string `json:"severity"`
+	Severity string `json:"severity" toon:"severity"`
 	// Source names the diagnostic's origin (may be "").
-	Source string `json:"source"`
+	Source string `json:"source" toon:"source"`
 	// Message is the diagnostic text.
-	Message string `json:"message"`
+	Message string `json:"message" toon:"message"`
 	// StartLine is the 1-based start line.
-	StartLine int `json:"start_line"`
+	StartLine int `json:"start_line" toon:"start_line"`
 	// StartCol is the 1-based start column.
-	StartCol int `json:"start_col"`
+	StartCol int `json:"start_col" toon:"start_col"`
 	// EndLine is the 1-based end line.
-	EndLine int `json:"end_line"`
+	EndLine int `json:"end_line" toon:"end_line"`
 	// EndCol is the 1-based end column.
-	EndCol int `json:"end_col"`
+	EndCol int `json:"end_col" toon:"end_col"`
 }
 
 // diagnoseView is the structured read view emitted by diagnose: the file, its
@@ -60,13 +60,13 @@ type lspDiagnosticView struct {
 // emitted on both clean and defect-bearing files (SPEC §10.5).
 type diagnoseView struct {
 	// Path is the file that was diagnosed.
-	Path string `json:"path"`
+	Path string `json:"path" toon:"path"`
 	// Lang is the canonical language name selected for Path (never "unknown").
-	Lang string `json:"lang"`
+	Lang string `json:"lang" toon:"lang"`
 	// ParseHealth lists every ERROR/MISSING node from the LSP-free parse tier.
-	ParseHealth []parseDefectView `json:"parse_health"`
+	ParseHealth []parseDefectView `json:"parse_health" toon:"parse_health"`
 	// LSP lists the language server's diagnostics; empty unless --lsp was given.
-	LSP []lspDiagnosticView `json:"lsp"`
+	LSP []lspDiagnosticView `json:"lsp" toon:"lsp"`
 }
 
 // runDiagnose parses the diagnose flags and SURFACES problems in --file from two
@@ -76,7 +76,9 @@ type diagnoseView struct {
 // the server's textDocument/publishDiagnostics after didOpen. diagnose does NOT
 // fix anything; the host/agent decides. Reporting defects is SUCCESS: exit code is
 // 0 even when diagnostics are found, with non-zero reserved for usage/IO/LSP-start
-// errors. Default output is human-readable; --json emits the structured view.
+// errors. The view is rendered in the --format the caller selects (text|json|toon)
+// through pkg/render.Emit, so diagnose shares one format surface with every other
+// verb.
 func runDiagnose(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("diagnose", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -84,7 +86,7 @@ func runDiagnose(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	var (
 		file   = fs.String("file", "", "path of the file to diagnose (required)")
 		lspCmd = fs.String("lsp", "", "optional LSP server command; when given, also collect the server's published diagnostics")
-		asJSON = fs.Bool("json", false, "emit structured JSON instead of human-readable text")
+		format = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -94,6 +96,12 @@ func runDiagnose(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if *file == "" {
 		fmt.Fprintln(stderr, "bage diagnose: --file is required")
 		return errors.New("bage diagnose: --file is required")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	opened, err := bage.OpenFile(ctx, *file)
@@ -141,11 +149,7 @@ func runDiagnose(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		}
 	}
 
-	if *asJSON {
-		return printDiagnoseJSON(stdout, stderr, view)
-	}
-	printDiagnoseText(stdout, view)
-	return nil
+	return render.Emit(stdout, fmtKind, view)
 }
 
 // collectLSPDiagnostics starts the named LSP server, initializes it rooted at the
@@ -185,36 +189,33 @@ func collectLSPDiagnostics(ctx context.Context, file, lspCmd string) ([]lsp.Diag
 	return diags, nil
 }
 
-// printDiagnoseJSON writes the diagnoseView as indented JSON.
-func printDiagnoseJSON(stdout, stderr io.Writer, view diagnoseView) error {
-	b, err := json.MarshalIndent(view, "", "  ")
-	if err != nil {
-		fmt.Fprintf(stderr, "bage diagnose: marshal json: %v\n", err)
-		return fmt.Errorf("bage diagnose: marshal json: %w", err)
-	}
-	fmt.Fprintln(stdout, string(b))
-	return nil
-}
-
-// printDiagnoseText writes the human-readable diagnose view: a header line with
-// the path, language, and the two source counts, then one line per parse-health
+// RenderText writes the human-readable diagnose view: a header line with the
+// path, language, and the two source counts, then one line per parse-health
 // defect and one per LSP diagnostic. A file with no problems prints just the
-// header (counts of 0), which is the explicit clean signal.
-func printDiagnoseText(stdout io.Writer, view diagnoseView) {
-	fmt.Fprintf(stdout, "%s lang=%s parse_health=%d lsp=%d\n",
-		view.Path, view.Lang, len(view.ParseHealth), len(view.LSP))
-	for _, d := range view.ParseHealth {
-		fmt.Fprintf(stdout,
-			"  parse %s line %d col %d bytes [%d:%d]\n",
-			d.Kind, d.Line, d.Col, d.StartByte, d.EndByte)
+// header (counts of 0), which is the explicit clean signal. It is the FormatText
+// path render.Emit type-asserts to (diagnoseView implements render.TextRenderable).
+func (v diagnoseView) RenderText(w io.Writer) error {
+	if _, err := fmt.Fprintf(w, "%s lang=%s parse_health=%d lsp=%d\n",
+		v.Path, v.Lang, len(v.ParseHealth), len(v.LSP)); err != nil {
+		return err
 	}
-	for _, d := range view.LSP {
+	for _, d := range v.ParseHealth {
+		if _, err := fmt.Fprintf(w,
+			"  parse %s line %d col %d bytes [%d:%d]\n",
+			d.Kind, d.Line, d.Col, d.StartByte, d.EndByte); err != nil {
+			return err
+		}
+	}
+	for _, d := range v.LSP {
 		source := d.Source
 		if source == "" {
 			source = "-"
 		}
-		fmt.Fprintf(stdout,
+		if _, err := fmt.Fprintf(w,
 			"  lsp %s [%s] line %d col %d: %s\n",
-			d.Severity, source, d.StartLine, d.StartCol, d.Message)
+			d.Severity, source, d.StartLine, d.StartCol, d.Message); err != nil {
+			return err
+		}
 	}
+	return nil
 }

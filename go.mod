@@ -6,6 +6,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/evanmschultz/laslig v0.2.4
 	github.com/testcontainers/testcontainers-go v0.42.0
+	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter-grammars/tree-sitter-make v1.1.1
 	github.com/tree-sitter-grammars/tree-sitter-markdown v0.5.1
 	github.com/tree-sitter-grammars/tree-sitter-toml v0.7.0
@@ -95,7 +96,6 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
-	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
 	github.com/yuin/goldmark-emoji v1.0.6 // indirect
