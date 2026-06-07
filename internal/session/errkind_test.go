@@ -5,9 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
+
+// TestKindOfOSNotExist verifies a wrapped os.ErrNotExist (e.g. opening a missing
+// file via OpenFile) classifies as KindNotFound, not the KindIO default.
+func TestKindOfOSNotExist(t *testing.T) {
+	wrapped := fmt.Errorf("bage: open file %q: %w", "x.go", os.ErrNotExist)
+	if got := KindOf(wrapped); got != KindNotFound {
+		t.Fatalf("KindOf(os.ErrNotExist) = %q, want %q", got, KindNotFound)
+	}
+}
 
 // driftErr is a local Kinded error used to verify KindOf prefers an
 // errors.As-discoverable Kind() over the sentinel switch.

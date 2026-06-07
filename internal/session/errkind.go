@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 )
 
 // Kind is a stable, machine-readable classification of a session error, used by
@@ -38,7 +39,8 @@ type Kinded interface {
 
 // KindOf classifies err into a Kind. It returns the empty Kind for a nil error,
 // the error's own Kind if any error in the chain implements Kinded, then matches
-// the known sentinels (ErrConflict, ErrExists, ErrNotFound) via errors.Is, and
+// the known sentinels (ErrConflict, ErrExists, ErrNotFound) and the OS not-exist
+// error (os.ErrNotExist, e.g. opening a missing file) via errors.Is, and
 // otherwise defaults to KindIO.
 func KindOf(err error) Kind {
 	if err == nil {
@@ -53,7 +55,7 @@ func KindOf(err error) Kind {
 		return KindConflict
 	case errors.Is(err, ErrExists):
 		return KindExists
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, ErrNotFound), errors.Is(err, os.ErrNotExist):
 		return KindNotFound
 	default:
 		return KindIO
