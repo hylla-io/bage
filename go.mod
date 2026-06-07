@@ -6,6 +6,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/evanmschultz/laslig v0.2.4
 	github.com/testcontainers/testcontainers-go v0.42.0
+	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter-grammars/tree-sitter-make v1.1.1
 	github.com/tree-sitter-grammars/tree-sitter-markdown v0.5.1
 	github.com/tree-sitter-grammars/tree-sitter-toml v0.7.0

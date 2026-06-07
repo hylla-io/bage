@@ -206,7 +206,7 @@ func (s *Session) validateDelete(op Op, intent *wal.Intent) (preparedOp, error) 
 		return preparedOp{}, err
 	}
 	if hashing.RawHash(s.Hasher, live) != op.ExpectedRawHash {
-		return preparedOp{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift"}
+		return preparedOp{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift", kind: KindDrift}
 	}
 	intent.Deletes = append(intent.Deletes, op.Path)
 	intent.Originals[op.Path] = live
@@ -226,7 +226,7 @@ func (s *Session) validateMove(op Op, intent *wal.Intent) (preparedOp, error) {
 		return preparedOp{}, err
 	}
 	if hashing.RawHash(s.Hasher, live) != op.ExpectedRawHash {
-		return preparedOp{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift"}
+		return preparedOp{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift", kind: KindDrift}
 	}
 	if _, statErr := os.Stat(op.To); statErr == nil {
 		return preparedOp{}, fmt.Errorf("session: move dest %q: %w", op.To, ErrExists)

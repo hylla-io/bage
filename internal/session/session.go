@@ -57,6 +57,9 @@ type ConflictError struct {
 	// Reason is the resolve status that triggered the conflict ("conflict" or
 	// "ambiguous"), or a wrapped resolver error message.
 	Reason string
+	// kind classifies the conflict for KindOf. A zero kind falls back to the
+	// Reason heuristic in Kind(), keeping older construction sites compatible.
+	kind Kind
 }
 
 // Error implements error with a path-and-reason-qualified message.
@@ -66,6 +69,20 @@ func (e *ConflictError) Error() string {
 
 // Unwrap returns ErrConflict so errors.Is(err, ErrConflict) matches a ConflictError.
 func (e *ConflictError) Unwrap() error { return ErrConflict }
+
+// Kind classifies the conflict so KindOf can distinguish a raw_hash drift reject
+// (KindDrift) from a region resolve conflict (KindConflict). It prefers the
+// explicitly set kind; when zero it falls back to the Reason heuristic so
+// construction sites that predate the field stay correctly classified.
+func (e *ConflictError) Kind() Kind {
+	if e.kind != "" {
+		return e.kind
+	}
+	if e.Reason == "raw_hash drift" {
+		return KindDrift
+	}
+	return KindConflict
+}
 
 // Session is the configured FILE-LEG edit engine. Formatter and Linter may be
 // nil to skip the corresponding step; Parser, Hasher, and WALDir are required.
@@ -312,7 +329,7 @@ func (s *Session) resolveEdits(path string, live []byte, edits []region.Edit) ([
 	for _, e := range edits {
 		start, end, status, rerr := region.Resolve(s.Parser, s.langFor(path), live, e.Region)
 		if status == region.Conflict || status == region.Ambiguous || rerr != nil {
-			return nil, &ConflictError{Path: path, Reason: status.String()}
+			return nil, &ConflictError{Path: path, Reason: status.String(), kind: KindConflict}
 		}
 		resolved = append(resolved, locator.FileEdit{
 			Path:      path,
