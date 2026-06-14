@@ -36,11 +36,11 @@ import (
 const usage = `bage — round-trip file editor (standalone)
 
 usage:
-  bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD]
-  bage create --file F (--text T | --text-file P) [--lang go] [--fmt CMD] [--lint CMD]
-  bage delete --file F [--raw-hash H]
-  bage move   --from F --to G [--raw-hash H]
-  bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
+  bage apply  --file F (--line L | --lines L1-L2 | --start S --end E) --text T [--region-hash H] [--lang go] [--fmt CMD] [--lint CMD] [--format text|json|toon]
+  bage create --file F (--text T | --text-file P) [--lang go] [--fmt CMD] [--lint CMD] [--format text|json|toon]
+  bage delete --file F [--raw-hash H] [--format text|json|toon]
+  bage move   --from F --to G [--raw-hash H] [--format text|json|toon]
+  bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go] [--format text|json|toon]
   bage read   --file F [--line L | --lines L1-L2 | --start S --end E] [--symbol NAME] [--content] [--format text|json|toon]
   bage show   --file F [--format text|json|toon]
   bage diagnose --file F [--lsp CMD] [--format text|json|toon]
