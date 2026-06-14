@@ -4,7 +4,7 @@
 > files + LSP; in integrated mode, Hylla links Båge as a library so one agent-facing edit
 > lands in both the graph and the files with no possible drift. This SPEC is the buildable
 > contract; design rationale lives in `docs/adr/` and `CONTEXT.md`. Module:
-> `github.com/hylla-io/bage`. Status: foundation drop. Date: 2026-06-01.
+> `github.com/hylla-io/bage`. Status: v0.4.0 (shipped) — read + serialization + error taxonomy (§11). Date: 2026-06-01.
 
 ---
 
