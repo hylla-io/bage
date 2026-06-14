@@ -134,3 +134,26 @@ content has drifted from the expected fingerprint. The lifecycle-op form of "rej
 never corrupt."
 _Avoid_: overwrite (an overwrite anchored to the expected fingerprint is legitimate; a
 clobber is the unguarded, destructive kind)
+
+**Read view**:
+The addressable, content-anchored projection of a file Båge emits for inspection: per
+block, its kind, name, line/byte range, and `region_hash` (the edit anchor), plus the
+file's raw/norm hashes. `bage show` is the structure-only read view; `bage read` adds
+optional block content and whole-file / `--symbol` / `--line` / byte-range addressing. In
+integrated mode Hylla's graph is the read side; standalone, this is how an agent sees a
+file cheaply.
+_Avoid_: dump, cat (the read view is structured + anchored, not a raw byte dump)
+
+**TOON** (Token-Oriented Object Notation):
+A compact serialization Båge emits via `--format toon`: a uniform array of blocks renders
+as a tabular form — field names declared once, then one comma-row per block — costing
+~30–60% fewer tokens than the equivalent JSON for the read view. One of three `--format`
+encodings (text | json | toon).
+_Avoid_: JSON-lite, CSV (TOON keeps full structure; it is not lossy CSV)
+
+**Error kind**:
+A stable, machine-branchable classification of a Båge error — `conflict | drift | exists |
+not-found | usage | io` — exposed as `bage.KindOf(err)` and serialized in
+`bage.ErrorEnvelope{Kind, Path, Message}`, re-exported from `pkg/bage` so an external host
+(MCP, Hylla) reacts to a failure without parsing English.
+_Avoid_: error code, error string (the kind is a closed taxonomy a host switches on)
