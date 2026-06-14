@@ -50,7 +50,11 @@ With **file-first ordering**, the graph leg never commits ahead of a durable fil
 
 **Gate boundary.** Båge's gate is the **mechanical per-file parse floor** ("would the staged
 bytes still parse?" → hard reject if not) plus **optional format/lint hooks that the caller
-configures and Båge merely executes on the staged bytes**. **Project-level correctness —
+configures and Båge merely executes on the staged bytes**. The floor is **lenient by design**:
+tree-sitter is error-tolerant, so staged bytes that produce a tree *with* `ERROR`/`MISSING`
+nodes are **accepted** (an agent must be free to write broken intermediate states mid-refactor)
+— `diagnose` surfaces those defects and the caller/Hylla decides; only bytes that fail to
+produce a tree at all are rejected. **Project-level correctness —
 does the whole module compile / run / pass tests + `-race`, and is *now* the right moment —
 is the caller's (Hylla's), and Båge never runs the build or tests.** The `Prepare`/`Commit`
 split hands the caller commit **timing**.
@@ -64,8 +68,8 @@ split hands the caller commit **timing**.
   full nav server: go-to-def / find-refs are graph edges (integrated) or an optional thin LSP
   passthrough (standalone).
 - **No text search** (ripgrep / the harness), **no standalone directory ops** (`create` makes
-  parent dirs; `delete` reaps empty dirs), **no undo stack** (git is history; the WAL is
-  crash-recovery).
+  parent dirs; `delete` leaves a now-empty parent dir for the host/VCS to reap — Båge does
+  not prune dirs), **no undo stack** (git is history; the WAL is crash-recovery).
 
 ## Considered options
 

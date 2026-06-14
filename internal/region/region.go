@@ -88,21 +88,21 @@ type Edit struct {
 // re-ingests only the changed region.
 type EditResult struct {
 	// Path is the file that was edited.
-	Path string
+	Path string `json:"path" toon:"path"`
 	// ChangedStart is the inclusive starting byte offset of the changed range.
-	ChangedStart int
+	ChangedStart int `json:"changed_start" toon:"changed_start"`
 	// ChangedEnd is the exclusive ending byte offset of the changed range.
-	ChangedEnd int
+	ChangedEnd int `json:"changed_end" toon:"changed_end"`
 	// NewRegionHash is the region_hash of the post-edit region bytes.
-	NewRegionHash string
+	NewRegionHash string `json:"new_region_hash" toon:"new_region_hash"`
 	// NewFileRawHash is the post-edit file RawHash.
-	NewFileRawHash string
+	NewFileRawHash string `json:"new_file_raw_hash" toon:"new_file_raw_hash"`
 	// NewFileNormHash is the post-edit file NormHash.
-	NewFileNormHash string
+	NewFileNormHash string `json:"new_file_norm_hash" toon:"new_file_norm_hash"`
 	// NewStartLine is the 1-based starting line of the post-edit region.
-	NewStartLine int
+	NewStartLine int `json:"new_start_line" toon:"new_start_line"`
 	// NewEndLine is the 1-based ending line of the post-edit region.
-	NewEndLine int
+	NewEndLine int `json:"new_end_line" toon:"new_end_line"`
 }
 
 // hasher is the canonical content hasher shared with Hylla (xxHash %016x). It

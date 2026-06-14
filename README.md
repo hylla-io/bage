@@ -67,18 +67,21 @@ Errors carry a machine-branchable kind so a wrapper never parses English:
 ## CLI
 
 ```sh
-bage apply    --file path --lines 3-5 --text "new text" [--lang go] [--region-hash HASH]
-bage create   --file path --text "..." [--lang go]         # create a new file (rejects if it exists)
-bage delete   --file path [--raw-hash HASH]                # delete, gated on the file's raw_hash
-bage move     --from path --to path2 [--raw-hash HASH]          # relocate (src drift gate + no-clobber dest)
+bage apply    --file path --lines 3-5 --text "new text" [--lang go] [--region-hash HASH] [--format text|json|toon]
+bage create   --file path --text "..." [--lang go] [--format text|json|toon]       # new file (rejects if exists)
+bage delete   --file path [--raw-hash HASH] [--format text|json|toon]              # delete, gated on raw_hash
+bage move     --from path --to path2 [--raw-hash HASH] [--format text|json|toon]   # relocate (drift + no-clobber)
 bage read     --file path [--symbol NAME | --line L | --lines A-B | --start S --end E] [--content] [--format text|json|toon]
 bage show     --file path [--format text|json|toon]             # read view: blocks + region_hash map
 bage diagnose --file path [--lsp CMD] [--format text|json|toon] # parse-health (+ optional LSP diagnostics)
-bage rename   --file path --line L --col C --new newName        # LSP-driven (needs a language server)
+bage rename   --file path --line L --col C --new newName [--format text|json|toon] # LSP-driven (needs a server)
 ```
 
-`--lang` is optional; empty auto-detects from the file path. `--format` selects the
-output encoding: `text` (human), `json` (interop), or `toon` (compact tabular, fewest tokens).
+`--lang` is optional; empty auto-detects from the file path. `--format` (every verb, default
+`text`) selects the output encoding: `text` (human), `json` (interop), or `toon` (compact
+tabular, fewest tokens). On failure it encodes a `{kind, path, message}` error envelope
+(`kind` ∈ `conflict | drift | exists | not-found | usage | io`), so a wrapper branches on
+`kind` instead of parsing text.
 
 ## Languages
 
