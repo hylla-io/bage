@@ -28,6 +28,7 @@ import (
 	"github.com/hylla-io/bage/internal/parser/treesitter"
 	"github.com/hylla-io/bage/internal/region"
 	"github.com/hylla-io/bage/internal/session"
+	"github.com/hylla-io/bage/pkg/render"
 )
 
 // usage is the top-level usage string printed when no subcommand, an unknown
@@ -168,6 +169,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		langStr    = fs.String("lang", "", "source language by canonical name (e.g. go, python, markdown); empty = auto-detect from --file path")
 		fmtCmd     = fs.String("fmt", "", "optional formatter command run on the staged bytes")
 		lintCmd    = fs.String("lint", "", "optional linter command run on the staged bytes")
+		format     = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -177,6 +179,12 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if *file == "" {
 		fmt.Fprintln(stderr, "bage apply: --file is required")
 		return errors.New("bage apply: --file is required")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	lang, err := parseLang(*langStr)
@@ -228,17 +236,16 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 	plan, err := sess.Prepare(ctx, edits, anchors)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage apply: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage apply: prepare: %w", err)
 	}
 	results, err := sess.Commit(plan)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage apply: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage apply: commit: %w", err)
 	}
 
-	printResults(stdout, results)
-	return nil
+	return render.Emit(stdout, fmtKind, editResults(results))
 }
 
 // applyRegion builds the region-anchored target from the apply flags. Exactly
@@ -342,6 +349,7 @@ func runCreate(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		langStr  = fs.String("lang", "", "source language by canonical name (e.g. go, python, markdown); empty = auto-detect from --file path")
 		fmtCmd   = fs.String("fmt", "", "optional formatter command run on the staged bytes")
 		lintCmd  = fs.String("lint", "", "optional linter command run on the staged bytes")
+		format   = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -355,6 +363,12 @@ func runCreate(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if *text != "" && *textFile != "" {
 		fmt.Fprintln(stderr, "bage create: choose one of --text or --text-file, not both")
 		return errors.New("bage create: --text and --text-file are mutually exclusive")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	lang, err := parseLang(*langStr)
@@ -388,12 +402,11 @@ func runCreate(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		Content: content,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "bage create: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage create: %w", err)
 	}
 
-	printResults(stdout, []region.EditResult{res})
-	return nil
+	return render.Emit(stdout, fmtKind, editResults{res})
 }
 
 // runDelete parses the delete flags and drives session.DeleteFile to unlink an
@@ -411,6 +424,7 @@ func runDelete(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	var (
 		file    = fs.String("file", "", "path of the file to delete (required; must exist)")
 		rawHash = fs.String("raw-hash", "", "expected raw content hash of the live file (drift gate); empty = compute from live bytes (delete-current, no drift protection)")
+		format  = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -420,6 +434,12 @@ func runDelete(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if *file == "" {
 		fmt.Fprintln(stderr, "bage delete: --file is required")
 		return errors.New("bage delete: --file is required")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	hasher := hashing.XXHasher{}
@@ -450,12 +470,11 @@ func runDelete(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		ExpectedRawHash: expected,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "bage delete: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage delete: %w", err)
 	}
 
-	fmt.Fprintf(stdout, "deleted %s raw=%s\n", res.Path, res.RawHash)
-	return nil
+	return render.Emit(stdout, fmtKind, res)
 }
 
 // runMove parses the move flags and drives session.MoveFile to relocate file
@@ -476,6 +495,7 @@ func runMove(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		from    = fs.String("from", "", "source path to move (required; must exist)")
 		to      = fs.String("to", "", "destination path (required; must not already exist)")
 		rawHash = fs.String("raw-hash", "", "expected raw content hash of the live source (drift gate); empty = compute from live bytes (relocate-current, no drift protection)")
+		format  = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -489,6 +509,12 @@ func runMove(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if *to == "" {
 		fmt.Fprintln(stderr, "bage move: --to is required")
 		return errors.New("bage move: --to is required")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	hasher := hashing.XXHasher{}
@@ -520,12 +546,11 @@ func runMove(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		ExpectedRawHash: expected,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "bage move: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage move: %w", err)
 	}
 
-	fmt.Fprintf(stdout, "moved %s -> %s raw=%s\n", res.From, res.Dest.Path, res.Dest.NewFileRawHash)
-	return nil
+	return render.Emit(stdout, fmtKind, res)
 }
 
 // runRename parses the rename flags, drives an LSP rename, converts the server's
@@ -546,6 +571,7 @@ func runRename(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		newName = fs.String("new", "", "new name for the symbol (required)")
 		lspCmd  = fs.String("lsp", "gopls", "LSP server command to drive the rename")
 		langStr = fs.String("lang", "go", "source language (currently only 'go')")
+		format  = fs.String("format", "text", "output format: text|json|toon")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -563,6 +589,12 @@ func runRename(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if *newName == "" {
 		fmt.Fprintln(stderr, "bage rename: --new is required")
 		return errors.New("bage rename: --new is required")
+	}
+
+	fmtKind, err := render.ParseFormat(*format)
+	if err != nil {
+		fmt.Fprintln(stderr, err.Error())
+		return err
 	}
 
 	lang, err := parseLang(*langStr)
@@ -604,13 +636,13 @@ func runRename(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 	we, err := client.Rename(ctx, abs, string(content), uint32(*line), uint32(*col), *newName)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage rename: %w", err)
 	}
 
 	fileEdits, err := lsp.WorkspaceEditToFileEdits(we, os.ReadFile)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage rename: convert: %w", err)
 	}
 	if len(fileEdits) == 0 {
@@ -634,17 +666,16 @@ func runRename(ctx context.Context, args []string, stdout, stderr io.Writer) err
 
 	plan, err := sess.Prepare(ctx, edits, anchors)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage rename: prepare: %w", err)
 	}
 	results, err := sess.Commit(plan)
 	if err != nil {
-		fmt.Fprintf(stderr, "bage rename: %v\n", err)
+		_ = render.Emit(stderr, fmtKind, session.Envelope(err))
 		return fmt.Errorf("bage rename: commit: %w", err)
 	}
 
-	printResults(stdout, results)
-	return nil
+	return render.Emit(stdout, fmtKind, editResults(results))
 }
 
 // renameEdits converts a flat slice of byte-range FileEdits (from the LSP
@@ -703,6 +734,38 @@ func fileAnchor(path string, live []byte, hasher hashing.Hasher) region.FileAnch
 		RawHash:  hashing.RawHash(hasher, live),
 		NormHash: hashing.NormHash(hasher, live),
 	}
+}
+
+// editResults is the renderable list of apply/create write-back results. As a
+// named slice it carries a RenderText method so render.Emit can produce the
+// FormatText output, while the FormatJSON/FormatTOON paths marshal the slice via
+// each EditResult's struct tags. It is the multi-format surface mirror of the
+// read verbs' view types.
+type editResults []region.EditResult
+
+// RenderText writes one line per EditResult (sorted by path then changed start
+// offset) describing the changed byte range, the new 1-based line range, and the
+// recomputed region/file hashes — the write-back contract a coordinator (or a
+// human) reads back (SPEC §8.2). It is byte-identical to the legacy printResults
+// output, so routing apply/create through render.Emit(FormatText) preserves the
+// existing text output exactly. It is the FormatText path render.Emit
+// type-asserts to (editResults implements render.TextRenderable).
+func (e editResults) RenderText(w io.Writer) error {
+	sort.SliceStable(e, func(i, j int) bool {
+		if e[i].Path != e[j].Path {
+			return e[i].Path < e[j].Path
+		}
+		return e[i].ChangedStart < e[j].ChangedStart
+	})
+	for _, r := range e {
+		if _, err := fmt.Fprintf(w,
+			"applied %s bytes [%d:%d] lines [%d:%d] region=%s raw=%s norm=%s\n",
+			r.Path, r.ChangedStart, r.ChangedEnd, r.NewStartLine, r.NewEndLine,
+			r.NewRegionHash, r.NewFileRawHash, r.NewFileNormHash); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // printResults writes one line per EditResult (sorted by path then changed

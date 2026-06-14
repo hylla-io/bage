@@ -1,6 +1,7 @@
 package region
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
@@ -36,6 +37,53 @@ func TestHashRegionDeterministicAndFormat(t *testing.T) {
 	// Different bytes hash differently.
 	if got := HashRegion([]byte("func main() {}!"), 0, 15); got == h1 {
 		t.Fatalf("different content collided with %s", h1)
+	}
+}
+
+// TestEditResultMarshalsSnakeCaseJSON asserts EditResult's exported fields
+// marshal to the flat snake_case JSON keys a host (Hylla) ingests — the
+// write-back contract (SPEC §8.2) — so the JSON shape is stable and decoupled
+// from the Go field names.
+func TestEditResultMarshalsSnakeCaseJSON(t *testing.T) {
+	r := EditResult{
+		Path:            "main.go",
+		ChangedStart:    14,
+		ChangedEnd:      28,
+		NewRegionHash:   "00000000000000aa",
+		NewFileRawHash:  "00000000000000bb",
+		NewFileNormHash: "00000000000000cc",
+		NewStartLine:    3,
+		NewEndLine:      3,
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal EditResult: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := map[string]any{
+		"path":               "main.go",
+		"changed_start":      float64(14),
+		"changed_end":        float64(28),
+		"new_region_hash":    "00000000000000aa",
+		"new_file_raw_hash":  "00000000000000bb",
+		"new_file_norm_hash": "00000000000000cc",
+		"new_start_line":     float64(3),
+		"new_end_line":       float64(3),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("key set = %v, want keys %v", got, want)
+	}
+	for k, wv := range want {
+		gv, ok := got[k]
+		if !ok {
+			t.Fatalf("missing key %q in %v", k, got)
+		}
+		if gv != wv {
+			t.Fatalf("key %q = %v, want %v", k, gv, wv)
+		}
 	}
 }
 

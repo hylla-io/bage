@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/hylla-io/bage/internal/hashing"
@@ -33,10 +34,20 @@ var ErrNotFound = errors.New("session: target does not exist")
 // raw_hash the live bytes matched at unlink time.
 type DeleteResult struct {
 	// Path is the file that was deleted.
-	Path string
+	Path string `json:"path" toon:"path"`
 	// RawHash is the raw content hash the live bytes matched (the satisfied
 	// drift anchor), confirming WHICH content was removed.
-	RawHash string
+	RawHash string `json:"raw_hash" toon:"raw_hash"`
+}
+
+// RenderText writes the human-readable delete confirmation line — "deleted
+// <path> raw=<h>" — the FormatText path render.Emit type-asserts to
+// (DeleteResult implements render.TextRenderable without importing pkg/render,
+// avoiding an import cycle). It is byte-identical to the line the delete CLI
+// printed before --format wiring.
+func (r DeleteResult) RenderText(w io.Writer) error {
+	_, err := fmt.Fprintf(w, "deleted %s raw=%s\n", r.Path, r.RawHash)
+	return err
 }
 
 // DeleteFile deletes op.Path, returning a DeleteResult a host can ingest to

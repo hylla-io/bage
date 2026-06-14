@@ -23,6 +23,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -36,10 +37,21 @@ import (
 // EditResult over the relocated bytes) plus the source path that was removed.
 type MoveResult struct {
 	// From is the source path that was removed by the move.
-	From string
+	From string `json:"from" toon:"from"`
 	// Dest is the whole-file EditResult for the destination (the relocated bytes),
 	// shaped like a create result so a host can ingest the destination's nodes.
-	Dest region.EditResult
+	Dest region.EditResult `json:"dest" toon:"dest"`
+}
+
+// RenderText writes the human-readable move confirmation line — "moved <from>
+// -> <dest> raw=<h>" — where the destination path and raw_hash come from the
+// destination EditResult. It is the FormatText path render.Emit type-asserts to
+// (MoveResult implements render.TextRenderable without importing pkg/render,
+// avoiding an import cycle) and is byte-identical to the line the move CLI
+// printed before --format wiring.
+func (r MoveResult) RenderText(w io.Writer) error {
+	_, err := fmt.Fprintf(w, "moved %s -> %s raw=%s\n", r.From, r.Dest.Path, r.Dest.NewFileRawHash)
+	return err
 }
 
 // MoveFile relocates op.Path to op.To, preserving the source bytes unchanged, and
