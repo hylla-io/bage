@@ -92,7 +92,7 @@ func (s *Session) MoveFile(_ context.Context, op Op) (MoveResult, error) {
 	// so the move HARD-REJECTS and never relocates bytes the caller did not see.
 	liveRaw := hashing.RawHash(s.Hasher, live)
 	if liveRaw != op.ExpectedRawHash {
-		return MoveResult{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift"}
+		return MoveResult{}, &ConflictError{Path: op.Path, Reason: "raw_hash drift", kind: KindDrift}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(op.To), 0o755); err != nil {

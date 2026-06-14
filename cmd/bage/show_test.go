@@ -54,16 +54,16 @@ func TestRunShowRoundTripsRegionHash(t *testing.T) {
 	path := writeNamed(t, "main.go", src)
 
 	var stdout, stderr bytes.Buffer
-	if err := run(context.Background(), []string{"show", "--file", path, "--json"}, &stdout, &stderr); err != nil {
-		t.Fatalf("run show --json: %v\nstderr: %s", err, stderr.String())
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "json"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run show --format json: %v\nstderr: %s", err, stderr.String())
 	}
 
 	var view showView
 	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
-		t.Fatalf("show --json not parseable: %v\nout: %s", err, stdout.String())
+		t.Fatalf("show --format json not parseable: %v\nout: %s", err, stdout.String())
 	}
 	if len(view.Outline) == 0 {
-		t.Fatal("show --json emitted an empty outline for a Go file with decls")
+		t.Fatal("show --format json emitted an empty outline for a Go file with decls")
 	}
 
 	// Find the helper() declaration block.
@@ -114,13 +114,13 @@ func TestRunShowTextFallbackListsLines(t *testing.T) {
 	path := writeNamed(t, "notes.txt", src)
 
 	var stdout, stderr bytes.Buffer
-	if err := run(context.Background(), []string{"show", "--file", path, "--json"}, &stdout, &stderr); err != nil {
-		t.Fatalf("run show --json: %v\nstderr: %s", err, stderr.String())
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "json"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run show --format json: %v\nstderr: %s", err, stderr.String())
 	}
 
 	var view showView
 	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
-		t.Fatalf("show --json not parseable: %v\nout: %s", err, stdout.String())
+		t.Fatalf("show --format json not parseable: %v\nout: %s", err, stdout.String())
 	}
 	if len(view.Outline) != 3 {
 		t.Fatalf("text fallback outline = %d blocks, want 3:\n%s", len(view.Outline), stdout.String())
@@ -147,13 +147,13 @@ func TestRunShowEmptyFile(t *testing.T) {
 	path := writeNamed(t, "empty.go", "")
 
 	var stdout, stderr bytes.Buffer
-	if err := run(context.Background(), []string{"show", "--file", path, "--json"}, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "json"}, &stdout, &stderr); err != nil {
 		t.Fatalf("run show empty: %v\nstderr: %s", err, stderr.String())
 	}
 
 	var view showView
 	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
-		t.Fatalf("show --json not parseable: %v\nout: %s", err, stdout.String())
+		t.Fatalf("show --format json not parseable: %v\nout: %s", err, stdout.String())
 	}
 	if len(view.Outline) != 0 {
 		t.Fatalf("empty file outline = %d, want 0", len(view.Outline))
@@ -169,12 +169,12 @@ func TestRunShowBinaryNoCrash(t *testing.T) {
 	path := writeNamed(t, "blob.bin", string([]byte{0x00, 0x01, 0xff, 'a', '\n', 0xfe, 'b'}))
 
 	var stdout, stderr bytes.Buffer
-	if err := run(context.Background(), []string{"show", "--file", path, "--json"}, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "json"}, &stdout, &stderr); err != nil {
 		t.Fatalf("run show binary: %v\nstderr: %s", err, stderr.String())
 	}
 	var view showView
 	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
-		t.Fatalf("show --json not parseable: %v\nout: %s", err, stdout.String())
+		t.Fatalf("show --format json not parseable: %v\nout: %s", err, stdout.String())
 	}
 	if view.RawHash == "" {
 		t.Fatal("binary file should still report a raw hash")
@@ -207,6 +207,73 @@ func TestRunShowIsReadOnly(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("show created/removed files: before=%d after=%d", len(before), len(after))
+	}
+}
+
+// TestRunShowFormatJSONByteIdentical asserts --format json emits exactly the
+// indented showView JSON the old --json flag produced: json.MarshalIndent with a
+// two-space indent followed by a trailing newline, byte-for-byte, so a wrapper
+// reading the JSON sees the SAME bytes after the flag rename.
+func TestRunShowFormatJSONByteIdentical(t *testing.T) {
+	const src = "package main\n\nfunc helper() int { return 7 }\n\nfunc main() { _ = helper() }\n"
+	path := writeNamed(t, "main.go", src)
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "json"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run show --format json: %v\nstderr: %s", err, stderr.String())
+	}
+
+	var view showView
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatalf("show --format json not parseable: %v\nout: %s", err, stdout.String())
+	}
+	want, err := json.MarshalIndent(view, "", "  ")
+	if err != nil {
+		t.Fatalf("oracle MarshalIndent: %v", err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(stdout.Bytes(), want) {
+		t.Fatalf("--format json not byte-identical to MarshalIndent+newline\n got:\n%q\nwant:\n%q", stdout.Bytes(), want)
+	}
+}
+
+// TestRunShowFormatToon asserts --format toon renders the outline as a non-empty
+// compact tabular document: the blocks array carries a tabular header and the
+// declared symbol name appears in the rows.
+func TestRunShowFormatToon(t *testing.T) {
+	const src = "package main\n\nfunc helper() int { return 7 }\n\nfunc main() { _ = helper() }\n"
+	path := writeNamed(t, "main.go", src)
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"show", "--file", path, "--format", "toon"}, &stdout, &stderr); err != nil {
+		t.Fatalf("run show --format toon: %v\nstderr: %s", err, stderr.String())
+	}
+
+	out := stdout.String()
+	if out == "" {
+		t.Fatal("show --format toon produced empty output")
+	}
+	if !strings.Contains(out, "outline[") {
+		t.Fatalf("show --format toon missing tabular 'outline[' header:\n%s", out)
+	}
+	if !strings.Contains(out, "helper") {
+		t.Fatalf("show --format toon missing symbol name 'helper':\n%s", out)
+	}
+}
+
+// TestRunShowFormatInvalid asserts an unknown --format value is an explicit usage
+// error: a non-nil error is returned and stderr names the valid format set.
+func TestRunShowFormatInvalid(t *testing.T) {
+	const src = "package main\n\nfunc main() {}\n"
+	path := writeNamed(t, "main.go", src)
+
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"show", "--file", path, "--format", "xml"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected error for --format xml, got nil (stdout: %q)", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "text|json|toon") {
+		t.Fatalf("stderr should name the valid format set, got: %q", stderr.String())
 	}
 }
 

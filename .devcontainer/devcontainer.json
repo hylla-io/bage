@@ -1,0 +1,17 @@
+{
+  "name": "bage-polyglot",
+  "build": { "dockerfile": "Dockerfile" },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "rust-lang.rust-analyzer",
+        "ms-python.python",
+        "llvm-vs-code-extensions.vscode-clangd"
+      ]
+    }
+  },
+  "postCreateCommand": "go build -o /usr/local/bin/bage ./cmd/bage"
+}

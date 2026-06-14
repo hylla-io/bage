@@ -40,8 +40,9 @@ usage:
   bage delete --file F [--raw-hash H]
   bage move   --from F --to G [--raw-hash H]
   bage rename --file F --line L --col C --new NAME [--lsp gopls] [--lang go]
-  bage show   --file F [--json]
-  bage diagnose --file F [--lsp CMD] [--json]
+  bage read   --file F [--line L | --lines L1-L2 | --start S --end E] [--symbol NAME] [--content] [--format text|json|toon]
+  bage show   --file F [--format text|json|toon]
+  bage diagnose --file F [--lsp CMD] [--format text|json|toon]
 
 show is the READ view: it parses F with the shared parser and emits, for every
 addressable block (the Outline), its kind, name, 1-based line range, byte range,
@@ -49,8 +50,8 @@ and region_hash — the SAME region_hash bage apply --region-hash verifies+accep
 for that exact byte range (the round-trip anchor an agent echoes back). It also
 emits the file's raw_hash + norm_hash. A grammar-backed file lists its
 declarations; a text-fallback file lists its line-blocks; an empty file yields an
-empty outline plus the file hashes. Default output is human-readable; --json
-emits structured JSON. show is strictly READ-ONLY — it writes nothing to disk.
+empty outline plus the file hashes. Default output is human-readable; --format
+selects text, json, or toon. show is strictly READ-ONLY — it writes nothing to disk.
 
 create writes a NEW file F from --text (or --text-file). Its anchor is
 non-existence: if F already exists the create HARD-REJECTS and nothing is
@@ -104,7 +105,7 @@ and the grammar-free text fallback always parses so it never reports a defect.
 server (textDocument/didOpen) and collects its published diagnostics, each with
 severity, 1-based range, message, and source. Reporting problems is SUCCESS: exit
 code is 0 even WITH findings; non-zero is reserved for usage/IO/LSP-start errors.
-Default output is human-readable; --json emits the structured view.`
+Default output is human-readable; --format selects text, json, or toon.`
 
 // main wires the process entrypoint to run and maps any error to exit code 1.
 func main() {
@@ -134,6 +135,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runMove(ctx, args[1:], stdout, stderr)
 	case "rename":
 		return runRename(ctx, args[1:], stdout, stderr)
+	case "read":
+		return runRead(ctx, args[1:], stdout, stderr)
 	case "show":
 		return runShow(ctx, args[1:], stdout, stderr)
 	case "diagnose":

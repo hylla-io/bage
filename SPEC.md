@@ -198,3 +198,18 @@ Båge's gate is the **mechanical per-file parse floor** (staged bytes must still
 
 ### §10.6 Graph-agnostic + open
 Ops are locator-addressed primitives. Hylla originates them from a graph mutation in integrated mode; an MCP wrapper originates them in standalone mode. Hylla-side deltas (create → N new nodes, delete → close node versions, move → re-identify + content-version referencers, mixed-op → one graph mutation, the gate boundary) are tracked in `hylla/polyglot-foundation/BAGE_UPDATE.md` + `BAGE_INTEGRATION_PLAN_ADJUSTMENT.md`.
+
+## 11. Read primitive + serialization + error taxonomy (v0.3)
+
+Standalone callers need a read Hylla doesn't (Hylla holds content in its node), so Båge ships a first-class read plus an output-encoding seam and a machine-branchable error taxonomy. Library-first: the Go structs are the product; CLI/MCP is a thin serialization edge.
+
+### §11.1 Read API
+- **`bage.ReadBlocks(opened, includeContent) []Block`** — the OpenedFile-level primitive (a host that already parsed reuses its tree). `Block` is a **flat** struct `{Kind, Name, StartLine, EndLine, StartByte, EndByte, RegionHash, Content}` — flat so JSON stays snake_case and a block slice is a uniform array TOON renders tabular.
+- **`(*Editor).Read(ctx, path, ReadOptions) ReadResult`** — the facade. Addressing is mutually exclusive: whole-file (zero value), `Symbol` (name match), line (`Line`/`EndLine`, 1-based), or byte (`StartByte`/`EndByte`). `IncludeContent` adds raw bytes; off keeps the listing cheap. The CLI `bage read` mirrors it.
+- `region_hash` is computed once by `region.HashRegion` (the single source, byte-identical to Hylla's node hash); `show` and `read` share it — no cmd-layer duplication.
+
+### §11.2 Serialization (`pkg/render`)
+- One `Format{text|json|toon}` + `Emit(w, Format, v)`. `json` = `MarshalIndent`; `text` dispatches to a `RenderText(io.Writer)` the result owns (no import cycle — domain packages implement the method, `render` owns the interface); `toon` = `github.com/toon-format/toon-go` (compact tabular for uniform arrays, ~30–60% fewer tokens than JSON). `--format` replaces the old `--json` on `show`/`diagnose` (pre-1.0 breaking).
+
+### §11.3 Error taxonomy
+- `Kind{conflict|drift|exists|not-found|usage|io}`, `KindOf(err) Kind`, and `Envelope(err) ErrorEnvelope{Kind, Path, Message}` — re-exported via `pkg/bage` so an external MCP module branches on `kind` without parsing English. This surfaced a real bug: `ConflictError` conflated a region *conflict* with raw_hash *drift*; they now carry distinct kinds.
