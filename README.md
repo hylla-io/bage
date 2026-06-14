@@ -2,7 +2,7 @@
 
 > **Båge** (Swedish for *bow / arc*) — a bidirectional code-graph round-trip file editor.
 
-Status: v0.2.0 — agent-IDE polyglot lib with file-lifecycle ops (create / delete / move / batch / show / diagnose).
+Status: v0.4.0 — agent-IDE polyglot lib: surgical edits + file-lifecycle ops (create / delete / move / batch), structured read (read / show / diagnose) with `--format text|json|toon`, and a public, machine-branchable error taxonomy.
 
 Båge edits source files **surgically and losslessly**. An agent (or a host like
 [Hylla](https://github.com/hylla-io)) targets a content-anchored *region* of a file, sends
@@ -125,5 +125,5 @@ rest never falls behind.
 
 ## License
 
-
-See [LICENSE](LICENSE).
+**MIT** — see [LICENSE](LICENSE). Permissive: use, modify, and distribute freely (including
+commercially) with attribution; provided as-is, no warranty.
