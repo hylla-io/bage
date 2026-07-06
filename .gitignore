@@ -72,3 +72,6 @@ graphify-out/
 
 # E2E dogfood scratch — local-only test tree, never committed
 e2e-scratch/
+
+# Rust build artifacts
+/target/

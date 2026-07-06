@@ -1,0 +1,60 @@
+   0.039706750s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: stale: changed "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/lsp.rs"
+   0.039719500s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:           (vs) "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-fd5dca8834bf3d92/dep-lib-bage"
+   0.039721833s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1783376944, nanos: 519815102 } < FileTime { seconds: 1783378194, nanos: 991684725 }
+   0.039839041s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: fingerprint dirty for bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("bage", ["lib"], "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/lib.rs", Edition2024) }
+   0.039850583s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-fd5dca8834bf3d92/dep-lib-bage", reference_mtime: FileTime { seconds: 1783376944, nanos: 519815102 }, stale: "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/lsp.rs", stale_mtime: FileTime { seconds: 1783378194, nanos: 991684725 } }))
+   0.048956750s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: stale: changed "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/editor.rs"
+   0.048962208s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:           (vs) "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-58018b5001c7dc19/dep-test-lib-bage"
+   0.048963916s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1783376944, nanos: 519851268 } < FileTime { seconds: 1783378194, nanos: 990652354 }
+   0.049034416s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: fingerprint dirty for bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("bage", ["lib"], "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/lib.rs", Edition2024) }
+   0.049041375s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-58018b5001c7dc19/dep-test-lib-bage", reference_mtime: FileTime { seconds: 1783376944, nanos: 519851268 }, stale: "/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/editor.rs", stale_mtime: FileTime { seconds: 1783378194, nanos: 990652354 } }))
+   0.049784333s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: fingerprint error for bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust)/Check { test: false }/TargetInner { name: "bage", doc: true, ..: with_path("/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/main.rs", Edition2024) }
+   0.049790333s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-e6e142255859d523/bin-bage`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: <std::backtrace::Backtrace>::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.053169666s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint: fingerprint error for bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust)/Check { test: true }/TargetInner { name: "bage", doc: true, ..: with_path("/Users/evanschultz/Documents/Code/hylla/bage/main/rust/src/main.rs", Edition2024) }
+   0.053182166s  INFO prepare_target{force=false package_id=bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust) target="bage"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/debug/.fingerprint/bage-01ff5534000ce098/test-bin-bage`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: <std::backtrace::Backtrace>::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+    Checking bage v0.1.0 (/Users/evanschultz/Documents/Code/hylla/bage/main/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s

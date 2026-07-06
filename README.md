@@ -2,7 +2,11 @@
 
 > **Båge** (Swedish for *bow / arc*) — a bidirectional code-graph round-trip file editor.
 
-Status: v0.4.0 — agent-IDE polyglot lib: surgical edits + file-lifecycle ops (create / delete / move / batch), structured read (read / show / diagnose) with `--format text|json|toon`, and a public, machine-branchable error taxonomy.
+Status: v0.6.0 — **Rust implementation** (the original Go implementation is archived on the
+[`go-legacy`](https://github.com/hylla-io/bage/tree/go-legacy) branch; Go module consumers
+keep resolving the existing `v0.4.x`/`v0.5.x` tags). Agent-IDE polyglot lib: surgical edits +
+file-lifecycle ops (create / delete / move / batch), structured read (read / show / diagnose)
+with `--format text|json|toon`, and a public, machine-branchable error taxonomy.
 
 Båge edits source files **surgically and losslessly**. An agent (or a host like
 [Hylla](https://github.com/hylla-io)) targets a content-anchored *region* of a file, sends
@@ -10,59 +14,62 @@ only the replacement text, and Båge resolves the region under a per-file lock, 
 edit through a parse/format/lint gate, and writes it back atomically — or rejects it. It
 never corrupts: an edit that does not cleanly resolve is refused, not misapplied.
 
-It is a **library first** (`pkg/bage`) and ships a thin standalone **CLI** (`cmd/bage`).
-Standalone it is an IDE-style edit engine; integrated, a host links it as a Go library so a
-single agent-facing edit lands in both a graph and the files with no possible drift.
+It is a **library first** (the `bage` crate) and ships a thin standalone **CLI** (the `bage`
+binary). Standalone it is an IDE-style edit engine; integrated, a host drives the library so
+a single agent-facing edit lands in both a graph and the files with no possible drift.
 
 ## Why
 
 - **Lossless round-trip.** Every file type opens and round-trips byte-for-byte — 20 real
   tree-sitter grammars, with a grammar-free text fallback for everything else. Verified by
-  property fuzzing.
+  property tests.
 - **Reject, never corrupt.** Region edits are anchored by a content hash (`region_hash`,
-  omp-style); a drifted or ambiguous target is rejected. Proven under `-race`.
+  omp-style); a drifted or ambiguous target is rejected. Proven under concurrent commits.
 - **Minimal context.** The model is shown a region and echoes its hash — it never resends
   the old text or computes a hash. Smallest possible edit payload.
 - **Concurrency-safe.** Per-file lock with resolve-under-lock at commit: concurrent edits to
   the same file serialize (no lost update); different files run in parallel.
+- **Cross-system hash contract.** `normalize` + xxHash64 `{:016x}` digests are byte-identical
+  with Hylla (and with the archived Go implementation) — pinned by parity-vector tests.
 
 ## Install
 
 ```sh
-go get github.com/hylla-io/bage@latest      # library
-go build -o bin/bage ./cmd/bage             # CLI (requires CGO + a C toolchain)
+cargo build --release        # → target/release/bage (no CGO, no C toolchain gymnastics)
 ```
 
 ## Library
 
-```go
-ed, _ := bage.Open(bage.Config{WALDir: dir}) // Lang optional → auto-detect per file
-plan, _ := ed.Prepare(ctx, edits, anchors)
-results, _ := ed.Commit(plan)                // []EditResult: new hashes + line spans
+```rust
+use bage::editor::{Config, Editor};
+
+let ed = Editor::open(Config { wal_dir: dir.into(), ..Default::default() })?; // lang optional → auto-detect per file
+let plan = ed.prepare(&edits, &anchors)?;
+let results = ed.commit(&plan)?;             // Vec<EditResult>: new hashes + line spans
 ```
 
 Read-only inspection without opening an editor:
 
-```go
-of, _ := bage.OpenFile(ctx, "main.go")       // auto-detects language, parses
-defer of.Close()
-syms := bage.Outline(of.Tree)                // declarations with byte + line ranges
-blocks := bage.ReadBlocks(of, true)          // blocks + region_hash + content (Hylla holds the OpenedFile)
+```rust
+let of = bage::inspect::open_file("main.go")?;   // auto-detects language, parses
+let syms = bage::inspect::outline(&of.tree);     // declarations with byte + line ranges
+let blocks = bage::inspect::read_blocks(&of, true); // blocks + region_hash + content
 ```
 
-Structured read through an editor — whole-file, by `Symbol`, by line, or by byte range:
+Structured read through an editor — whole-file, by symbol, by line, or by byte range:
 
-```go
-res, _ := ed.Read(ctx, "main.go", bage.ReadOptions{Symbol: "Greet", IncludeContent: true})
-// res.Blocks[i] = {Kind, Name, StartLine, EndLine, StartByte, EndByte, RegionHash, Content}
+```rust
+let res = ed.read("main.go", &ReadOptions { symbol: "Greet".into(), include_content: true, ..Default::default() })?;
+// res.blocks[i] = {kind, name, start_line, end_line, start_byte, end_byte, region_hash, content}
 ```
 
 The hash primitives a host mirrors for cross-system agreement are exported:
-`bage.Normalize`, `bage.RawHash`, `bage.NormHash`, `bage.RegionHash`, `bage.LangForPath`.
+`bage::normalize::normalize`, `bage::hashing::{raw_hash, norm_hash}`,
+`bage::region::hash_region`, `bage::parser::Lang::for_path`.
 
 Errors carry a machine-branchable kind so a wrapper never parses English:
-`bage.KindOf(err)` → `conflict | drift | exists | not-found | usage | io`, and
-`bage.Envelope(err)` → `bage.ErrorEnvelope{Kind, Path, Message}` (JSON/TOON-serializable).
+`SessionError::kind()` → `conflict | drift | exists | not-found | usage | io`, and
+`session::envelope(&err)` → `ErrorEnvelope { kind, path, message }` (JSON/TOON-serializable).
 
 ## CLI
 
@@ -88,17 +95,17 @@ tabular, fewest tokens). On failure it encodes a `{kind, path, message}` error e
 - **Grammars (20, parse + round-trip):** Go, TypeScript, TSX, JavaScript, Python, Rust, Java,
   C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
-- **LSP rename (10, container-verified):** Go, Python, TypeScript, TSX, JavaScript, JSX, Rust,
-  C, C++, Swift. (C#/Java rows defined, pending hardening.)
+- **LSP rename:** UTF-16-aware client driving any stdio language server (gopls-verified
+  end-to-end; the Go-era container matrix is a follow-up on this branch).
 
 ## Build gates
 
-All via [mage](https://magefile.org) — never the raw Go toolchain:
+All via cargo:
 
 ```sh
-mage ci      # format-check + vet + race + coverage + tidy + build
-mage lsp      # containerized LSP-rename suite (requires Docker)
-mage fuzz     # property fuzzing (normalize idempotency, text-fallback losslessness)
+cargo fmt --check                          # formatting
+cargo clippy --all-targets -- -D warnings  # lints
+cargo test                                 # unit + property + concurrency + TOON goldens
 ```
 
 ## Dogfooding
@@ -119,9 +126,9 @@ the round-trip and region-anchor machinery is exercised on real content on every
 
 Friction or bugs found while dogfooding are logged in
 [`BAGE_DOGFOOD_FINDINGS.md`](BAGE_DOGFOOD_FINDINGS.md) and fixed test-first. This loop has
-already caught a line-newline edit bug and a missing `--text-file` flag. When dogfooding
-sharpens one language, the fix lands with test parity across the other file types so the
-rest never falls behind.
+already caught a line-newline edit bug, a missing `--text-file` flag, and (during the Rust
+rewrite) a Go-side TOON envelope bug. When dogfooding sharpens one language, the fix lands
+with test parity across the other file types so the rest never falls behind.
 
 ## License
 

@@ -6,7 +6,7 @@ Project-local guidance for working inside the `bage` tree. Global rules (Tillsyn
 
 ## Architecture & Cascade Tracking
 
-Freshly-bootstrapped Go-only sibling. The cross-project agent-dispatch + persona architecture (per-persona `settings.json` + `bin/agent-dispatch.sh` + `.claude/hooks/`) was sync'd from the source-of-truth sibling `ta`; the sync file-list + dev bootstrap checklist live in `R_SHIP_HANDOFF.md`. Per separate-repo discipline, `bage` has its own `.git` + remote: **orch DOES commit and push `bage`** to bage's own origin. The rule is only that bage's git stays SEPARATE — never bundle bage changes into a sibling repo's commit (`hylla`, `ta`), and run any sibling git op against that sibling's own checkout/remote.
+**Rust implementation** (cargo crate at the repo root; the original Go implementation is archived on the `go-legacy` branch — any Go-side fix lands THERE, never on `main`). The cross-project agent-dispatch + persona architecture (per-persona `settings.json` + `bin/agent-dispatch.sh` + `.claude/hooks/`) was sync'd from the source-of-truth sibling `ta`; the sync file-list + dev bootstrap checklist live in `R_SHIP_HANDOFF.md`. Per separate-repo discipline, `bage` has its own `.git` + remote: **orch DOES commit and push `bage`** to bage's own origin. The rule is only that bage's git stays SEPARATE — never bundle bage changes into a sibling repo's commit (`hylla`, `ta`), and run any sibling git op against that sibling's own checkout/remote.
 
 - **Cascade tracking uses the `ta` MCP** (`mcp__ta__*` on `.ta/`-managed records), **NEVER `tillsyn` MCP** — only the `tillsyn` repo has Tillsyn MCP wired. Any leftover textual `mcp__tillsyn__*` ref in a persona body is INERT here.
 - **`ta` records are the work-tracking source of truth.** Built-in `TaskCreate`/`TaskUpdate` are fine for granular sub-steps or tiny reminders — anything durable goes in a `ta` record.
@@ -19,74 +19,50 @@ Canonical contract: [`CASCADE_METHODOLOGY.md`](CASCADE_METHODOLOGY.md) at repo r
 2. **RECURSE ON ATOMICITY.** 1-2 small code blocks per build droplet, ≤80 LOC incl. tests, ≤3 files. ≥3 distinct production symbols → split.
 3. **PER-BRANCH PARALLELISM.** All unblocked work runs in parallel; only `blocked_by` serializes.
 4. **DESCENT GATE per branch.** Plan-QA pair (proof + falsification) MUST both PASS before that node spawns children or builds.
-5. **DROPLET-LEVEL QA = `mage ci` gate.** No LLM proof/falsification per droplet; the automated gate is enough.
+5. **DROPLET-LEVEL QA = CI gate.** No LLM proof/falsification per droplet; the automated gate is enough.
 6. **ORCH AUTO-ADVANCE.** Drive the cascade autonomously; don't ask permission per tick.
 
-## Go Development Rules
+## Rust Development Rules
 
-- **Hexagonal architecture**, interface-first boundaries, dependency inversion.
+- **Hexagonal architecture**, trait-first boundaries where a seam earns its keep, dependency inversion (`ParserPort`, `Hasher`, `Formatter`/`Linter`).
 - **TDD-first** where practical. Ship small tested increments.
 - **Smallest concrete design.** No abstraction for hypothetical future variation.
-- **Idiomatic Go** — naming, package structure, import grouping (stdlib / third-party / local).
-- **Go doc comments** on every top-level declaration and method.
-- **Errors**: wrap with `%w`, bubble at clean boundaries, log context-rich failures at adapter/runtime edges, don't swallow.
-- **Tests**: `*_test.go` co-located, table-driven, behavior-oriented; `-race` via mage targets.
+- **Idiomatic Rust** — enums over tag+nilable-payload, RAII over idempotent close, `thiserror` error enums with a `kind()` classification, `usize` making invalid offsets unrepresentable.
+- **Doc comments (`///` / `//!`)** on every public item.
+- **Errors**: typed per module, wrapped with `#[from]`/`#[source]`, classified to the public `Kind` taxonomy at the session boundary; never swallowed.
+- **Tests**: co-located `#[cfg(test)]` modules, behavior-oriented, table-style where it fits; concurrency claims exercised with real threads; cross-system contracts pinned by parity vectors generated from the reference binary.
 
 ## Build Verification
 
-Before any `build` action item is `complete`:
+Before any `build` action item is `complete`, the full cargo gate must pass:
 
-1. All relevant mage targets pass (`mage -l` for the list).
-2. **NEVER raw Go toolchain** (`go test` / `go build` / `go run` / `go vet`). Always `mage <target>`. If a target has a bug, fix the target — don't bypass.
-3. All template-generated QA subtasks completed.
-
-### Canonical 12-target shape (per tillsyn P6 — 2026-05-29)
-
-```
-TestFunc(pkg, fn)  builder + build-QA       go test -run "^<Func>$" -count=1 -race <pkg>
-TestPkg(pkg)       plan-QA read-only        go test -count=1 <pkg>
-Test               closeout/orch            go test ./...
-RacePkg(pkg)       build-QA                 go test -race -count=1 <pkg>
-Race               closeout/orch            go test -race ./...
-FormatFile(file)   builder + build-QA       gofumpt -w <file>
-Format             closeout/orch            gofumpt -w .
-FormatCheck        ci                       gofumpt -l . && fail if non-empty
-VetPkg(pkg)        builder + build-QA       go vet <pkg>
-Vet                closeout/orch            go vet ./...
-Tidy               orch-only                go mod tidy + diff-exit-code
-CI                 closeout/orch            FormatCheck + Vet + (Race+Coverage) + Tidy + Build
+```sh
+cargo fmt --check                          # formatting (CI-enforced)
+cargo clippy --all-targets -- -D warnings  # lints (CI-enforced)
+cargo test                                 # unit + property + concurrency + TOON goldens
 ```
 
-This shape is enforced across all sibling projects for naming consistency so agents always know the gate name. Hyphenated aliases (`format-check`, `format-file`, `test-func`, `test-pkg`, `race-pkg`, `vet-pkg`) preserved for human ergonomics.
+CI (`.github/workflows/ci.yml`, job key `check` — the required status on `main`) runs exactly these three. The release workflow runs the same gate on tag push.
 
-## Hylla discipline — Go-only, primary evidence source
+## Evidence discipline
 
-Evidence order for Go work: (1) Hylla (`mcp__hylla__*`) for committed symbols/refs/graphs; (2) `git diff` for uncommitted; (3) Read/Grep/Glob for non-Go and post-edit pre-push Go; (4) Context7 + `go doc` + LSP for external semantics.
+Hylla ingest is Go-only, so **Hylla MCP does not index this repo's Rust source**. Evidence order for Rust work: (1) `git diff` / `git log` for changes; (2) Read/Grep/Glob + LSP (rust-analyzer) for code; (3) Context7 + docs.rs for external crate semantics. The archived Go implementation on `go-legacy` (and the Hylla artifact ref `github.com/hylla-io/bage@go-legacy`) remains the byte-contract REFERENCE for normalize/hash parity questions.
 
-**Hylla is Go-only.** Never query for `.toml`, `.json`, `.md`, `.yml`, scripts.
+## Dogfooding — use bage to edit bage
 
-**Push-often + ingest-after-push**: after every commit batch push to origin, then trigger `mcp__hylla__hylla_ingest`. Between push and ingest, fall back to `git log` / `Read`.
+Orch AND subagents edit files in THIS repo with **bage itself** (`bage apply` / `bage rename`, built via `cargo build --release` → `target/release/bage`). Built-in Edit is a **fallback only** — used when bage genuinely cannot do it.
 
-Spawn prompts for dispatched `ta-go-*` roles MUST include the Hylla artifact ref `github.com/hylla-io/bage@main`.
-
-## What's missing (bootstrap TODO for dev)
-
-This project was sync'd with the agent infrastructure but is not yet a working Go project. To bring it online, the dev needs to:
-
-1. `git init` + remote setup
-2. `go mod init github.com/hylla-io/bage`
-3. Bootstrap `magefile.go` to the canonical 12-target shape (see tillsyn or ta for reference)
-4. Bootstrap `.github/workflows/ci.yml` calling `mage ci`
-5. Add `cmd/bage/main.go` (or whatever entrypoint the project chooses)
-6. Fill in project-specific sections in this CLAUDE.md when domain decisions are made (architecture, dependencies, target users, etc.)
-
-This CLAUDE.md is intentionally generic until bage's domain is decided.
+- **Edits to existing files → `bage apply`** (`--file`, `--line`/`--lines`/`--start`/`--end`, `--text`/`--text-file`, optional `--region-hash`, `--lang` empty = auto-detect). **New files → `bage create`.** Lifecycle → `bage delete` / `bage move` (raw_hash-gated). Symbol renames → `bage rename` (LSP). Inspect → `bage show` (block + `region_hash` map) / `bage read` (whole-file/`--symbol`/`--line`/byte-range, optional `--content`, `--format text|json|toon`) / `bage diagnose` (parse/LSP health).
+- **Honest constraint:** bage **creates** (`bage create`), **reads content** (`bage read --content`), **shows** structure (`bage show`), and does **lifecycle** (delete/move) — so built-in Read/Write is a fallback only when bage genuinely cannot do it.
+- **Report findings:** any bage friction/bug goes in `BAGE_DOGFOOD_FINDINGS.md`, then gets fixed (TDD).
+- **Test parity:** when dogfooding sharpens one language, update tests + code for ALL other file types/langs to match — do not let them fall behind.
+- Goal: dogfood until bage is proven excellent for every lang/file type, and right for what Hylla needs (keep `hylla/polyglot-foundation/BAGE_UPDATE.md` current).
 
 ## ta CLI usage
 
 - All `ta <read-command>` invocations from dispatched roles MUST pass `--json`.
 - `--json` accepted on: `ta get`, `ta list-sections`, `ta schema`, `ta search`.
-- **NEVER invoke raw `go test` / `go vet` / `go build` / `gofmt` / `gofumpt`.** Always route through mage.
+- Build/test verification goes through the cargo gate above — do not invent ad-hoc scripts around it.
 
 ## MCP server pinning
 
@@ -99,18 +75,8 @@ The `ta` MCP server pins one project per process. Either:
   {"mcpServers":{"ta":{"command":"ta","args":["--project","/abs/path/to/project"]}}}
   ```
 
-## Dogfooding — use bage to edit bage
-
-Orch AND subagents edit files in THIS repo with **bage itself** (`bage apply` / `bage rename`, built from `cmd/bage`). Built-in Edit is a **fallback only** — used when bage genuinely cannot do it.
-
-- **Edits to existing files → `bage apply`** (`--file`, `--line`/`--lines`/`--start`/`--end`, `--text`/`--text-file`, optional `--region-hash`, `--lang` empty = auto-detect). **New files → `bage create`.** Lifecycle → `bage delete` / `bage move` (raw_hash-gated). Symbol renames → `bage rename` (LSP). Inspect → `bage show` (block + `region_hash` map) / `bage read` (whole-file/`--symbol`/`--line`/byte-range, optional `--content`, `--format text|json|toon`) / `bage diagnose` (parse/LSP health).
-- **Honest constraint:** bage now **creates** (`bage create`), **reads content** (`bage read --content`, by block/`--symbol`/`--line`/byte-range), **shows** structure (`bage show`), and does **lifecycle** (delete/move) — so built-in Read/Write is a fallback only when bage genuinely cannot do it. Do NOT reach for built-in Write to create a file when `bage create` works, nor built-in Read for a block/region when `bage read --content` covers it.
-- **Report findings:** any bage friction/bug goes in `BAGE_DOGFOOD_FINDINGS.md`, then gets fixed (TDD).
-- **Test parity:** when dogfooding sharpens Go, update tests + code for ALL other file types/langs to match — do not let them fall behind.
-- Goal: dogfood until bage is proven excellent for every lang/file type, and right for what Hylla needs (keep `hylla/polyglot-foundation/BAGE_UPDATE.md` current).
-
 ## Git workflow & versioning
 
-- **All work goes on a branch → PR → CI green → merge.** Never push code directly to `main` (the repo is public; the PR + `mage ci` check is the gate).
-- **Delete merged branches immediately — local AND remote**: `git branch -d <branch> && git push origin --delete <branch>`. Never leave a merged branch lying around (in the worktree dirs, locally, or on the remote).
+- **All work goes on a branch → PR → CI green → merge.** Never push code directly to `main` (the repo is public; the PR + CI check is the gate).
+- **Delete merged branches immediately — local AND remote**: `git branch -d <branch> && git push origin --delete <branch>`. Never leave a merged branch lying around. (Exception: `go-legacy` is a PERMANENT archive branch — never delete it.)
 - **Semver bumps follow CODE, never docs.** Tag a new version on `main` after a merged PR that changes CODE: a feature → bump MINOR (`v0.N.0`), a fix → bump PATCH (`v0.x.P`); while pre-1.0, a breaking change also bumps MINOR. A **doc-only** PR (README, CONTRIBUTING, CLAUDE.md, SPEC, code comments) gets **NO version bump and NO tag**. Tag: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
