@@ -37,4 +37,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "$GITHUB_REF_NAME" --generate-notes
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
