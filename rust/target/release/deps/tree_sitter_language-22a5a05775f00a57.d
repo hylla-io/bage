@@ -1,7 +1,0 @@
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/tree_sitter_language-22a5a05775f00a57.d: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-language-0.1.7/src/language.rs
-
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/libtree_sitter_language-22a5a05775f00a57.rlib: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-language-0.1.7/src/language.rs
-
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/libtree_sitter_language-22a5a05775f00a57.rmeta: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-language-0.1.7/src/language.rs
-
-/Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-language-0.1.7/src/language.rs:

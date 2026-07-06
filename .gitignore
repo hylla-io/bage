@@ -75,3 +75,4 @@ e2e-scratch/
 
 # Rust build artifacts
 /target/
+/rust/

@@ -1,9 +1,0 @@
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/tree_sitter_json-245df7ad836d00ae.d: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/lib.rs /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../src/node-types.json /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../queries/highlights.scm
-
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/libtree_sitter_json-245df7ad836d00ae.rlib: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/lib.rs /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../src/node-types.json /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../queries/highlights.scm
-
-/Users/evanschultz/Documents/Code/hylla/bage/main/rust/target/release/deps/libtree_sitter_json-245df7ad836d00ae.rmeta: /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/lib.rs /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../src/node-types.json /Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../queries/highlights.scm
-
-/Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/lib.rs:
-/Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../src/node-types.json:
-/Users/evanschultz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tree-sitter-json-0.24.8/bindings/rust/../../queries/highlights.scm:
