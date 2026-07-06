@@ -1,0 +1,18 @@
+{
+  "path": "tiny.go",
+  "lang": "go",
+  "raw_hash": "6151d80cb5fe5e98",
+  "norm_hash": "6151d80cb5fe5e98",
+  "blocks": [
+    {
+      "kind": "range",
+      "name": "",
+      "start_line": 1,
+      "end_line": 3,
+      "start_byte": 0,
+      "end_byte": 38,
+      "region_hash": "3c4a10fc9a577ab1",
+      "content": "package tiny\n\n// Answer is the answer."
+    }
+  ]
+}

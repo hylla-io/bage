@@ -1,0 +1,7 @@
+path: tiny.go
+lang: go
+raw_hash: 6151d80cb5fe5e98
+norm_hash: 6151d80cb5fe5e98
+outline[2]{kind,name,start_line,end_line,start_byte,end_byte,region_hash}:
+  const_declaration,Answer,4,4,39,56,"04927316d00f5017"
+  function_declaration,Greet,6,8,58,113,9c92adf0bf575068

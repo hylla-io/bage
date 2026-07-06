@@ -1,0 +1,26 @@
+{
+  "path": "tiny.go",
+  "lang": "go",
+  "raw_hash": "6151d80cb5fe5e98",
+  "norm_hash": "6151d80cb5fe5e98",
+  "outline": [
+    {
+      "kind": "const_declaration",
+      "name": "Answer",
+      "start_line": 4,
+      "end_line": 4,
+      "start_byte": 39,
+      "end_byte": 56,
+      "region_hash": "04927316d00f5017"
+    },
+    {
+      "kind": "function_declaration",
+      "name": "Greet",
+      "start_line": 6,
+      "end_line": 8,
+      "start_byte": 58,
+      "end_byte": 113,
+      "region_hash": "9c92adf0bf575068"
+    }
+  ]
+}
