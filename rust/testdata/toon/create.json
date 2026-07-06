@@ -1,0 +1,12 @@
+[
+  {
+    "path": "created.txt",
+    "changed_start": 0,
+    "changed_end": 1,
+    "new_region_hash": "5c80c09683041123",
+    "new_file_raw_hash": "5c80c09683041123",
+    "new_file_norm_hash": "5c80c09683041123",
+    "new_start_line": 1,
+    "new_end_line": 1
+  }
+]

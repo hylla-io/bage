@@ -1,0 +1,2 @@
+[1]{path,changed_start,changed_end,new_region_hash,new_file_raw_hash,new_file_norm_hash,new_start_line,new_end_line}:
+  created.txt,0,1,5c80c09683041123,5c80c09683041123,5c80c09683041123,1,1

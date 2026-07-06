@@ -66,10 +66,12 @@ fn run_tool(name: &str, args: &[String], src: &[u8]) -> Result<Vec<u8>, ToolErro
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     if let Some(out) = child.stdout.as_mut() {
-        out.read_to_end(&mut stdout).map_err(|e| err(e.to_string()))?;
+        out.read_to_end(&mut stdout)
+            .map_err(|e| err(e.to_string()))?;
     }
     if let Some(errs) = child.stderr.as_mut() {
-        errs.read_to_end(&mut stderr).map_err(|e| err(e.to_string()))?;
+        errs.read_to_end(&mut stderr)
+            .map_err(|e| err(e.to_string()))?;
     }
     let status = child.wait().map_err(|e| err(e.to_string()))?;
     writer.join().expect("stdin writer panicked");

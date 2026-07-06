@@ -8,6 +8,7 @@
 
 pub mod atomicwrite;
 pub mod edit;
+pub mod editor;
 pub mod format;
 pub mod hashing;
 pub mod inspect;

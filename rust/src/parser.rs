@@ -303,7 +303,10 @@ impl Adapter {
     pub fn new() -> Adapter {
         let langs: [(Lang, ts::Language); 20] = [
             (Lang::Go, tree_sitter_go::LANGUAGE.into()),
-            (Lang::TypeScript, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            (
+                Lang::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
             (Lang::Tsx, tree_sitter_typescript::LANGUAGE_TSX.into()),
             (Lang::JavaScript, tree_sitter_javascript::LANGUAGE.into()),
             (Lang::Python, tree_sitter_python::LANGUAGE.into()),
@@ -444,7 +447,10 @@ fn text_lines(src: &[u8]) -> Vec<Node> {
             start_byte: line_start,
             end_byte: i + 1,
             start_point: Point { row, col: 0 },
-            end_point: Point { row: row + 1, col: 0 },
+            end_point: Point {
+                row: row + 1,
+                col: 0,
+            },
             named: true,
             missing: false,
             children: Vec::new(),
@@ -641,7 +647,9 @@ mod tests {
         ];
         let a = Adapter::new();
         for (lang, src) in snippets {
-            let tree = a.parse(*lang, src).unwrap_or_else(|e| panic!("{lang}: {e}"));
+            let tree = a
+                .parse(*lang, src)
+                .unwrap_or_else(|e| panic!("{lang}: {e}"));
             assert_eq!(tree.root.start_byte, 0, "{lang}");
             assert_eq!(tree.root.end_byte, src.len(), "{lang} root spans source");
             assert!(!tree.root.children.is_empty(), "{lang} has children");
@@ -694,7 +702,9 @@ mod tests {
             old_end_point: Point { row: 2, col: 9 },
             new_end_point: Point { row: 2, col: 10 },
         };
-        let incr = a.parse_incremental(Lang::Go, new_src, &mut old, edit).unwrap();
+        let incr = a
+            .parse_incremental(Lang::Go, new_src, &mut old, edit)
+            .unwrap();
         let full = a.parse(Lang::Go, new_src).unwrap();
         assert_eq!(incr.root, full.root);
         // A token-only rename may legitimately report no structural
@@ -705,7 +715,9 @@ mod tests {
     #[test]
     fn error_and_missing_nodes_are_surfaced() {
         let a = Adapter::new();
-        let tree = a.parse(Lang::Go, b"package main\n\nfunc main() {\n").unwrap();
+        let tree = a
+            .parse(Lang::Go, b"package main\n\nfunc main() {\n")
+            .unwrap();
         let mut found = false;
         tree.root.walk(&mut |n| {
             if n.kind == "ERROR" || n.missing {

@@ -2,13 +2,11 @@
 //! blocks (the Outline), read sub-ranges, and surface parse-health defects.
 //! Everything here is strictly read-only — nothing writes to disk.
 
-
-
 use serde::{Deserialize, Serialize};
 
 use crate::hashing::{self, Hasher};
 use crate::parser::{Adapter, Lang, Node, ParserPort, Tree};
-use crate::region::{self, LineIndex, Region, LINE_SENTINEL};
+use crate::region::{self, LINE_SENTINEL, LineIndex, Region};
 
 /// Errors from the read-only inspection surface.
 #[derive(Debug, thiserror::Error)]
@@ -284,12 +282,12 @@ pub fn read_blocks(opened: &OpenedFile, include_content: bool) -> Vec<Block> {
     outline(&opened.tree)
         .into_iter()
         .map(|sym| {
-            let content = if include_content && sym.end_byte <= src.len() && sym.end_byte >= sym.start_byte
-            {
-                String::from_utf8_lossy(&src[sym.start_byte..sym.end_byte]).into_owned()
-            } else {
-                String::new()
-            };
+            let content =
+                if include_content && sym.end_byte <= src.len() && sym.end_byte >= sym.start_byte {
+                    String::from_utf8_lossy(&src[sym.start_byte..sym.end_byte]).into_owned()
+                } else {
+                    String::new()
+                };
             Block {
                 region_hash: region::hash_region(src, sym.start_byte, sym.end_byte),
                 kind: sym.kind,
@@ -402,11 +400,15 @@ fn range_block(src: &[u8], opts: &ReadOptions, line_mode: bool) -> Result<Block,
             (opts.line as i64, String::new(), -1, -1)
         }
     } else {
-        (-1, String::new(), opts.start_byte as i64, opts.end_byte as i64)
+        (
+            -1,
+            String::new(),
+            opts.start_byte as i64,
+            opts.end_byte as i64,
+        )
     };
 
-    let reg = resolve_range(src, line, &lines, start, end)
-        .map_err(InspectError::Usage)?;
+    let reg = resolve_range(src, line, &lines, start, end).map_err(InspectError::Usage)?;
 
     let (rs, re) = (reg.start_byte as usize, reg.end_byte as usize);
     let content = if opts.include_content && re <= src.len() && re >= rs {
@@ -712,7 +714,11 @@ mod tests {
         let opened = open_file(&broken).unwrap();
         let defects = parse_health(&opened);
         assert!(!defects.is_empty());
-        assert!(defects.iter().all(|d| d.kind == "ERROR" || d.kind == "MISSING"));
+        assert!(
+            defects
+                .iter()
+                .all(|d| d.kind == "ERROR" || d.kind == "MISSING")
+        );
         assert!(defects.iter().all(|d| d.line >= 1 && d.col >= 1));
 
         let txt = write_temp(&dir, "b.txt", b"anything {{{ at all");

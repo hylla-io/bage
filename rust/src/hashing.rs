@@ -88,7 +88,10 @@ mod tests {
             for hasher in [&XxHasher as &dyn Hasher, &FnvHasher] {
                 let d = hasher.sum(input);
                 assert_eq!(d.len(), 16, "digest {d:?}");
-                assert!(d.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+                assert!(
+                    d.bytes()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                );
             }
         }
     }

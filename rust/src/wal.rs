@@ -113,8 +113,8 @@ pub struct Move {
 mod base64_map {
     use std::collections::HashMap;
 
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(
@@ -132,8 +132,7 @@ mod base64_map {
         de: D,
     ) -> Result<HashMap<String, Vec<u8>>, D::Error> {
         // Option-tolerant: Go marshals a nil map as JSON null.
-        let encoded: HashMap<String, String> =
-            Option::deserialize(de)?.unwrap_or_default();
+        let encoded: HashMap<String, String> = Option::deserialize(de)?.unwrap_or_default();
         encoded
             .into_iter()
             .map(|(k, v)| {

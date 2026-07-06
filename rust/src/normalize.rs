@@ -76,8 +76,16 @@ mod tests {
             ("trailing ws at eof", b"a  ", b"a"),
             ("interior ws preserved", b"a  b\tc\n", b"a  b\tc\n"),
             ("single leading bom", b"\xEF\xBB\xBFa\n", b"a\n"),
-            ("multiple leading boms", b"\xEF\xBB\xBF\xEF\xBB\xBFa\n", b"a\n"),
-            ("interior bom preserved", b"a\n\xEF\xBB\xBFb\n", b"a\n\xEF\xBB\xBFb\n"),
+            (
+                "multiple leading boms",
+                b"\xEF\xBB\xBF\xEF\xBB\xBFa\n",
+                b"a\n",
+            ),
+            (
+                "interior bom preserved",
+                b"a\n\xEF\xBB\xBFb\n",
+                b"a\n\xEF\xBB\xBFb\n",
+            ),
             // A \r-split BOM collapses under \r-removal, then strips (the
             // fuzz-discovered ordering invariant).
             ("cr-split leading bom", b"\xEF\xBB\r\xBFa\n", b"a\n"),

@@ -19,7 +19,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::hashing::{norm_hash, Hasher, XxHasher};
+use crate::hashing::{Hasher, XxHasher, norm_hash};
 use crate::parser::{ByteRange, Lang, ParserPort};
 
 /// The `start_byte` value marking a [`Region`] as line-addressed: the byte
@@ -159,7 +159,9 @@ pub enum ResolveError {
     },
     #[error("region: {path:?} region_hash {hash} no longer matches any node (conflict)")]
     Conflict { path: String, hash: String },
-    #[error("region: {path:?} region_hash {hash} matches {count} nodes (ambiguous); refusing to guess")]
+    #[error(
+        "region: {path:?} region_hash {hash} matches {count} nodes (ambiguous); refusing to guess"
+    )]
     Ambiguous {
         path: String,
         hash: String,
