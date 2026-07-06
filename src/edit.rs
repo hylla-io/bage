@@ -109,7 +109,7 @@ pub fn splice_edits(src: &[u8], edits: &[FileEdit]) -> Result<Vec<u8>, EditError
     }
 
     let mut sorted: Vec<&FileEdit> = edits.iter().collect();
-    sorted.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.start_byte));
 
     // sorted is descending by start_byte, so sorted[i+1] has the lower
     // start; they overlap when its end_byte extends past sorted[i]'s start.

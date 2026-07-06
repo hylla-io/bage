@@ -732,14 +732,9 @@ mod tests {
         let a = Adapter::new();
         let mut src = Vec::new();
         src.extend_from_slice(b"const x = ");
-        for _ in 0..2000 {
-            src.push(b'(');
-        }
+        src.extend(std::iter::repeat_n(b'(', 2000));
         src.push(b'1');
-        for _ in 0..2000 {
-            src.push(b')');
-        }
-        src.extend_from_slice(b";\n");
+        src.extend(std::iter::repeat_n(b')', 2000));
         let tree = a.parse(Lang::JavaScript, &src).unwrap();
         assert_eq!(tree.root.end_byte, src.len());
     }

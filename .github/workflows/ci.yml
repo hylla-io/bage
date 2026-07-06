@@ -15,16 +15,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The job key MUST stay `check`: it is the required status context on main.
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: true
-      - name: Install mage
-        run: go install github.com/magefile/mage@latest
-      - name: mage ci
-        run: mage ci
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test

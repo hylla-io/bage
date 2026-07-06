@@ -214,10 +214,11 @@ pub fn resolve(
 
     // Fast path: the region is in place if its bytes still hash to
     // region_hash.
-    if let Ok((start, end)) = checked_range(r) {
-        if end <= live.len() && hash_region(live, start, end) == r.region_hash {
-            return Ok((start, end, ResolveStatus::Exact));
-        }
+    if let Ok((start, end)) = checked_range(r)
+        && end <= live.len()
+        && hash_region(live, start, end) == r.region_hash
+    {
+        return Ok((start, end, ResolveStatus::Exact));
     }
 
     // Slow path: parse the live file and match the region_hash against the
