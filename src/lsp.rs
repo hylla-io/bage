@@ -12,7 +12,9 @@
 //! DROPS on overflow rather than ever blocking the read loop.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -309,7 +311,12 @@ pub fn file_uri(path: &str) -> lt::Uri {
 /// escaped bytes (mirrors Go `DocumentURI.Filename`). A non-file URI is
 /// returned as-is minus its scheme, best-effort.
 pub fn uri_to_path(uri: &lt::Uri) -> String {
-    let s = uri.as_str();
+    uri_str_to_path(uri.as_str())
+}
+
+/// String-level body of [`uri_to_path`], usable where only the raw URI text
+/// is at hand (the initialize root URI).
+fn uri_str_to_path(s: &str) -> String {
     let rest = s.strip_prefix("file://").unwrap_or(s);
     // Strip a non-empty authority (file://host/path); file:///path has an
     // empty authority and starts directly with '/'.
@@ -362,6 +369,106 @@ fn language_id_for_path(path: &str) -> &'static str {
         "css" => "css",
         _ => "plaintext",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace priming + clangd compilation database (issue #23)
+// ---------------------------------------------------------------------------
+
+/// Cap on how many same-language sibling files workspace priming will
+/// `didOpen` before a rename, bounding both the filesystem walk and the
+/// number of notifications sent to the server.
+const PRIME_FILE_CAP: usize = 200;
+
+/// Environment variable that disables workspace priming when set to `"1"`.
+pub const NO_PRIME_ENV: &str = "BAGE_LSP_NO_PRIME";
+
+/// Basename of the clang compilation database consulted (and, when missing,
+/// generated) for clangd.
+const COMPILE_COMMANDS: &str = "compile_commands.json";
+
+/// Reports whether the server command runs clangd. Detection is a substring
+/// scan over every token so wrappers survive it: `clangd`, `clangd-18`,
+/// `/usr/bin/clangd`, and `docker run … sh -c "… exec clangd"` all match.
+fn command_is_clangd(command: &[String]) -> bool {
+    command.iter().any(|t| t.contains("clangd"))
+}
+
+/// Walks `root` depth-first collecting the files `keep` accepts, capped at
+/// `cap` results. Hidden (dot-prefixed) directories plus `target/` and
+/// `node_modules/` are skipped, entries are visited in sorted order for
+/// determinism, and unreadable directories are silently ignored.
+fn walk_files(root: &Path, cap: usize, keep: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        entries.sort();
+        for p in entries {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if p.is_dir() {
+                if name.starts_with('.') || name == "target" || name == "node_modules" {
+                    continue;
+                }
+                stack.push(p);
+            } else if keep(&p) {
+                out.push(p);
+                if out.len() >= cap {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Discovers source files under `root` whose extension maps to the given LSP
+/// `languageId`, bounded by `cap` — the candidate set workspace priming
+/// `didOpen`s before a rename.
+fn discover_same_language_files(root: &Path, language_id: &str, cap: usize) -> Vec<PathBuf> {
+    walk_files(root, cap, &|p| {
+        language_id_for_path(&p.to_string_lossy()) == language_id
+    })
+}
+
+/// Ensures `root` has a `compile_commands.json` for clangd. Without a
+/// compilation database clangd treats every file as an isolated translation
+/// unit and a rename never crosses TUs. When the database already exists (or
+/// no C/C++ sources are found) nothing is written and `Ok(None)` is
+/// returned; otherwise a minimal database covering every `.c`/`.cc`/`.cpp`/
+/// `.cxx` file under `root` is written — one `{directory, file, command:
+/// "clang -c <file>"}` entry each — and `Ok(Some(path))` is returned so the
+/// creator ([`Client::initialize`] via [`Client::close`]/Drop) can remove
+/// the file it added. A pre-existing database is never touched or removed.
+pub fn ensure_compile_commands(root: &Path) -> io::Result<Option<PathBuf>> {
+    let db = root.join(COMPILE_COMMANDS);
+    if db.exists() {
+        return Ok(None);
+    }
+    let tus = walk_files(root, usize::MAX, &|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("c" | "cc" | "cpp" | "cxx")
+        )
+    });
+    if tus.is_empty() {
+        return Ok(None);
+    }
+    let entries: Vec<Value> = tus
+        .iter()
+        .map(|f| {
+            json!({
+                "directory": root.to_string_lossy(),
+                "file": f.to_string_lossy(),
+                "command": format!("clang -c {}", f.to_string_lossy()),
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec_pretty(&entries)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&db, body)?;
+    Ok(Some(db))
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +602,15 @@ pub struct Client {
     next_id: u64,
     ver: i32,
     child: Option<Child>,
+    /// The full server command (set by `new_stdio`, empty for `from_conn`),
+    /// kept for clangd detection.
+    command: Vec<String>,
+    /// Workspace root recorded at initialize — the base directory workspace
+    /// priming walks before a rename.
+    root: Option<PathBuf>,
+    /// A compile_commands.json bage generated for clangd, removed again on
+    /// close/Drop; `None` when the database pre-existed or was never needed.
+    created_compile_commands: Option<PathBuf>,
     /// Bounds how long `rename` retries a still-indexing server (overridable
     /// in tests).
     pub rename_deadline: Duration,
@@ -526,6 +642,7 @@ impl Client {
         let stdout = child.stdout.take().expect("piped stdout");
         let mut client = Client::from_conn(stdout, stdin);
         client.child = Some(child);
+        client.command = command.to_vec();
         Ok(client)
     }
 
@@ -552,6 +669,9 @@ impl Client {
             next_id: 0,
             ver: 0,
             child: None,
+            command: Vec::new(),
+            root: None,
+            created_compile_commands: None,
             rename_deadline: DEFAULT_RENAME_DEADLINE,
             rename_retry: DEFAULT_RENAME_RETRY,
             call_timeout: DEFAULT_CALL_TIMEOUT,
@@ -597,8 +717,19 @@ impl Client {
     }
 
     /// Performs the LSP initialize/initialized handshake rooted at `root_uri`
-    /// (a `file://` URI for the workspace root).
+    /// (a `file://` URI for the workspace root). The root path is recorded
+    /// as the base for workspace priming, and when the server command runs
+    /// clangd a missing compile_commands.json is generated at the root first
+    /// (see [`ensure_compile_commands`]; a generation failure is swallowed —
+    /// clangd then just stays single-TU, exactly as before).
     pub fn initialize(&mut self, root_uri: &str) -> Result<(), LspError> {
+        let root = PathBuf::from(uri_str_to_path(root_uri));
+        if command_is_clangd(&self.command)
+            && let Ok(Some(created)) = ensure_compile_commands(&root)
+        {
+            self.created_compile_commands = Some(created);
+        }
+        self.root = Some(root);
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
@@ -628,10 +759,11 @@ impl Client {
     }
 
     /// Opens the file at `path` (sending `content` via didOpen so the server
-    /// has an authoritative view), requests a `textDocument/rename` of the
-    /// symbol at the zero-based (line, col) UTF-16 position, and returns the
-    /// server's `WorkspaceEdit` — convert it to byte offsets with
-    /// [`workspace_edit_to_file_edits`].
+    /// has an authoritative view), primes the server with the target's
+    /// same-language sibling files (see [`Client::prime_workspace`]),
+    /// requests a `textDocument/rename` of the symbol at the zero-based
+    /// (line, col) UTF-16 position, and returns the server's `WorkspaceEdit`
+    /// — convert it to byte offsets with [`workspace_edit_to_file_edits`].
     ///
     /// A language server still building its index (e.g. rust-analyzer on a
     /// cold crate) answers a rename before it can resolve references — either
@@ -647,6 +779,7 @@ impl Client {
         new_name: &str,
     ) -> Result<lt::WorkspaceEdit, LspError> {
         self.did_open(path, content)?;
+        self.prime_workspace(path);
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
@@ -675,6 +808,39 @@ impl Client {
         }
     }
 
+    /// Primes the server with the rename target's same-language sibling
+    /// files under the workspace root recorded at initialize, `didOpen`ing
+    /// each with its disk content. Servers that only consider OPEN documents
+    /// (pyright) need this for a rename to reach cross-file references;
+    /// full-workspace servers (gopls, rust-analyzer) simply ignore the
+    /// redundant opens, so priming runs unconditionally — bounded by
+    /// [`PRIME_FILE_CAP`], skipping hidden dirs, `target/` and
+    /// `node_modules/` — unless [`NO_PRIME_ENV`]=1 disables it. Best-effort:
+    /// unreadable files and notify failures are skipped (a dead transport
+    /// still surfaces on the rename request itself).
+    fn prime_workspace(&mut self, target: &str) {
+        if std::env::var(NO_PRIME_ENV).is_ok_and(|v| v == "1") {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let lang = language_id_for_path(target);
+        if lang == "plaintext" {
+            return;
+        }
+        for p in discover_same_language_files(&root, lang, PRIME_FILE_CAP) {
+            let ps = p.to_string_lossy().into_owned();
+            if ps == target {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else {
+                continue;
+            };
+            let _ = self.did_open(&ps, &text);
+        }
+    }
+
     /// Opens `path` in the server (didOpen with `content`) and collects the
     /// first `textDocument/publishDiagnostics` notification the server pushes,
     /// mapping each entry into Båge's reporting shape. The result arrives as
@@ -699,10 +865,15 @@ impl Client {
     }
 
     /// Requests an orderly LSP shutdown (shutdown + exit) and reaps the
-    /// subprocess, killing it if it does not exit promptly. Best-effort: a
-    /// failed shutdown still proceeds to exit and reaping, and the first
-    /// error encountered is returned.
+    /// subprocess, killing it if it does not exit promptly. Removes a
+    /// compile_commands.json bage generated for clangd (a pre-existing
+    /// database is never touched). Best-effort: a failed shutdown still
+    /// proceeds to exit and reaping, and the first error encountered is
+    /// returned.
     pub fn close(&mut self) -> Result<(), LspError> {
+        if let Some(db) = self.created_compile_commands.take() {
+            let _ = fs::remove_file(db);
+        }
         let shutdown = self.call("shutdown", Value::Null, Duration::from_secs(2));
         let exit = self.notify("exit", Value::Null);
         if let Some(mut child) = self.child.take() {
@@ -730,8 +901,12 @@ impl Client {
 }
 
 impl Drop for Client {
-    /// Backstop: kill and reap the server subprocess if `close` was skipped.
+    /// Backstop: kill and reap the server subprocess if `close` was skipped,
+    /// and remove a compile_commands.json bage created.
     fn drop(&mut self) {
+        if let Some(db) = self.created_compile_commands.take() {
+            let _ = fs::remove_file(db);
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -1545,5 +1720,229 @@ mod tests {
         }
         assert_eq!(file_uri("/tmp/a b").as_str(), "file:///tmp/a%20b");
         assert_eq!(file_uri("/t/a#b.go").as_str(), "file:///t/a%23b.go");
+    }
+
+    // ---- workspace priming + compile_commands (issue #23) ----
+
+    /// Serializes tests that read or write [`NO_PRIME_ENV`] so the process
+    /// environment mutation cannot race a concurrent priming rename.
+    static PRIME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn discover_same_language_files_skips_hidden_and_vendor_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for d in ["pkg", ".hidden", "target", "node_modules"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for f in [
+            "a.py",
+            "pkg/b.py",
+            ".hidden/c.py",
+            "target/d.py",
+            "node_modules/e.py",
+        ] {
+            std::fs::write(root.join(f), "x = 1\n").unwrap();
+        }
+        std::fs::write(root.join("notes.md"), "# not python\n").unwrap();
+
+        let got = discover_same_language_files(root, "python", PRIME_FILE_CAP);
+        let mut names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a.py", "b.py"],
+            "hidden/target/node_modules and other languages must be excluded"
+        );
+    }
+
+    #[test]
+    fn discover_same_language_files_caps_result_count() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.py")), "x = 1\n").unwrap();
+        }
+        let got = discover_same_language_files(dir.path(), "python", 3);
+        assert_eq!(got.len(), 3, "discovery must stop at the cap");
+    }
+
+    #[test]
+    fn ensure_compile_commands_generates_minimal_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        for f in ["main.c", "util.cc", "deep/x.cpp"] {
+            std::fs::write(root.join(f), "// tu\n").unwrap();
+        }
+        std::fs::write(root.join("skip.h"), "// header\n").unwrap();
+        std::fs::write(root.join("skip.py"), "x = 1\n").unwrap();
+
+        let created = ensure_compile_commands(root)
+            .unwrap()
+            .expect("database must be created");
+        assert_eq!(created, root.join(COMPILE_COMMANDS));
+
+        let body = std::fs::read(&created).unwrap();
+        let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "one entry per TU, headers/other langs skipped"
+        );
+        let mut files: Vec<String> = entries
+            .iter()
+            .map(|e| e["file"].as_str().unwrap().to_string())
+            .collect();
+        files.sort();
+        let want: Vec<String> = ["deep/x.cpp", "main.c", "util.cc"]
+            .iter()
+            .map(|f| root.join(f).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, want);
+        for e in &entries {
+            assert_eq!(e["directory"].as_str().unwrap(), root.to_string_lossy());
+            let cmd = e["command"].as_str().unwrap();
+            assert!(cmd.starts_with("clang -c "), "got command {cmd:?}");
+        }
+
+        // Second call: the database now exists, so nothing is created and
+        // the content is untouched.
+        assert!(ensure_compile_commands(root).unwrap().is_none());
+        assert_eq!(std::fs::read(&created).unwrap(), body);
+    }
+
+    #[test]
+    fn ensure_compile_commands_no_sources_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ensure_compile_commands(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(COMPILE_COMMANDS).exists());
+    }
+
+    #[test]
+    fn close_removes_bage_created_compile_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(COMPILE_COMMANDS);
+        std::fs::write(&db, b"[]").unwrap();
+
+        let (client_conn, server_conn) = conn_pair();
+        spawn_fake_server(server_conn, || Ok(json!({})), Vec::new());
+        let mut c = test_client(client_conn);
+        c.created_compile_commands = Some(db.clone());
+        let _ = c.close();
+        assert!(!db.exists(), "close must remove the database bage created");
+    }
+
+    /// A fake server that records every didOpen URI, for priming assertions.
+    fn spawn_recording_server(
+        server_conn: (PipeReader, PipeWriter),
+        opened: Arc<Mutex<Vec<String>>>,
+    ) {
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didOpen" => {
+                        if let Some(uri) = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                        {
+                            opened.lock().unwrap().push(uri.to_string());
+                        }
+                    }
+                    "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Shared fixture for the priming tests: a root with the rename target,
+    /// one same-language sibling, and one other-language file. Returns the
+    /// didOpen URIs recorded across one full rename.
+    fn prime_fixture_opened_uris() -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("lib.py");
+        std::fs::write(&target, "def greet():\n    return 1\n").unwrap();
+        std::fs::write(root.join("other.py"), "from lib import greet\n").unwrap();
+        std::fs::write(root.join("notes.md"), "# not python\n").unwrap();
+
+        let (client_conn, server_conn) = conn_pair();
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        spawn_recording_server(server_conn, Arc::clone(&opened));
+        let mut c = test_client(client_conn);
+        c.initialize(&file_uri(root.to_str().unwrap()).to_string())
+            .unwrap();
+        c.rename(
+            target.to_str().unwrap(),
+            "def greet():\n    return 1\n",
+            0,
+            4,
+            "hello",
+        )
+        .expect("rename against recording fake");
+        // The rename response is a sync point: every didOpen notification was
+        // written to the pipe before the rename request, so the server has
+        // recorded them all by the time it answers.
+        let _ = c.close();
+        let uris = opened.lock().unwrap().clone();
+        (dir, uris)
+    }
+
+    #[test]
+    fn rename_primes_same_language_siblings() {
+        let _guard = PRIME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (dir, opened) = prime_fixture_opened_uris();
+        let root = dir.path();
+        let target_uri = file_uri(root.join("lib.py").to_str().unwrap()).to_string();
+        let sibling_uri = file_uri(root.join("other.py").to_str().unwrap()).to_string();
+        let md_uri = file_uri(root.join("notes.md").to_str().unwrap()).to_string();
+
+        assert_eq!(
+            opened.first(),
+            Some(&target_uri),
+            "target must be opened first with authoritative content"
+        );
+        assert!(
+            opened.contains(&sibling_uri),
+            "same-language sibling must be primed, got {opened:?}"
+        );
+        assert!(
+            !opened.contains(&md_uri),
+            "other-language files must not be primed, got {opened:?}"
+        );
+        assert_eq!(
+            opened.iter().filter(|u| **u == target_uri).count(),
+            1,
+            "target must not be re-opened by priming"
+        );
+    }
+
+    #[test]
+    fn rename_priming_disabled_by_env() {
+        let _guard = PRIME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: single-threaded with respect to this variable — every test
+        // touching NO_PRIME_ENV holds PRIME_ENV_LOCK.
+        unsafe { std::env::set_var(NO_PRIME_ENV, "1") };
+        let (dir, opened) = prime_fixture_opened_uris();
+        unsafe { std::env::remove_var(NO_PRIME_ENV) };
+        let target_uri = file_uri(dir.path().join("lib.py").to_str().unwrap()).to_string();
+        assert_eq!(
+            opened,
+            vec![target_uri],
+            "with {NO_PRIME_ENV}=1 only the rename target may be opened"
+        );
     }
 }

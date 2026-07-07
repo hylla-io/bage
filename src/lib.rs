@@ -7,6 +7,7 @@
 //! implementation and Hylla.
 
 pub mod atomicwrite;
+pub mod clipboard;
 pub mod edit;
 pub mod editor;
 pub mod format;

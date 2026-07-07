@@ -157,3 +157,12 @@ not-found | usage | io` — exposed as `bage.KindOf(err)` and serialized in
 `bage.ErrorEnvelope{Kind, Path, Message}`, re-exported from `pkg/bage` so an external host
 (MCP, Hylla) reacts to a failure without parsing English.
 _Avoid_: error code, error string (the kind is a closed taxonomy a host switches on)
+
+**File clipboard**:
+The single-slot store `bage cut` / `bage copy --clip` write and `bage paste --clip` reads —
+`$BAGE_CLIPBOARD`, default `~/.bage/clipboard.json`. It holds one region's bytes plus
+provenance (source path, `region_hash`, and whether the source was `cut` or `copy`), written
+atomically so a cut in one process can be pasted by another. This is what makes a region
+**move** cross-file and cross-process; distinct from the OS/GUI clipboard, which Båge never
+touches.
+_Avoid_: pasteboard, kill ring, system clipboard (Båge's clipboard is its own file slot).

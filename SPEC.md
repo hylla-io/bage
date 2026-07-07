@@ -4,7 +4,7 @@
 > files + LSP; in integrated mode, Hylla links Båge as a library so one agent-facing edit
 > lands in both the graph and the files with no possible drift. This SPEC is the buildable
 > contract; design rationale lives in `docs/adr/` and `CONTEXT.md`. Module:
-> `github.com/hylla-io/bage`. Status: v0.4.0 (shipped) — read + serialization + error taxonomy (§11). Date: 2026-06-01.
+> `github.com/hylla-io/bage`. Status: v0.7.0 (shipped) — Rust implementation; cut / copy / paste over a file clipboard, insertion + whole-file-replace primitives, data-format key outline (§12). The `internal/*` Go layout below is the archived reference contract (`go-legacy`); the Rust crate is a flat `src/` mirror of the same ports. Date: 2026-07-06.
 
 ---
 
@@ -213,3 +213,46 @@ Standalone callers need a read Hylla doesn't (Hylla holds content in its node), 
 
 ### §11.3 Error taxonomy
 - `Kind{conflict|drift|exists|not-found|usage|io}`, `KindOf(err) Kind`, and `Envelope(err) ErrorEnvelope{Kind, Path, Message}` — re-exported via `pkg/bage` so an external MCP module branches on `kind` without parsing English. This surfaced a real bug: `ConflictError` conflated a region *conflict* with raw_hash *drift*; they now carry distinct kinds.
+
+## 12. Clipboard verbs + insertion primitives (v0.7)
+
+Region **move/duplicate** and **insertion** are first-class, riding the same anchored
+two-phase engine — no second write path.
+
+### §12.1 Insertion primitive (#20)
+`inspect::resolve_insertion(src, InsertionPoint)` resolves a **zero-width** region
+(`start == end`) for `Append` (EOF), `BeforeLine(n)`, or `AfterLine(n)`. It carries **no
+`region_hash`** — there is no content to hash — so the per-file anchor is the only drift gate.
+Shared by `bage apply --append/--before-line/--after-line` and `bage paste`. `bage apply --all`
+resolves the whole-file span `[0, len)` (also hash-free) for a lossless whole-file replace,
+fixing the stale-tail hazard of a too-short `--lines` range (dogfood finding #12). All four are
+mutually exclusive with each other and with `--line/--lines/--start/--end`.
+
+### §12.2 Clipboard verbs (cut / copy / paste)
+- **`copy`** — `Editor::copy` extracts a region READ-ONLY by `--symbol`, `--line`/`--lines`, or
+  `--start`/`--end` (optional `--region-hash` verifies + benignly relocates). `text` output is
+  the **bare content** so it pipes.
+- **`cut`** — `Editor::cut` extracts **and removes** the region: WAL-backed, `region_hash`-gated;
+  a hash mismatch rejects and nothing is removed.
+- **`paste`** — `Editor::paste` inserts at a `PastePoint` (`AtByte(n)` verbatim, or an
+  `InsertionPoint`) from `--text`, `--text-file`, or `--clip`. Exactly one point and exactly one
+  source are required.
+
+### §12.3 File clipboard (`--clip`)
+A single-slot JSON record at `$BAGE_CLIPBOARD` (default `~/.bage/clipboard.json`, OS temp
+fallback when `HOME` is unset), written atomically. `Clip{content, source_path, region_hash,
+cut}` carries the bytes plus provenance; `cut --clip` writes the slot **before** the removal
+commits. This makes a region move **cross-file and cross-process**; `paste --clip` on an empty
+slot is the distinct `Empty` error. Båge never touches the OS/GUI clipboard.
+
+### §12.4 Data-format key outline (#21)
+The outline declaration-kind set is extended per data grammar so named-key addressing works:
+JSON `pair`, YAML `block_mapping_pair`, TOML top-level `pair` + `table`, XML/HTML `element`,
+each with name extraction. Code grammars keep the substring `is_decl_kind` path.
+
+### §12.5 LSP cross-file rename completeness (#23)
+`Client::rename` primes the workspace — `didOpen`ing same-language siblings under the root
+(capped, `BAGE_LSP_NO_PRIME=1` to disable) — so servers that only see open files (pyright) rename
+across files. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
+on close) so a rename crosses translation units. Container-verified for gopls, pyright, and clangd
+(`BAGE_DOCKER_LSP=1`).

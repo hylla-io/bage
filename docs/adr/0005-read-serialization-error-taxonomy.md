@@ -68,7 +68,7 @@ maps `os.ErrNotExist` to `not-found`.
   `EditResult`-style) implement `RenderText` to stay text-renderable without a cycle.
 - `pkg/bage` re-exports the error taxonomy; `ConflictError` carries a kind.
 - Adds the `toon-format/toon-go` dependency.
-- **Open / follow-ups** (tracked): `--format` + error-envelope on the edit verbs; per-key
-  addressing for data-format grammars (JSON/YAML/TOML have empty outlines today — line/byte
-  addressing still works); an insertion/append primitive; prebuilt binaries; pyright/clangd
-  cross-file rename completeness.
+- **Open / follow-ups**: `--format` + error-envelope on the edit verbs (shipped v0.4);
+  per-key addressing for data-format grammars, an insertion/append primitive, prebuilt
+  binaries, and pyright/clangd cross-file rename completeness — all resolved in
+  [ADR-0006](0006-clipboard-and-insertion-primitives.md) (v0.7).
