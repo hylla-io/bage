@@ -35,9 +35,27 @@ a single agent-facing edit lands in both a graph and the files with no possible 
 
 ## Install
 
+**Build from source** (no CGO, no C toolchain gymnastics):
+
 ```sh
-cargo build --release        # → target/release/bage (no CGO, no C toolchain gymnastics)
+cargo build --release        # → target/release/bage
 ```
+
+**Install the CLI** from the repo at a released tag:
+
+```sh
+cargo install --git https://github.com/hylla-io/bage --tag v0.7.0
+```
+
+**Use as a library** — add the crate as a git dependency pinned to a tag:
+
+```toml
+[dependencies]
+bage = { git = "https://github.com/hylla-io/bage", tag = "v0.7.0" }
+```
+
+Prebuilt per-OS binaries (linux x64/arm64, macOS arm/intel, windows msvc) are also attached to
+each [GitHub release](https://github.com/hylla-io/bage/releases).
 
 ## Library
 
@@ -53,7 +71,7 @@ Read-only inspection without opening an editor:
 
 ```rust
 let of = bage::inspect::open_file("main.go")?;   // auto-detects language, parses
-let syms = bage::inspect::outline(&of.tree);     // declarations with byte + line ranges
+let syms = bage::inspect::outline(&of.tree, of.lang); // declarations with byte + line ranges
 let blocks = bage::inspect::read_blocks(&of, true); // blocks + region_hash + content
 ```
 
