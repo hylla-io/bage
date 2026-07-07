@@ -68,7 +68,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          name="bage-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="bage-${ref}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/bage" README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
@@ -76,7 +77,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "bage-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $ref = $env:GITHUB_REF_NAME -replace '/','-'
+          $name = "bage-$ref-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/bage.exe", "README.md", "LICENSE" -Destination $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
