@@ -76,3 +76,6 @@ e2e-scratch/
 # Rust build artifacts
 /target/
 /rust/
+
+# Private security roadmap — local only, never committed (public repo)
+/HARDENING.md
