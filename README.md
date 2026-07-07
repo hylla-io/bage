@@ -2,9 +2,10 @@
 
 > **Båge** (Swedish for *bow / arc*) — a bidirectional code-graph round-trip file editor.
 
-Status: v0.6.0 — **Rust implementation** (the original Go implementation is archived on the
+Status: v0.7.0 — **Rust implementation** (the original Go implementation is archived on the
 [`go-legacy`](https://github.com/hylla-io/bage/tree/go-legacy) branch; Go module consumers
 keep resolving the existing `v0.4.x`/`v0.5.x` tags). Agent-IDE polyglot lib: surgical edits +
+whole-file replace + insertion primitives, cut / copy / paste over a file clipboard,
 file-lifecycle ops (create / delete / move / batch), structured read (read / show / diagnose)
 with `--format text|json|toon`, and a public, machine-branchable error taxonomy.
 
@@ -74,10 +75,13 @@ Errors carry a machine-branchable kind so a wrapper never parses English:
 ## CLI
 
 ```sh
-bage apply    --file path --lines 3-5 --text "new text" [--lang go] [--region-hash HASH] [--format text|json|toon]
+bage apply    --file path (--lines A-B | --all | --append | --before-line N | --after-line N) --text "…" [--text-file F] [--lang go] [--region-hash HASH] [--format text|json|toon]
 bage create   --file path --text "..." [--lang go] [--format text|json|toon]       # new file (rejects if exists)
 bage delete   --file path [--raw-hash HASH] [--format text|json|toon]              # delete, gated on raw_hash
 bage move     --from path --to path2 [--raw-hash HASH] [--format text|json|toon]   # relocate (drift + no-clobber)
+bage copy     --file path (--symbol N | --line L | --lines A-B | --start S --end E) [--region-hash H] [--clip] [--format …]  # read-only extract
+bage cut      --file path (--symbol N | --line L | --lines A-B | --start S --end E) [--region-hash H] [--clip] [--format …]  # remove region (WAL-backed)
+bage paste    --file path (--at-byte B | --append | --before-line N | --after-line N) (--text "…" | --text-file F | --clip) [--format …]
 bage read     --file path [--symbol NAME | --line L | --lines A-B | --start S --end E] [--content] [--format text|json|toon]
 bage show     --file path [--format text|json|toon]             # read view: blocks + region_hash map
 bage diagnose --file path [--lsp CMD] [--format text|json|toon] # parse-health (+ optional LSP diagnostics)
@@ -90,13 +94,23 @@ tabular, fewest tokens). On failure it encodes a `{kind, path, message}` error e
 (`kind` ∈ `conflict | drift | exists | not-found | usage | io`), so a wrapper branches on
 `kind` instead of parsing text.
 
+`cut` and `copy` extract a region (by `--symbol`, `--line`/`--lines`, or `--start`/`--end`);
+`cut` also removes it (WAL-backed, `region_hash`-gated). `--clip` stashes the bytes in a
+single-slot **file clipboard** (`$BAGE_CLIPBOARD`, default `~/.bage/clipboard.json`) so a later
+`bage paste --clip` drops them into another file — a cross-file, cross-process move. `paste`
+inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, sourced from
+`--text`, `--text-file`, or `--clip`.
+
 ## Languages
 
 - **Grammars (20, parse + round-trip):** Go, TypeScript, TSX, JavaScript, Python, Rust, Java,
   C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
-- **LSP rename:** UTF-16-aware client driving any stdio language server (gopls-verified
-  end-to-end; the Go-era container matrix is a follow-up on this branch).
+- **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
+  rust-analyzer do full cross-file rename natively; clangd is carried across translation
+  units by a generated `compile_commands.json`, and pyright across files by workspace
+  priming (opening same-language siblings before the rename). Cross-file rename is
+  container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
 
 ## Build gates
 

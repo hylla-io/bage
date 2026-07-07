@@ -24,6 +24,8 @@ pub enum InspectError {
     },
     #[error("{0}")]
     Usage(String),
+    #[error(transparent)]
+    Resolve(#[from] crate::region::ResolveError),
 }
 
 /// A freshly parsed file handle: the path, the selected language, and the
@@ -86,41 +88,45 @@ pub struct Symbol {
 }
 
 /// Returns a documentSymbol-like listing of a parsed tree: every named
-/// declaration node, in source order, with its byte and line ranges. It is
-/// grammar-agnostic — it selects declaration nodes by named-node kind, so it
-/// works for any tree-sitter grammar. For the grammar-free text fallback it
-/// returns one symbol per source line instead.
+/// declaration node, in source order, with its byte and line ranges. Code
+/// grammars select declaration nodes by named-node kind, so any tree-sitter
+/// grammar works; the data-format grammars (JSON, YAML, TOML, XML, CSS,
+/// HTML) instead list their named-block kinds — pairs, tables, elements,
+/// rule sets — via [`data_decl_kinds`]. For the grammar-free text fallback
+/// it returns one symbol per source line.
 ///
 /// The text fallback is identified by the absence of a native engine tree
 /// ([`Tree::has_native`]), NOT by root kind: some real grammars (e.g. HTML)
 /// also use a "document" root, so the engine-free handle is the unambiguous
 /// discriminator.
-pub fn outline(tree: &Tree) -> Vec<Symbol> {
+pub fn outline(tree: &Tree, lang: Lang) -> Vec<Symbol> {
     if !tree.has_native() {
         return outline_lines(&tree.source);
     }
     let mut out = Vec::new();
-    walk_decls(&tree.root, &tree.source, &mut out);
+    walk_decls(&tree.root, &tree.source, lang, 0, &mut out);
     out
 }
 
-/// Recursively appends a symbol for every named declaration-kind node under
-/// `n`, in source order. It always recurses (even into a matched
-/// declaration) so methods nested in a class/impl/struct body are captured.
-/// The root itself is never a declaration kind, so it is never emitted.
-fn walk_decls(n: &Node, src: &[u8], out: &mut Vec<Symbol>) {
+/// Recursively appends a symbol for every named outline-worthy node under
+/// `n`, in source order. It always recurses (even into a matched node) so
+/// methods nested in a class/impl/struct body — and nested data blocks like
+/// JSON pairs inside objects — are captured. `depth` is 0 for direct
+/// children of the root; TOML uses it to limit bare pairs to the top level.
+/// The root itself is never emitted.
+fn walk_decls(n: &Node, src: &[u8], lang: Lang, depth: usize, out: &mut Vec<Symbol>) {
     for c in &n.children {
-        if c.named && is_decl_kind(&c.kind) {
+        if c.named && is_outline_kind(lang, &c.kind, depth) {
             out.push(Symbol {
                 kind: c.kind.clone(),
-                name: decl_name(c, src),
+                name: symbol_name(lang, c, src),
                 start_byte: c.start_byte,
                 end_byte: c.end_byte,
                 start_line: c.start_point.row + 1,
                 end_line: c.end_point.row + 1,
             });
         }
-        walk_decls(c, src, out);
+        walk_decls(c, src, lang, depth + 1, out);
     }
 }
 
@@ -204,6 +210,104 @@ fn direct_name(n: &Node, src: &[u8]) -> String {
     String::new()
 }
 
+/// The named-block kinds that form the outline for a data-format grammar,
+/// or `None` for code grammars (which use [`is_decl_kind`]). TOML's
+/// top-level bare pairs are handled separately in [`is_outline_kind`]
+/// because they are outline-worthy only at document depth.
+fn data_decl_kinds(lang: Lang) -> Option<&'static [&'static str]> {
+    Some(match lang {
+        Lang::Json => &["pair"],
+        Lang::Yaml => &["block_mapping_pair"],
+        Lang::Toml => &["table"],
+        Lang::Xml | Lang::Html => &["element"],
+        Lang::Css => &["rule_set"],
+        _ => return None,
+    })
+}
+
+/// Whether a named node of `kind` at `depth` (0 = direct child of the root)
+/// belongs in `lang`'s outline. Data-format grammars use their fixed
+/// per-language kind set; every other grammar keeps the exact
+/// substring-based [`is_decl_kind`] behavior.
+fn is_outline_kind(lang: Lang, kind: &str, depth: usize) -> bool {
+    match data_decl_kinds(lang) {
+        Some(kinds) => {
+            kinds.contains(&kind) || (lang == Lang::Toml && kind == "pair" && depth == 0)
+        }
+        None => is_decl_kind(kind),
+    }
+}
+
+/// The display name for an outline node: language-specific key/tag/selector
+/// extraction for the data-format grammars, the identifier-child search of
+/// [`decl_name`] for everything else.
+fn symbol_name(lang: Lang, n: &Node, src: &[u8]) -> String {
+    match lang {
+        Lang::Json => json_key_name(n, src),
+        Lang::Yaml | Lang::Toml => first_named_child_text(n, src),
+        Lang::Xml => tag_name(n, src, "Name"),
+        Lang::Html => tag_name(n, src, "tag_name"),
+        Lang::Css => child_kind_text(n, src, "selectors").trim().to_string(),
+        _ => decl_name(n, src),
+    }
+}
+
+/// The raw source text of `n`, bounds-guarded; empty when the node's byte
+/// range does not fit `src`.
+fn node_text(n: &Node, src: &[u8]) -> String {
+    if n.end_byte < n.start_byte || n.end_byte > src.len() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&src[n.start_byte..n.end_byte]).into_owned()
+}
+
+/// The text of `n`'s first named child — a YAML pair's key flow_node or a
+/// TOML table's bare/dotted key — or empty when none exists.
+fn first_named_child_text(n: &Node, src: &[u8]) -> String {
+    n.children
+        .iter()
+        .find(|c| c.named)
+        .map(|c| node_text(c, src))
+        .unwrap_or_default()
+}
+
+/// The text of `n`'s first direct child of exactly `kind`, or empty.
+fn child_kind_text(n: &Node, src: &[u8], kind: &str) -> String {
+    n.children
+        .iter()
+        .find(|c| c.kind == kind)
+        .map(|c| node_text(c, src))
+        .unwrap_or_default()
+}
+
+/// A JSON pair's key with the surrounding quotes stripped: the key is the
+/// pair's first named child (a "string") and its "string_content" child is
+/// the unquoted text. Falls back to trimming quotes off the whole key when
+/// the content node is absent (the empty key `""`).
+fn json_key_name(n: &Node, src: &[u8]) -> String {
+    let Some(key) = n.children.iter().find(|c| c.named) else {
+        return String::new();
+    };
+    let content = child_kind_text(key, src, "string_content");
+    if !content.is_empty() {
+        return content;
+    }
+    node_text(key, src).trim_matches('"').to_string()
+}
+
+/// An XML/HTML element's tag name: the first direct child (start tag,
+/// self-closing tag, or empty-element tag) carrying a `name_kind` child
+/// supplies it. Empty when no tag name is found.
+fn tag_name(n: &Node, src: &[u8], name_kind: &str) -> String {
+    for c in &n.children {
+        let name = child_kind_text(c, src, name_kind);
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    String::new()
+}
+
 /// One "line" symbol per source line for the grammar-free text fallback.
 /// Each symbol's byte range excludes the trailing newline. A trailing
 /// newline does not produce a phantom empty final line; genuine
@@ -279,7 +383,7 @@ pub struct Block {
 /// callers can list structure cheaply.
 pub fn read_blocks(opened: &OpenedFile, include_content: bool) -> Vec<Block> {
     let src = &opened.tree.source;
-    outline(&opened.tree)
+    outline(&opened.tree, opened.lang)
         .into_iter()
         .map(|sym| {
             let content =
@@ -487,6 +591,148 @@ pub fn resolve_range(
     Err("resolve: one of line, lines, or start/end is required".to_string())
 }
 
+/// One first-class insertion point over a source buffer, resolved to a
+/// zero-width byte position by [`resolve_insertion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertionPoint {
+    /// Insert at end-of-file (`src.len()`).
+    Append,
+    /// Insert at the start byte of the 1-based line.
+    BeforeLine(i64),
+    /// Insert at the start byte of the line AFTER the 1-based line — i.e.
+    /// just past the line's trailing newline. A line at or past EOF clamps
+    /// to end-of-buffer, matching [`LineIndex::byte_for_line`].
+    AfterLine(i64),
+}
+
+/// Resolves an [`InsertionPoint`] against `src` to a zero-width region
+/// (`start_byte == end_byte`) with an EMPTY region_hash — there is no
+/// content to anchor at a point, so the per-file anchor gates drift.
+/// Shared by `bage apply --append/--before-line/--after-line` and (later)
+/// paste. Line numbers must be >= 1; a line past EOF clamps to
+/// end-of-buffer via [`LineIndex::byte_for_line`] rather than erroring.
+pub fn resolve_insertion(src: &[u8], point: InsertionPoint) -> Result<Region, String> {
+    let li = LineIndex::new(src);
+    let pos = match point {
+        InsertionPoint::Append => src.len(),
+        InsertionPoint::BeforeLine(l) => {
+            if l < 1 {
+                return Err("resolve: before-line must be >= 1".to_string());
+            }
+            li.byte_for_line(l)
+        }
+        InsertionPoint::AfterLine(l) => {
+            if l < 1 {
+                return Err("resolve: after-line must be >= 1".to_string());
+            }
+            li.byte_for_line(l + 1)
+        }
+    };
+    Ok(li.fill_line_cols(Region {
+        start_byte: pos as i64,
+        end_byte: pos as i64,
+        ..Default::default()
+    }))
+}
+
+/// The addressing flags shared by `bage copy` and `bage cut`: symbol
+/// addressing, line/byte-range addressing (as in read), or bare
+/// `region_hash` addressing (the region is located purely by content).
+/// A `region_hash` combined with a range/symbol verifies-and-relocates via
+/// [`region::resolve`] instead of trusting the offsets blindly.
+#[derive(Debug, Clone, Default)]
+pub struct CopyTarget {
+    /// 1-based single line (-1 = unset).
+    pub line: i64,
+    /// 1-based inclusive "L1-L2" range ("" = unset).
+    pub lines: String,
+    /// Inclusive start byte (-1 = unset).
+    pub start: i64,
+    /// Exclusive end byte (-1 = unset).
+    pub end: i64,
+    /// Block name to address ("" = unset).
+    pub symbol: String,
+    /// Content anchor ("" = unset). Alone, it addresses the region purely
+    /// by content; with a range/symbol it verifies the resolved bytes.
+    pub region_hash: String,
+}
+
+/// Resolves a [`CopyTarget`] against an opened file to the half-open byte
+/// range to copy or cut. Exactly one addressing mode is required: symbol,
+/// line/lines, start/end, or a bare region_hash. Symbol addressing errors
+/// when zero or more than one block carries the name (never guesses). When
+/// a region_hash is present the range is verified (and benignly relocated)
+/// through [`region::resolve`], so a stale offset can never copy the wrong
+/// bytes; a content mismatch is a conflict, not a silent misread.
+pub fn resolve_copy_range(
+    p: &dyn ParserPort,
+    opened: &OpenedFile,
+    t: &CopyTarget,
+) -> Result<(usize, usize), InspectError> {
+    let src = &opened.tree.source;
+    let range_mode = t.line >= 0 || !t.lines.is_empty() || t.start >= 0 || t.end >= 0;
+    let symbol_mode = !t.symbol.is_empty();
+    let hash_mode = !t.region_hash.is_empty();
+
+    if symbol_mode && range_mode {
+        return Err(InspectError::Usage(
+            "copy: --symbol is mutually exclusive with line/byte addressing".to_string(),
+        ));
+    }
+    if !symbol_mode && !range_mode && !hash_mode {
+        return Err(InspectError::Usage(
+            "copy: one of --symbol, --line/--lines, --start/--end, or --region-hash is required"
+                .to_string(),
+        ));
+    }
+
+    let range: Option<(usize, usize)> = if symbol_mode {
+        let matches: Vec<Block> = read_blocks(opened, false)
+            .into_iter()
+            .filter(|b| b.name == t.symbol)
+            .collect();
+        match matches.len() {
+            0 => {
+                return Err(InspectError::Usage(format!(
+                    "copy: no block named {:?} in {:?}",
+                    t.symbol, opened.path
+                )));
+            }
+            1 => Some((matches[0].start_byte, matches[0].end_byte)),
+            n => {
+                return Err(InspectError::Usage(format!(
+                    "copy: {n} blocks named {:?} in {:?}; address by --region-hash or line/byte range",
+                    t.symbol, opened.path
+                )));
+            }
+        }
+    } else if range_mode {
+        let r =
+            resolve_range(src, t.line, &t.lines, t.start, t.end).map_err(InspectError::Usage)?;
+        Some((r.start_byte as usize, r.end_byte as usize))
+    } else {
+        None // bare region_hash: located purely by content below
+    };
+
+    if hash_mode {
+        let (sb, eb) = match range {
+            Some((s, e)) => (s as i64, e as i64),
+            None => (LINE_SENTINEL, LINE_SENTINEL),
+        };
+        let reg = Region {
+            path: opened.path.clone(),
+            start_byte: sb,
+            end_byte: eb,
+            region_hash: t.region_hash.clone(),
+            ..Default::default()
+        };
+        let (s, e, _status) = region::resolve(p, opened.lang, src, &reg)?;
+        return Ok((s, e));
+    }
+
+    Ok(range.expect("range or hash mode guaranteed by the mode checks above"))
+}
+
 /// Resolves the single-line / line-range inputs to a 1-based inclusive
 /// `[start_line, end_line]`. `line` and `lines` are mutually exclusive;
 /// `lines` must be "L1-L2" with L1 <= L2 and both >= 1.
@@ -598,7 +844,7 @@ mod tests {
             b"package main\n\ntype T struct{ X int }\n\nfunc (t T) M() {}\n\nfunc F() {}\n",
         );
         let opened = open_file(&p).unwrap();
-        let syms = outline(&opened.tree);
+        let syms = outline(&opened.tree, opened.lang);
         let names: Vec<(&str, &str)> = syms
             .iter()
             .map(|s| (s.kind.as_str(), s.name.as_str()))
@@ -613,7 +859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_temp(&dir, "notes.txt", b"alpha\n\nbeta");
         let opened = open_file(&p).unwrap();
-        let syms = outline(&opened.tree);
+        let syms = outline(&opened.tree, opened.lang);
         assert_eq!(syms.len(), 3);
         assert!(syms.iter().all(|s| s.kind == "line"));
         // Byte ranges exclude the trailing newline.
@@ -708,6 +954,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_insertion_returns_zero_width_positions() {
+        let src = b"one\ntwo\nthree\n";
+        let r = resolve_insertion(src, InsertionPoint::Append).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (14, 14));
+        assert!(r.region_hash.is_empty(), "insertion carries no region_hash");
+        let r = resolve_insertion(src, InsertionPoint::BeforeLine(1)).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (0, 0));
+        let r = resolve_insertion(src, InsertionPoint::BeforeLine(2)).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (4, 4));
+        // After the last line lands at end-of-buffer.
+        let r = resolve_insertion(src, InsertionPoint::AfterLine(3)).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (14, 14));
+        // A line past EOF clamps to end-of-buffer, like byte_for_line.
+        let r = resolve_insertion(src, InsertionPoint::AfterLine(99)).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (14, 14));
+        // Empty buffer: every point resolves to 0.
+        let r = resolve_insertion(b"", InsertionPoint::Append).unwrap();
+        assert_eq!((r.start_byte, r.end_byte), (0, 0));
+        // Line numbers must be >= 1.
+        assert!(resolve_insertion(src, InsertionPoint::BeforeLine(0)).is_err());
+        assert!(resolve_insertion(src, InsertionPoint::AfterLine(0)).is_err());
+    }
+
+    #[test]
     fn parse_health_reports_defects_and_text_is_always_clean() {
         let dir = tempfile::tempdir().unwrap();
         let broken = write_temp(&dir, "b.go", b"package main\n\nfunc F( {\n");
@@ -724,5 +994,95 @@ mod tests {
         let txt = write_temp(&dir, "b.txt", b"anything {{{ at all");
         let opened = open_file(&txt).unwrap();
         assert!(parse_health(&opened).is_empty());
+    }
+    /// The outline of `path` flattened to "kind:name" strings, for compact
+    /// per-grammar assertions.
+    fn kinds_names(path: &str) -> Vec<String> {
+        let opened = open_file(path).unwrap();
+        outline(&opened.tree, opened.lang)
+            .into_iter()
+            .map(|s| format!("{}:{}", s.kind, s.name))
+            .collect()
+    }
+
+    #[test]
+    fn outline_json_pairs_with_key_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(
+            &dir,
+            "a.json",
+            b"{\"name\": \"x\", \"nested\": {\"k\": 1}}\n",
+        );
+        // Quoted keys are stripped; nested pairs are included.
+        assert_eq!(kinds_names(&p), ["pair:name", "pair:nested", "pair:k"]);
+        let opened = open_file(&p).unwrap();
+        let syms = outline(&opened.tree, opened.lang);
+        assert_eq!((syms[0].start_line, syms[0].end_line), (1, 1));
+        assert_eq!((syms[0].start_byte, syms[0].end_byte), (1, 12));
+    }
+
+    #[test]
+    fn outline_yaml_mapping_pairs_with_key_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, "a.yaml", b"top: 1\nmap:\n  inner: 2\n");
+        assert_eq!(
+            kinds_names(&p),
+            [
+                "block_mapping_pair:top",
+                "block_mapping_pair:map",
+                "block_mapping_pair:inner",
+            ]
+        );
+        let opened = open_file(&p).unwrap();
+        let syms = outline(&opened.tree, opened.lang);
+        assert_eq!(syms[1].start_line, 2);
+        assert_eq!(syms[2].start_line, 3);
+    }
+
+    #[test]
+    fn outline_toml_tables_and_top_level_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, "a.toml", b"top = 1\n[server.http]\nport = 8080\n");
+        // Dotted table keys keep their full path; pairs inside a table are
+        // part of the table block, so only top-level pairs are listed.
+        assert_eq!(kinds_names(&p), ["pair:top", "table:server.http"]);
+    }
+
+    #[test]
+    fn outline_xml_elements_with_tag_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, "a.xml", b"<root attr=\"v\"><child>t</child></root>\n");
+        assert_eq!(kinds_names(&p), ["element:root", "element:child"]);
+    }
+
+    #[test]
+    fn outline_css_rule_sets_with_selector_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, "a.css", b".btn , a:hover { color: red; }\n");
+        // Exactly the rule sets: property declarations and selector innards
+        // no longer leak through the code-grammar substring matcher.
+        assert_eq!(kinds_names(&p), ["rule_set:.btn , a:hover"]);
+    }
+
+    #[test]
+    fn outline_html_elements_with_tag_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, "a.html", b"<div id=\"x\"><span>hi</span></div>\n");
+        assert_eq!(kinds_names(&p), ["element:div", "element:span"]);
+    }
+
+    #[test]
+    fn outline_rust_declarations_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(
+            &dir,
+            "m.rs",
+            b"struct S;\n\nimpl S {\n    fn m(&self) {}\n}\n\nfn f() {}\n",
+        );
+        let got = kinds_names(&p);
+        assert!(got.contains(&"struct_item:S".to_string()), "{got:?}");
+        assert!(got.contains(&"impl_item:S".to_string()), "{got:?}");
+        assert!(got.contains(&"function_item:m".to_string()), "{got:?}");
+        assert!(got.contains(&"function_item:f".to_string()), "{got:?}");
     }
 }

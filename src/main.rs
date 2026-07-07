@@ -46,6 +46,15 @@ enum Cmd {
     Show(ShowArgs),
     /// Surface parse-health defects and (optionally) LSP diagnostics.
     Diagnose(DiagnoseArgs),
+    /// Extract a region READ-ONLY (content + locator bundle); text output
+    /// is the bare content, so it pipes cleanly.
+    Copy(CopyArgs),
+    /// Atomically REMOVE a region (hash-gated, WAL-backed) and emit what
+    /// was removed.
+    Cut(CutArgs),
+    /// Insert text at a byte offset, line point, or end-of-file — from
+    /// --text, --text-file, or the clipboard (--clip).
+    Paste(PasteArgs),
 }
 
 #[derive(Args)]
@@ -65,6 +74,32 @@ struct ApplyArgs {
     /// Exclusive end byte of the region to replace.
     #[arg(long, default_value_t = -1)]
     end: i64,
+    /// Replace the ENTIRE file [0, len). Mutually exclusive with
+    /// --line/--lines/--start/--end; carries no region_hash (the per-file
+    /// anchor still gates drift) and never strips a trailing newline.
+    #[arg(long, default_value_t = false)]
+    all: bool,
+    /// Insert --text at end-of-file. If the file does not end with a
+    /// newline, one is prepended to the inserted text so the append starts
+    /// on a fresh line. Mutually exclusive with the other addressing modes;
+    /// carries no region_hash (the per-file anchor gates drift) and never
+    /// strips a trailing newline from --text.
+    #[arg(long, default_value_t = false)]
+    append: bool,
+    /// Insert --text at the start of this 1-based line. The inserted text
+    /// gets a trailing newline appended if missing (never stripped), so
+    /// existing line structure is preserved. Mutually exclusive with the
+    /// other addressing modes; carries no region_hash (the per-file anchor
+    /// gates drift).
+    #[arg(long, default_value_t = -1)]
+    before_line: i64,
+    /// Insert --text just after this 1-based line's newline; a line at or
+    /// past EOF clamps to end-of-file. The inserted text gets a trailing
+    /// newline appended if missing (never stripped), so existing line
+    /// structure is preserved. Mutually exclusive with the other addressing
+    /// modes; carries no region_hash (the per-file anchor gates drift).
+    #[arg(long, default_value_t = -1)]
+    after_line: i64,
     /// Replacement text for the region.
     #[arg(long, default_value = "")]
     text: String,
@@ -74,6 +109,13 @@ struct ApplyArgs {
     /// Optional region_hash anchoring the region by content.
     #[arg(long, default_value = "")]
     region_hash: String,
+    /// Expected raw content hash of the LIVE FILE (file-level drift gate,
+    /// like delete/move): when set, a mismatch rejects before anything is
+    /// staged, so an edit grounded on stale bytes can never land on a file
+    /// that changed underneath it. Empty = no file-level gate (the
+    /// region_hash, when given, still gates the region).
+    #[arg(long, default_value = "")]
+    raw_hash: String,
     /// Source language by canonical name; empty = auto-detect from --file.
     #[arg(long, default_value = "")]
     lang: String,
@@ -234,6 +276,9 @@ fn main() -> ExitCode {
         Cmd::Read(a) => run_read(a, &mut stdout, &mut stderr),
         Cmd::Show(a) => run_show(a, &mut stdout, &mut stderr),
         Cmd::Diagnose(a) => run_diagnose(a, &mut stdout, &mut stderr),
+        Cmd::Copy(a) => run_copy(a, &mut stdout, &mut stderr),
+        Cmd::Cut(a) => run_cut(a, &mut stdout, &mut stderr),
+        Cmd::Paste(a) => run_paste(a, &mut stdout, &mut stderr),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -342,16 +387,22 @@ fn run_apply(a: ApplyArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Re
             return Err(());
         }
     };
+    if !a.raw_hash.is_empty() {
+        let live_hash = hashing::raw_hash(&XxHasher, &live);
+        if live_hash != a.raw_hash {
+            let env = ErrorEnvelope {
+                kind: bage::session::Kind::Drift,
+                path: Some(a.file.clone()),
+                message: format!(
+                    "bage apply: live file raw_hash {live_hash} does not match expected {} (file changed underneath the edit)",
+                    a.raw_hash
+                ),
+            };
+            return emit_envelope(stderr, fmt, &env);
+        }
+    }
 
-    let reg = match apply_region(
-        &a.file,
-        &live,
-        a.line,
-        &a.lines,
-        a.start,
-        a.end,
-        &a.region_hash,
-    ) {
+    let reg = match apply_region(&a, &live) {
         Ok(r) => r,
         Err(msg) => {
             let _ = writeln!(stderr, "{msg}");
@@ -382,6 +433,16 @@ fn run_apply(a: ApplyArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Re
             new_text = stripped.to_string();
         }
     }
+    if a.append && !live.is_empty() && live.last() != Some(&b'\n') {
+        // The append must start on a fresh line: when the file does not end
+        // with a newline, prepend one to the inserted text.
+        new_text.insert(0, '\n');
+    }
+    if (a.before_line >= 0 || a.after_line >= 0) && !new_text.ends_with('\n') {
+        // Line insertion preserves line structure: ensure the inserted text
+        // ends with a newline so the line it lands before stays intact.
+        new_text.push('\n');
+    }
 
     let sess = cli_session(lang, &a.fmt, &a.lint);
     let edits = [bage::region::Edit {
@@ -403,25 +464,61 @@ fn run_apply(a: ApplyArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Re
 }
 
 /// Builds the region-anchored target from the apply flags. Exactly one
-/// addressing mode must be supplied: a single line (--line), a 1-based
-/// inclusive line range (--lines), or a raw byte range (--start/--end). Line
+/// addressing mode must be supplied: the whole file (--all), a single line
+/// (--line), a 1-based inclusive line range (--lines), a raw byte range
+/// (--start/--end), or an insertion point (--append / --before-line /
+/// --after-line). --all spans [0, len); the insertion modes resolve to a
+/// zero-width region via the shared [`inspect::resolve_insertion`]. Neither
+/// carries a region_hash — the per-file anchor still gates drift. Line
 /// addressing resolves to bytes via the shared [`inspect::resolve_range`]
 /// (which excludes the structural trailing newline); the optional
 /// region_hash is attached unchanged so the resolver can verify content and
 /// relocate a benign shift.
-fn apply_region(
-    file: &str,
-    live: &[u8],
-    line: i64,
-    lines: &str,
-    start: i64,
-    end: i64,
-    region_hash: &str,
-) -> Result<Region, String> {
-    let mut reg = inspect::resolve_range(live, line, lines, start, end)
+fn apply_region(a: &ApplyArgs, live: &[u8]) -> Result<Region, String> {
+    let range_mode = a.line >= 0 || !a.lines.is_empty() || a.start >= 0 || a.end >= 0;
+    let insert_flags =
+        usize::from(a.append) + usize::from(a.before_line >= 0) + usize::from(a.after_line >= 0);
+    if insert_flags > 1 {
+        return Err(
+            "bage apply: choose one of --append, --before-line, or --after-line".to_string(),
+        );
+    }
+    if insert_flags == 1 {
+        if a.all || range_mode {
+            return Err(
+                "bage apply: --append/--before-line/--after-line are mutually \
+                 exclusive with --all/--line/--lines/--start/--end"
+                    .to_string(),
+            );
+        }
+        let point = if a.append {
+            inspect::InsertionPoint::Append
+        } else if a.before_line >= 0 {
+            inspect::InsertionPoint::BeforeLine(a.before_line)
+        } else {
+            inspect::InsertionPoint::AfterLine(a.after_line)
+        };
+        let mut reg = inspect::resolve_insertion(live, point)
+            .map_err(|m| m.replacen("resolve:", "bage apply:", 1))?;
+        reg.path = a.file.clone();
+        return Ok(reg);
+    }
+    if a.all {
+        if range_mode {
+            return Err(
+                "bage apply: --all is mutually exclusive with --line/--lines/--start/--end"
+                    .to_string(),
+            );
+        }
+        let mut reg = inspect::resolve_range(live, -1, "", 0, live.len() as i64)
+            .map_err(|m| m.replacen("resolve:", "bage apply:", 1))?;
+        reg.path = a.file.clone();
+        return Ok(reg);
+    }
+    let mut reg = inspect::resolve_range(live, a.line, &a.lines, a.start, a.end)
         .map_err(|m| m.replacen("resolve:", "bage apply:", 1))?;
-    reg.path = file.to_string();
-    reg.region_hash = region_hash.to_string();
+    reg.path = a.file.clone();
+    reg.region_hash = a.region_hash.clone();
     Ok(reg)
 }
 
@@ -662,6 +759,9 @@ impl TextRender for ReadView {
         )?;
         for b in &r.blocks {
             render_block_line(w, b)?;
+            for line in b.content.lines() {
+                writeln!(w, "    |{line}")?;
+            }
         }
         Ok(())
     }
@@ -895,6 +995,251 @@ fn collect_lsp_diagnostics(file: &str, lsp_cmd: &str) -> Result<Vec<lsp::Diagnos
     outcome
 }
 
+#[derive(Args)]
+struct CopyArgs {
+    /// Path of the file to copy from.
+    #[arg(long)]
+    file: String,
+    /// 1-based single line to copy.
+    #[arg(long, default_value_t = -1)]
+    line: i64,
+    /// 1-based inclusive line range L1-L2 to copy.
+    #[arg(long, default_value = "")]
+    lines: String,
+    /// Inclusive start byte of the region to copy.
+    #[arg(long, default_value_t = -1)]
+    start: i64,
+    /// Exclusive end byte of the region to copy.
+    #[arg(long, default_value_t = -1)]
+    end: i64,
+    /// Copy the block whose symbol name equals this (errors when zero or
+    /// several blocks match — never guesses).
+    #[arg(long, default_value = "")]
+    symbol: String,
+    /// Content anchor: alone it locates the region purely by content; with
+    /// a range/symbol it verifies (and benignly relocates) the target.
+    #[arg(long, default_value = "")]
+    region_hash: String,
+    /// Also write the content to the file clipboard
+    /// ($BAGE_CLIPBOARD, default ~/.bage/clipboard.json).
+    #[arg(long, default_value_t = false)]
+    clip: bool,
+    /// Output format: text|json|toon. Text is the BARE content (pipeable).
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Args)]
+struct CutArgs {
+    /// Path of the file to cut from.
+    #[arg(long)]
+    file: String,
+    /// 1-based single line to cut.
+    #[arg(long, default_value_t = -1)]
+    line: i64,
+    /// 1-based inclusive line range L1-L2 to cut.
+    #[arg(long, default_value = "")]
+    lines: String,
+    /// Inclusive start byte of the region to cut.
+    #[arg(long, default_value_t = -1)]
+    start: i64,
+    /// Exclusive end byte of the region to cut.
+    #[arg(long, default_value_t = -1)]
+    end: i64,
+    /// Cut the block whose symbol name equals this (errors when zero or
+    /// several blocks match — never guesses).
+    #[arg(long, default_value = "")]
+    symbol: String,
+    /// Content anchor: alone it locates the region purely by content; with
+    /// a range/symbol it verifies (and benignly relocates) the target. A
+    /// mismatch rejects the cut — nothing is removed.
+    #[arg(long, default_value = "")]
+    region_hash: String,
+    /// Also write the removed content to the file clipboard BEFORE the
+    /// removal commits ($BAGE_CLIPBOARD, default ~/.bage/clipboard.json).
+    #[arg(long, default_value_t = false)]
+    clip: bool,
+    /// Output format: text|json|toon.
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Args)]
+struct PasteArgs {
+    /// Path of the file to paste into.
+    #[arg(long)]
+    file: String,
+    /// Insert at this exact byte offset, verbatim (no newline
+    /// normalization).
+    #[arg(long, default_value_t = -1)]
+    at_byte: i64,
+    /// Insert at end-of-file (fresh-line rule: a newline is prepended when
+    /// the file does not end with one).
+    #[arg(long, default_value_t = false)]
+    append: bool,
+    /// Insert at the start of this 1-based line (a trailing newline is
+    /// appended to the text if missing).
+    #[arg(long, default_value_t = -1)]
+    before_line: i64,
+    /// Insert just after this 1-based line's newline (a trailing newline is
+    /// appended to the text if missing); past-EOF clamps to end-of-file.
+    #[arg(long, default_value_t = -1)]
+    after_line: i64,
+    /// The text to paste.
+    #[arg(long, default_value = "")]
+    text: String,
+    /// Read the text to paste from this file.
+    #[arg(long, default_value = "")]
+    text_file: String,
+    /// Paste from the file clipboard (written by cut/copy --clip).
+    #[arg(long, default_value_t = false)]
+    clip: bool,
+    /// Source language by canonical name; empty = auto-detect from --file.
+    #[arg(long, default_value = "")]
+    lang: String,
+    /// Output format: text|json|toon.
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+/// Shared copy/cut flag → target mapping.
+fn copy_target(
+    line: i64,
+    lines: &str,
+    start: i64,
+    end: i64,
+    symbol: &str,
+    region_hash: &str,
+) -> inspect::CopyTarget {
+    inspect::CopyTarget {
+        line,
+        lines: lines.to_string(),
+        start,
+        end,
+        symbol: symbol.to_string(),
+        region_hash: region_hash.to_string(),
+    }
+}
+
+/// Opens a throwaway editor for the clipboard verbs (WAL in the OS temp
+/// dir, per-file auto language).
+fn cli_editor(lang: Option<Lang>, stderr: &mut dyn Write) -> Result<Editor, ()> {
+    Editor::open(Config {
+        lang,
+        wal_dir: std::env::temp_dir(),
+        ..Default::default()
+    })
+    .map_err(|e| {
+        let _ = writeln!(stderr, "bage: {e}");
+    })
+}
+
+fn run_copy(a: CopyArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<(), ()> {
+    let fmt = parse_format(&a.format, stderr)?;
+    if a.file.is_empty() {
+        let _ = writeln!(stderr, "bage copy: --file is required");
+        return Err(());
+    }
+    let ed = cli_editor(None, stderr)?;
+    let target = copy_target(a.line, &a.lines, a.start, a.end, &a.symbol, &a.region_hash);
+    match ed.copy(&a.file, &target, a.clip) {
+        Ok(res) => {
+            let _ = emit(stdout, fmt, &res);
+            Ok(())
+        }
+        Err(e) => emit_envelope(stderr, fmt, &editor::envelope(&e)),
+    }
+}
+
+fn run_cut(a: CutArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<(), ()> {
+    let fmt = parse_format(&a.format, stderr)?;
+    if a.file.is_empty() {
+        let _ = writeln!(stderr, "bage cut: --file is required");
+        return Err(());
+    }
+    let ed = cli_editor(None, stderr)?;
+    let target = copy_target(a.line, &a.lines, a.start, a.end, &a.symbol, &a.region_hash);
+    match ed.cut(&a.file, &target, a.clip) {
+        Ok(res) => {
+            let _ = emit(stdout, fmt, &res);
+            Ok(())
+        }
+        Err(e) => emit_envelope(stderr, fmt, &editor::envelope(&e)),
+    }
+}
+
+fn run_paste(a: PasteArgs, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<(), ()> {
+    let fmt = parse_format(&a.format, stderr)?;
+    let lang = parse_lang(&a.lang, stderr)?;
+    if a.file.is_empty() {
+        let _ = writeln!(stderr, "bage paste: --file is required");
+        return Err(());
+    }
+
+    let point_flags = usize::from(a.at_byte >= 0)
+        + usize::from(a.append)
+        + usize::from(a.before_line >= 0)
+        + usize::from(a.after_line >= 0);
+    if point_flags != 1 {
+        let _ = writeln!(
+            stderr,
+            "bage paste: exactly one of --at-byte, --append, --before-line, or --after-line is required"
+        );
+        return Err(());
+    }
+    let point = if a.at_byte >= 0 {
+        editor::PastePoint::AtByte(a.at_byte as usize)
+    } else if a.append {
+        editor::PastePoint::Point(inspect::InsertionPoint::Append)
+    } else if a.before_line >= 0 {
+        editor::PastePoint::Point(inspect::InsertionPoint::BeforeLine(a.before_line))
+    } else {
+        editor::PastePoint::Point(inspect::InsertionPoint::AfterLine(a.after_line))
+    };
+
+    let source_flags = usize::from(!a.text.is_empty())
+        + usize::from(!a.text_file.is_empty())
+        + usize::from(a.clip);
+    if source_flags != 1 {
+        let _ = writeln!(
+            stderr,
+            "bage paste: exactly one of --text, --text-file, or --clip is required"
+        );
+        return Err(());
+    }
+    let text = if a.clip {
+        match bage::clipboard::read() {
+            Ok(clip) => clip.content,
+            Err(e) => {
+                let env = editor::envelope(&editor::EditorError::Clipboard(e));
+                return emit_envelope(stderr, fmt, &env);
+            }
+        }
+    } else if !a.text_file.is_empty() {
+        match std::fs::read_to_string(&a.text_file) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "bage paste: read --text-file {:?}: {e}",
+                    a.text_file
+                );
+                return Err(());
+            }
+        }
+    } else {
+        a.text.clone()
+    };
+
+    let ed = cli_editor(lang, stderr)?;
+    match ed.paste(&a.file, point, &text) {
+        Ok(results) => {
+            let _ = emit(stdout, fmt, &EditResults(results));
+            Ok(())
+        }
+        Err(e) => emit_envelope(stderr, fmt, &editor::envelope(&e)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,5 +1289,259 @@ mod tests {
             ..a
         };
         assert!(read_options(&bad).is_err());
+    }
+
+    /// Renders a [`ReadView`] over the given blocks for the text-format tests.
+    fn render_read(blocks: Vec<Block>) -> String {
+        let view = ReadView(ReadResult {
+            path: "f.md".into(),
+            lang: "markdown".into(),
+            raw_hash: "x".repeat(16),
+            norm_hash: "n".repeat(16),
+            blocks,
+        });
+        let mut buf = Vec::new();
+        view.render_text(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// A range block carrying `content`, for the --content rendering tests.
+    fn block(content: &str) -> Block {
+        Block {
+            kind: "range".into(),
+            name: String::new(),
+            start_line: 1,
+            end_line: 2,
+            start_byte: 0,
+            end_byte: content.len(),
+            region_hash: "r".repeat(16),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn read_view_text_without_content_prints_metadata_only() {
+        let s = render_read(vec![block("")]);
+        assert!(!s.contains('|'), "no content lines expected, got: {s}");
+        assert_eq!(s.lines().count(), 2, "header + block line only, got: {s}");
+    }
+
+    #[test]
+    fn read_view_text_prints_content_under_block_line() {
+        let s = render_read(vec![block("hello\n")]);
+        assert!(s.ends_with("    |hello\n"), "content line missing: {s}");
+    }
+
+    #[test]
+    fn read_view_text_prints_multiline_content() {
+        let s = render_read(vec![block("a\nb\nc\n")]);
+        assert!(s.contains("    |a\n    |b\n    |c\n"), "got: {s}");
+    }
+
+    #[test]
+    fn read_view_text_prints_content_with_no_trailing_newline() {
+        let s = render_read(vec![block("a\nb")]);
+        assert!(s.ends_with("    |a\n    |b\n"), "got: {s}");
+    }
+
+    /// [`ApplyArgs`] with defaults matching the CLI flag defaults.
+    fn apply_args(file: &str) -> ApplyArgs {
+        ApplyArgs {
+            file: file.into(),
+            raw_hash: String::new(),
+            line: -1,
+            lines: String::new(),
+            start: -1,
+            end: -1,
+            all: false,
+            append: false,
+            before_line: -1,
+            after_line: -1,
+            text: String::new(),
+            text_file: String::new(),
+            region_hash: String::new(),
+            lang: String::new(),
+            fmt: String::new(),
+            lint: String::new(),
+            format: "text".into(),
+        }
+    }
+
+    #[test]
+    fn apply_region_all_spans_whole_file_without_region_hash() {
+        let live = b"line1\nline2\n";
+        let mut a = apply_args("f.md");
+        a.all = true;
+        let reg = apply_region(&a, live).unwrap();
+        assert_eq!((reg.start_byte, reg.end_byte), (0, live.len() as i64));
+        assert!(
+            reg.region_hash.is_empty(),
+            "--all must carry no region_hash"
+        );
+    }
+
+    #[test]
+    fn apply_region_all_rejects_other_addressing_modes() {
+        let live = b"x\n";
+        let cases: [fn(&mut ApplyArgs); 4] = [
+            |a| a.line = 1,
+            |a| a.lines = "1-2".into(),
+            |a| a.start = 0,
+            |a| a.end = 1,
+        ];
+        for set in cases {
+            let mut a = apply_args("f.md");
+            a.all = true;
+            set(&mut a);
+            let err = apply_region(&a, live).unwrap_err();
+            assert!(err.contains("--all is mutually exclusive"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn apply_all_replaces_longer_file_with_shorter_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.md");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        let mut a = apply_args(path.to_str().unwrap());
+        a.all = true;
+        a.text = "short\n".into();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_apply(a, &mut out, &mut err).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "short\n");
+    }
+
+    #[test]
+    fn apply_all_replaces_shorter_file_with_longer_text_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.md");
+        std::fs::write(&path, "tiny\n").unwrap();
+        let mut a = apply_args(path.to_str().unwrap());
+        a.all = true;
+        // No trailing newline: --all must NOT strip or append one.
+        a.text = "a\nb\nc".into();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_apply(a, &mut out, &mut err).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc");
+    }
+
+    /// Runs `run_apply` over a temp file seeded with `initial`, returning
+    /// the file content after the edit.
+    fn apply_to_file(initial: &str, set: impl FnOnce(&mut ApplyArgs)) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.md");
+        std::fs::write(&path, initial).unwrap();
+        let mut a = apply_args(path.to_str().unwrap());
+        set(&mut a);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_apply(a, &mut out, &mut err).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn apply_append_to_file_with_trailing_newline() {
+        let got = apply_to_file("a\nb\n", |a| {
+            a.append = true;
+            a.text = "c\n".into();
+        });
+        assert_eq!(got, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn apply_append_prepends_newline_when_file_lacks_one() {
+        let got = apply_to_file("a\nb", |a| {
+            a.append = true;
+            a.text = "c\n".into();
+        });
+        assert_eq!(got, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn apply_append_to_empty_file_inserts_verbatim() {
+        let got = apply_to_file("", |a| {
+            a.append = true;
+            a.text = "x\n".into();
+        });
+        assert_eq!(got, "x\n");
+    }
+
+    #[test]
+    fn apply_before_line_one_inserts_at_start_and_ensures_newline() {
+        // No trailing newline on --text: one is appended so line structure
+        // is preserved.
+        let got = apply_to_file("one\ntwo\n", |a| {
+            a.before_line = 1;
+            a.text = "zero".into();
+        });
+        assert_eq!(got, "zero\none\ntwo\n");
+    }
+
+    #[test]
+    fn apply_after_line_last_appends_line() {
+        let got = apply_to_file("one\ntwo\n", |a| {
+            a.after_line = 2;
+            a.text = "three".into();
+        });
+        assert_eq!(got, "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn apply_after_line_past_eof_clamps_to_end() {
+        let got = apply_to_file("one\ntwo\n", |a| {
+            a.after_line = 99;
+            a.text = "three\n".into();
+        });
+        assert_eq!(got, "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn apply_region_insertion_modes_are_mutually_exclusive() {
+        let live = b"x\n";
+        let cases: [fn(&mut ApplyArgs); 6] = [
+            |a| {
+                a.append = true;
+                a.before_line = 1;
+            },
+            |a| {
+                a.append = true;
+                a.after_line = 1;
+            },
+            |a| {
+                a.before_line = 1;
+                a.after_line = 1;
+            },
+            |a| {
+                a.append = true;
+                a.all = true;
+            },
+            |a| {
+                a.append = true;
+                a.line = 1;
+            },
+            |a| {
+                a.before_line = 1;
+                a.start = 0;
+                a.end = 1;
+            },
+        ];
+        for set in cases {
+            let mut a = apply_args("f.md");
+            set(&mut a);
+            let err = apply_region(&a, live).unwrap_err();
+            assert!(err.contains("bage apply:"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn apply_region_insertion_is_zero_width_without_region_hash() {
+        let live = b"one\ntwo\n";
+        let mut a = apply_args("f.md");
+        a.append = true;
+        let reg = apply_region(&a, live).unwrap();
+        assert_eq!((reg.start_byte, reg.end_byte), (8, 8));
+        assert!(
+            reg.region_hash.is_empty(),
+            "insertion must carry no region_hash"
+        );
     }
 }

@@ -3,10 +3,12 @@
 //! (lazily, per rename) a language-server client. In Go this lived in
 //! `pkg/bage` re-exporting `internal/*` types as aliases; in Rust the crate's
 //! modules are public, so this module only adds the behavior layer.
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde::Serialize;
+
+use crate::clipboard;
 use crate::edit::FileEdit;
 use crate::format::{Formatter, Linter};
 use crate::hashing::{self, Hasher, XxHasher};
@@ -56,6 +58,8 @@ pub enum EditorError {
     },
     #[error(transparent)]
     Inspect(#[from] inspect::InspectError),
+    #[error(transparent)]
+    Clipboard(#[from] clipboard::ClipboardError),
 }
 
 /// The configured FILE-LEG edit engine: the public handle consumers drive
@@ -251,6 +255,231 @@ impl Editor {
         let (edits, anchors) = ground_edits(&file_edits, self.hasher())?;
         Ok(self.sess.prepare(&edits, &anchors)?)
     }
+
+    /// Extracts a region's bytes READ-ONLY: resolves `target` against the
+    /// live file (symbol / line / byte / region_hash addressing; a hash
+    /// verifies-and-relocates so a stale offset never copies the wrong
+    /// bytes) and returns the content plus its locator bundle. When `clip`
+    /// is set the content is also written to the file clipboard.
+    pub fn copy(
+        &self,
+        path: &str,
+        target: &inspect::CopyTarget,
+        clip: bool,
+    ) -> Result<CopyResult, EditorError> {
+        let (opened, result) = self.extract(path, target)?;
+        drop(opened);
+        if clip {
+            clipboard::write(&clipboard::Clip {
+                content: result.content.clone(),
+                source_path: path.to_string(),
+                region_hash: result.region_hash.clone(),
+                cut: false,
+            })?;
+        }
+        Ok(result)
+    }
+
+    /// Atomically REMOVES a region: resolves `target` like [`Editor::copy`],
+    /// captures the content, then commits a hash-gated empty-text edit
+    /// through the session engine (per-file lock, WAL, reject-never-corrupt
+    /// — a concurrent change of the region rejects with a conflict). When
+    /// `clip` is set the content is written to the file clipboard BEFORE the
+    /// removal commits, so a crash can never lose the bytes to the clipboard
+    /// AND the file at once.
+    pub fn cut(
+        &self,
+        path: &str,
+        target: &inspect::CopyTarget,
+        clip: bool,
+    ) -> Result<CutResult, EditorError> {
+        let (opened, removed) = self.extract(path, target)?;
+        let live = &opened.tree.source;
+
+        if clip {
+            clipboard::write(&clipboard::Clip {
+                content: removed.content.clone(),
+                source_path: path.to_string(),
+                region_hash: removed.region_hash.clone(),
+                cut: true,
+            })?;
+        }
+
+        let li = LineIndex::new(live);
+        let reg = li.fill_line_cols(Region {
+            path: path.to_string(),
+            start_byte: removed.start_byte as i64,
+            end_byte: removed.end_byte as i64,
+            region_hash: removed.region_hash.clone(),
+            ..Default::default()
+        });
+        let anchors = [crate::region::file_anchor(self.hasher(), path, live)];
+        drop(opened);
+        let edits = [Edit {
+            region: reg,
+            new_text: String::new(),
+        }];
+        let plan = self.sess.prepare(&edits, &anchors)?;
+        let mut results = self.sess.commit(&plan)?;
+        let result = results.pop().ok_or_else(|| {
+            EditorError::Usage("bage: cut: commit returned no result".to_string())
+        })?;
+        Ok(CutResult { removed, result })
+    }
+
+    /// INSERTS `text` at a point: `--at-byte` positions verbatim; the line
+    /// and append modes normalize newlines exactly like `bage apply`'s
+    /// insertion flags (append starts on a fresh line when the file lacks a
+    /// trailing newline; line insertions gain a trailing newline if missing
+    /// so line structure is preserved). The per-file anchor gates drift.
+    pub fn paste(
+        &self,
+        path: &str,
+        point: PastePoint,
+        text: &str,
+    ) -> Result<Vec<EditResult>, EditorError> {
+        let live = std::fs::read(path).map_err(|e| EditorError::Io {
+            context: format!("paste read {path:?}"),
+            source: e,
+        })?;
+
+        let mut new_text = text.to_string();
+        let mut reg = match point {
+            PastePoint::AtByte(n) => {
+                if n > live.len() {
+                    return Err(EditorError::Usage(format!(
+                        "bage: paste --at-byte {n} is past end of file (len {})",
+                        live.len()
+                    )));
+                }
+                let li = LineIndex::new(&live);
+                li.fill_line_cols(Region {
+                    start_byte: n as i64,
+                    end_byte: n as i64,
+                    ..Default::default()
+                })
+            }
+            PastePoint::Point(p) => {
+                match p {
+                    inspect::InsertionPoint::Append => {
+                        if !live.is_empty() && live.last() != Some(&b'\n') {
+                            new_text.insert(0, '\n');
+                        }
+                    }
+                    inspect::InsertionPoint::BeforeLine(_)
+                    | inspect::InsertionPoint::AfterLine(_) => {
+                        if !new_text.ends_with('\n') {
+                            new_text.push('\n');
+                        }
+                    }
+                }
+                inspect::resolve_insertion(&live, p)
+                    .map_err(|m| EditorError::Usage(m.replacen("resolve:", "bage paste:", 1)))?
+            }
+        };
+        reg.path = path.to_string();
+
+        let anchors = [crate::region::file_anchor(self.hasher(), path, &live)];
+        let edits = [Edit {
+            region: reg,
+            new_text,
+        }];
+        let plan = self.sess.prepare(&edits, &anchors)?;
+        Ok(self.sess.commit(&plan)?)
+    }
+
+    /// Shared copy/cut extraction: opens + parses the live file, resolves
+    /// the target range, and builds the [`CopyResult`] locator bundle from
+    /// the live bytes.
+    fn extract(
+        &self,
+        path: &str,
+        target: &inspect::CopyTarget,
+    ) -> Result<(inspect::OpenedFile, CopyResult), EditorError> {
+        let opened = inspect::open_file(path)?;
+        let (s, e) = inspect::resolve_copy_range(self.parser(), &opened, target)?;
+        let live = &opened.tree.source;
+        let li = LineIndex::new(live);
+        let (start_line, _) = li.position_for_byte(s);
+        let (end_line, _) = li.position_for_byte(e);
+        let result = CopyResult {
+            path: path.to_string(),
+            start_byte: s,
+            end_byte: e,
+            start_line,
+            end_line,
+            region_hash: crate::region::hash_region(live, s, e),
+            content: String::from_utf8_lossy(&live[s..e]).into_owned(),
+        };
+        Ok((opened, result))
+    }
+}
+
+/// Where [`Editor::paste`] inserts: a raw byte position (verbatim, no
+/// newline normalization) or a first-class insertion point (append /
+/// before-line / after-line, with `bage apply`-identical newline rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastePoint {
+    /// Insert at this byte offset, verbatim.
+    AtByte(usize),
+    /// Insert at a line-oriented point with newline normalization.
+    Point(inspect::InsertionPoint),
+}
+
+/// The outcome of a [`Editor::copy`] (and the `removed` half of a cut): the
+/// extracted content plus the locator bundle identifying exactly which
+/// bytes were taken. Text rendering is the bare content, so
+/// `bage copy ... --format text` pipes cleanly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CopyResult {
+    /// The file the content came from.
+    pub path: String,
+    /// Inclusive start byte of the copied region.
+    pub start_byte: usize,
+    /// Exclusive end byte of the copied region.
+    pub end_byte: usize,
+    /// 1-based start line of the copied region.
+    pub start_line: usize,
+    /// 1-based end line of the copied region.
+    pub end_line: usize,
+    /// The region_hash of the copied bytes at capture time.
+    pub region_hash: String,
+    /// The copied bytes (lossy UTF-8, matching block content semantics).
+    pub content: String,
+}
+
+impl crate::render::TextRender for CopyResult {
+    fn render_text(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        w.write_all(self.content.as_bytes())
+    }
+}
+
+/// The outcome of a [`Editor::cut`]: what was removed plus the standard
+/// write-back [`EditResult`] for the mutation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CutResult {
+    /// The removed region's locator bundle and content.
+    pub removed: CopyResult,
+    /// The write-back contract for the removal edit.
+    pub result: EditResult,
+}
+
+impl crate::render::TextRender for CutResult {
+    fn render_text(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "cut {} bytes [{}:{}] lines [{}:{}] region={} raw={} norm={}",
+            self.result.path,
+            self.removed.start_byte,
+            self.removed.end_byte,
+            self.removed.start_line,
+            self.removed.end_line,
+            self.removed.region_hash,
+            self.result.new_file_raw_hash,
+            self.result.new_file_norm_hash
+        )?;
+        w.write_all(self.removed.content.as_bytes())
+    }
 }
 
 /// Converts a flat slice of byte-range [`FileEdit`]s (from an LSP
@@ -328,9 +557,18 @@ pub fn envelope(err: &EditorError) -> crate::session::ErrorEnvelope {
             path: None,
             message: err.to_string(),
         },
+        EditorError::Clipboard(e) => ErrorEnvelope {
+            kind: match e {
+                clipboard::ClipboardError::Empty => Kind::Usage,
+                clipboard::ClipboardError::Io { .. } => Kind::Io,
+            },
+            path: None,
+            message: e.to_string(),
+        },
         EditorError::Inspect(e) => ErrorEnvelope {
             kind: match e {
                 inspect::InspectError::Usage(_) => Kind::Usage,
+                inspect::InspectError::Resolve(_) => Kind::Conflict,
                 inspect::InspectError::Io { source, .. }
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
@@ -428,6 +666,188 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn copy_is_read_only_and_matches_read_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ed = editor(&dir);
+        let p = dir.path().join("m.go");
+        let p = p.to_string_lossy().into_owned();
+        let src = b"package main\n\nfunc f() {}\n\nfunc g() {}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let by_symbol = ed
+            .copy(
+                &p,
+                &crate::inspect::CopyTarget {
+                    line: -1,
+                    start: -1,
+                    end: -1,
+                    symbol: "g".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(by_symbol.content, "func g() {}");
+        assert_eq!(
+            by_symbol.region_hash,
+            crate::region::hash_region(src, by_symbol.start_byte, by_symbol.end_byte)
+        );
+        // File untouched.
+        assert_eq!(std::fs::read(&p).unwrap(), src);
+
+        // Bare region_hash addressing relocates purely by content.
+        let by_hash = ed
+            .copy(
+                &p,
+                &crate::inspect::CopyTarget {
+                    line: -1,
+                    start: -1,
+                    end: -1,
+                    region_hash: by_symbol.region_hash.clone(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(by_hash.content, by_symbol.content);
+
+        // A wrong hash combined with a range is a conflict, not a misread.
+        let err = ed
+            .copy(
+                &p,
+                &crate::inspect::CopyTarget {
+                    line: -1,
+                    start: 0,
+                    end: 5,
+                    region_hash: "0".repeat(16),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(envelope(&err).kind, crate::session::Kind::Conflict);
+    }
+
+    #[test]
+    fn cut_removes_exactly_the_region_and_rejects_on_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let ed = editor(&dir);
+        let p = dir.path().join("t.txt");
+        let p = p.to_string_lossy().into_owned();
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+
+        let cut = ed
+            .cut(
+                &p,
+                &crate::inspect::CopyTarget {
+                    line: 2,
+                    start: -1,
+                    end: -1,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(cut.removed.content, "two");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\n\nthree\n");
+
+        // Symbol ambiguity (duplicate lines in text mode) rejects as usage.
+        std::fs::write(&p, "dup\nmid\ndup\n").unwrap();
+        let dup_hash = crate::region::hash_region(b"dup\nmid\ndup\n", 0, 3);
+        let err = ed
+            .cut(
+                &p,
+                &crate::inspect::CopyTarget {
+                    line: -1,
+                    start: -1,
+                    end: -1,
+                    region_hash: dup_hash,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(envelope(&err).kind, crate::session::Kind::Conflict);
+        assert_eq!(std::fs::read(&p).unwrap(), b"dup\nmid\ndup\n");
+    }
+
+    #[test]
+    fn cut_then_paste_reproduces_bytes_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ed = editor(&dir);
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        let a = a.to_string_lossy().into_owned();
+        let b = b.to_string_lossy().into_owned();
+        std::fs::write(&a, "fn keep() {}\n\nfn moved() { let x = 1; }\n").unwrap();
+        std::fs::write(&b, "fn existing() {}\n").unwrap();
+
+        let cut = ed
+            .cut(
+                &a,
+                &crate::inspect::CopyTarget {
+                    line: -1,
+                    start: -1,
+                    end: -1,
+                    symbol: "moved".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let results = ed
+            .paste(
+                &b,
+                PastePoint::Point(crate::inspect::InsertionPoint::Append),
+                &cut.removed.content,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "fn existing() {}\nfn moved() { let x = 1; }"
+        );
+        assert!(!std::fs::read_to_string(&a).unwrap().contains("moved"));
+    }
+
+    #[test]
+    fn paste_points_normalize_newlines_like_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let ed = editor(&dir);
+        let p = dir.path().join("t.txt");
+        let p = p.to_string_lossy().into_owned();
+
+        // Append onto a newline-less file starts on a fresh line.
+        std::fs::write(&p, "tail-no-newline").unwrap();
+        ed.paste(
+            &p,
+            PastePoint::Point(crate::inspect::InsertionPoint::Append),
+            "added",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "tail-no-newline\nadded"
+        );
+
+        // before-line gains a trailing newline so the target line survives.
+        std::fs::write(&p, "one\ntwo\n").unwrap();
+        ed.paste(
+            &p,
+            PastePoint::Point(crate::inspect::InsertionPoint::BeforeLine(2)),
+            "mid",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\nmid\ntwo\n");
+
+        // at-byte is verbatim; past-EOF rejects as usage.
+        std::fs::write(&p, "ab").unwrap();
+        ed.paste(&p, PastePoint::AtByte(1), "X").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "aXb");
+        let err = ed.paste(&p, PastePoint::AtByte(99), "X").unwrap_err();
+        assert_eq!(envelope(&err).kind, crate::session::Kind::Usage);
+    }
     #[test]
     fn ground_edits_sorts_and_anchors() {
         let dir = tempfile::tempdir().unwrap();
