@@ -8,6 +8,30 @@ use crate::hashing::{self, Hasher};
 use crate::parser::{Adapter, Lang, Node, ParserPort, Tree};
 use crate::region::{self, LINE_SENTINEL, LineIndex, Region};
 
+// The tier-2 analysis substrate is a sibling read-only surface over an
+// [`OpenedFile`]; re-export it here so hosts reach declaration outline and
+// analysis sites through the one inspection facade. Its identity is disposable
+// (re-derived per parse) and it never mutates the outline contract.
+pub use crate::tier2::{Site, Tier2Family, tier2_sites};
+
+// Import/export FACT extraction (XB1) is a second sibling read-only surface
+// over an [`OpenedFile`]: structured cross-file linkage facts (who imports what
+// from where, who re-exports) Hylla joins into edges. Re-exported through the
+// inspection facade so hosts reach outline, tier-2 sites, and facts uniformly;
+// like tier-2, facts are DISPOSABLE (re-derived per parse) and never touch the
+// outline contract.
+pub use crate::facts::{ExportFact, ExportKind, Facts, ImportFact, ImportedItem, extract_facts};
+
+// Scope + binding extraction (XB2) is a third sibling read-only surface over an
+// [`OpenedFile`]: the lexical scope tree, per-scope local bindings, and every
+// value-identifier occurrence tagged with a typed resolution
+// (LocalBinding/ImportedName/Undecidable). Re-exported through the inspection
+// facade alongside outline, tier-2 sites, and facts; like them it is DISPOSABLE
+// (re-derived per parse) and never touches the outline contract.
+pub use crate::facts::{
+    Binding, Occurrence, Resolution, Scope, ScopeKind, ScopeTree, Scopes, extract_scopes,
+};
+
 /// Errors from the read-only inspection surface.
 #[derive(Debug, thiserror::Error)]
 pub enum InspectError {
