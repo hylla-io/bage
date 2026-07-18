@@ -897,6 +897,18 @@ pub struct Scope {
     /// case patterns, walrus targets, future grammar additions).
     #[serde(skip)]
     poison: HashSet<String>,
+    /// LOCAL import names declared BY an import/use statement lexically inside
+    /// THIS scope (BF2): a top-level `use`/`import` lands in the module root
+    /// (visible file-wide, since every chain ends at root); a fn-body/block-
+    /// scoped import (Rust fn-body `use crate::x::h;`, Python `def g(): from m
+    /// import h`) lands in the ENCLOSING function/block scope, so its names are
+    /// visible ONLY down that scope's subtree — a SIBLING function that cannot
+    /// see the declaration resolves the name `Undecidable`, never a false
+    /// file-wide `ImportedName`. Checked per-level in [`resolve_name`] AFTER
+    /// this scope's local bindings (a same-scope local shadows the import).
+    /// Resolution-only, `#[serde(skip)]` — NOT part of the wire contract.
+    #[serde(skip)]
+    import_bindings: HashSet<String>,
 }
 
 /// The typed resolution of an identifier [`Occurrence`]. Exactly one variant
@@ -977,9 +989,13 @@ pub enum Scopes {
 /// are consistent with the outline the host anchors on.
 ///
 /// Two passes: (1) a scope-aware walk builds the scope arena, records each
-/// scope's bindings, and buffers every identifier occurrence with its enclosing
-/// scope; (2) each occurrence is resolved against the scope chain then the
-/// definite-import name set. Local bindings take precedence over imports.
+/// scope's bindings, buffers every identifier occurrence with its enclosing
+/// scope, and collects each import/use statement with the scope it sits in;
+/// (2) each import declaration's LOCAL names are attached to ITS scope's
+/// `import_bindings` (module root = file-wide; a fn/block-body import = that
+/// subtree only, BF2), then each occurrence is resolved by walking the scope
+/// chain — local bindings shadow imports, a name unreachable via the chain is
+/// `Undecidable` (no file-wide import fallback for body imports).
 pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
     let lang = opened.lang;
     let Some(ts_lang) = grammar(lang) else {
@@ -999,6 +1015,7 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
         end_line: root.end_position().row + 1,
         bindings: Vec::new(),
         poison: HashSet::new(),
+        import_bindings: HashSet::new(),
     };
     let Some(tree) = parser.parse(src, None) else {
         // Total parse failure over already-parsed bytes is unreachable in
@@ -1013,6 +1030,7 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
                 end_line: 1,
                 bindings: Vec::new(),
                 poison: HashSet::new(),
+                import_bindings: HashSet::new(),
             }],
             occurrences: Vec::new(),
         });
@@ -1029,18 +1047,27 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
         HashSet::new()
     };
     let mut scopes = vec![module_scope(root)];
-    // Buffered occurrences: (name, enclosing_scope, start_byte, end_byte, line).
-    let mut raw: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+    let mut out = WalkOut {
+        occurrences: Vec::new(),
+        import_decls: Vec::new(),
+    };
     for i in 0..root.named_child_count() {
         if let Some(c) = root.named_child(i as u32) {
-            walk_scopes(lang, c, 0, src, &mut scopes, &mut raw, &globals);
+            walk_scopes(lang, c, 0, src, &mut scopes, &mut out, &globals);
         }
     }
-    let imports = imported_local_names(opened);
-    let occurrences = raw
+    // Attach each import declaration's LOCAL names to the scope that contains
+    // it (BF2): module root for top-level imports (visible file-wide), the
+    // fn/block scope for body imports (visible only down that subtree).
+    for (sid, node) in out.import_decls {
+        let names = import_local_names(lang, &imports_of_node(lang, node, src, &ts_lang));
+        scopes[sid].import_bindings.extend(names);
+    }
+    let occurrences = out
+        .occurrences
         .into_iter()
         .map(|(name, scope, start_byte, end_byte, line)| {
-            let resolution = resolve_name(&name, scope, start_byte, &scopes, &imports);
+            let resolution = resolve_name(lang, &name, scope, start_byte, &scopes);
             Occurrence {
                 name,
                 scope,
@@ -1057,21 +1084,42 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
     })
 }
 
+/// The output buffers [`walk_scopes`] accumulates over one file: every
+/// value-identifier `occurrences` tuple `(name, scope, start, end, line)` and
+/// every import/use statement paired with the scope it sits in (`import_decls`,
+/// BF2). Both are resolved AFTER the walk (occurrences → [`resolve_name`];
+/// import decls → per-scope `import_bindings`). Bundled so the recursive walker
+/// threads one accumulator, not two.
+struct WalkOut<'t> {
+    /// Buffered occurrences: `(name, enclosing_scope, start_byte, end_byte, line)`.
+    occurrences: Vec<(String, usize, usize, usize, usize)>,
+    /// Import/use statement nodes paired with their lexically-enclosing scope.
+    import_decls: Vec<(usize, TsNode<'t>)>,
+}
+
 /// Scope-aware descent. Adds `node`'s enclosing-scope bindings (declaration
 /// names + `let`/`assignment`/`:=` locals) to `cur`, opens a child scope when
 /// `node` introduces one (binding its parameters there), buffers `node` as an
-/// occurrence when it is a value identifier, then recurses over named children
-/// under the (possibly new) scope.
-fn walk_scopes(
+/// occurrence when it is a value identifier, records an import/use statement
+/// against `cur` (BF2), then recurses over named children under the (possibly
+/// new) scope.
+fn walk_scopes<'t>(
     lang: Lang,
-    node: TsNode,
+    node: TsNode<'t>,
     cur: usize,
     src: &[u8],
     scopes: &mut Vec<Scope>,
-    raw: &mut Vec<(String, usize, usize, usize, usize)>,
+    out: &mut WalkOut<'t>,
     globals: &HashSet<String>,
 ) {
     let kind = node.kind();
+    // BF2: an import/use STATEMENT binds its local names into the scope it sits
+    // in (`cur`). Recorded here (not resolved yet — the query needs the grammar
+    // handle held in `extract_scopes`); `import_spec`/inner nodes are NOT trigger
+    // kinds, so a Go `import ( … )` block is collected once at the declaration.
+    if is_import_stmt_kind(lang, kind) {
+        out.import_decls.push((cur, node));
+    }
     // Names that bind in the ENCLOSING scope, or — for JS `function`/`class`
     // declarations — HOIST to the nearest enclosing Function/Module scope (F2).
     if let Some(b) = decl_name_binding(lang, node, src) {
@@ -1105,6 +1153,7 @@ fn walk_scopes(
                 end_line: node.end_position().row + 1,
                 bindings: Vec::new(),
                 poison: HashSet::new(),
+                import_bindings: HashSet::new(),
             });
             collect_param_bindings(lang, node, src, id, scopes);
             collect_pattern_scope_bindings(lang, node, src, id, scopes);
@@ -1119,7 +1168,7 @@ fn walk_scopes(
     // index-signature param — F4/F6/XH3), which is dropped so it can never coerce
     // a false definite.
     if kind == "identifier" && !is_non_occurrence(lang, node, src) {
-        raw.push((
+        out.occurrences.push((
             ntext(node, src),
             cur,
             node.start_byte(),
@@ -1137,7 +1186,7 @@ fn walk_scopes(
             } else {
                 child
             };
-            walk_scopes(lang, c, into, src, scopes, raw, globals);
+            walk_scopes(lang, c, into, src, scopes, out, globals);
         }
     }
 }
@@ -1299,6 +1348,28 @@ fn is_import_decl_kind(lang: Lang, kind: &str) -> bool {
             "import_statement" | "import_from_statement" | "future_import_statement"
         ),
         Lang::Go => matches!(kind, "import_declaration" | "import_spec"),
+        _ => false,
+    }
+}
+
+/// The per-grammar import/use STATEMENT node kinds that BIND local names into
+/// the enclosing scope (BF2). A superset-free subset of [`is_import_decl_kind`]:
+/// the STATEMENT level only, so an import is collected ONCE (a Go
+/// `import_declaration` holds every `import_spec`, so `import_spec` is NOT a
+/// trigger; the per-node extractor descends into the specs). Kinds outside a
+/// grammar's extractor (Rust `extern_crate_declaration`, Python
+/// `future_import_statement`) are harmless triggers — [`imports_of_node`]
+/// returns no facts for them, matching the pre-BF2 file-wide behavior (those
+/// names were never in the import set).
+fn is_import_stmt_kind(lang: Lang, kind: &str) -> bool {
+    match lang {
+        Lang::Rust => matches!(kind, "use_declaration" | "extern_crate_declaration"),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => kind == "import_statement",
+        Lang::Python => matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ),
+        Lang::Go => kind == "import_declaration",
         _ => false,
     }
 }
@@ -2316,30 +2387,43 @@ fn left_assign_is_define(node: TsNode, src: &[u8]) -> bool {
         .is_some_and(|s| s.contains(":="))
 }
 
-/// The set of DEFINITE local import names for `opened` — the names an import
-/// binds into the local namespace (`alias` when renamed, else the last path
+/// The DEFINITE local import names bound by `imports` — the names each import
+/// puts into the local namespace (`alias` when renamed, else the last path
 /// segment of the imported symbol/module). Glob/wildcard imports contribute
 /// NOTHING (their members are unknown), upholding the never-guess invariant.
-fn imported_local_names(opened: &OpenedFile) -> HashSet<String> {
+/// BF2: called per-import-declaration (over [`imports_of_node`]'s facts) so the
+/// names attach to the DECLARING scope, not one file-wide set.
+///
+/// Python bare dotted import (`import a.b.c`, no alias): Python binds ONLY the
+/// HEAD package name `a` (`a.b.c` is then reached via attribute access), not the
+/// tail — so `path` in `import os.path` is NOT a local name (real `NameError`),
+/// `os` IS. The aliased form (`import a.b as x`) has non-empty `items` and takes
+/// the alias branch below unchanged; every other language's bare import binds
+/// the tail path segment (Go package name), so the head rule is Python-only.
+fn import_local_names(lang: Lang, imports: &[ImportFact]) -> HashSet<String> {
     let mut set = HashSet::new();
-    let Facts::Supported { imports, .. } = extract_facts(opened) else {
-        return set;
-    };
     for imp in imports {
         if imp.glob {
             // A wildcard brings unknown names; never fabricate specific ones.
             continue;
         }
         if imp.items.is_empty() {
-            // A bare module import binds a local module/package name.
-            if let Some(seg) = last_segment(&imp.source_specifier) {
+            // A bare module import binds a local module/package name: Python
+            // binds the dotted HEAD (`import os.path` -> `os`); other languages
+            // bind the tail path segment (`import "a/b/c"` -> `c`).
+            let seg = if matches!(lang, Lang::Python) {
+                python_head_segment(&imp.source_specifier)
+            } else {
+                last_segment(&imp.source_specifier)
+            };
+            if let Some(seg) = seg {
                 set.insert(seg);
             }
             continue;
         }
-        for it in imp.items {
-            let local = it.alias.unwrap_or(it.name);
-            if local == "*" || local.ends_with("::*") || local.ends_with("*") {
+        for it in &imp.items {
+            let local = it.alias.clone().unwrap_or_else(|| it.name.clone());
+            if local == "*" || local.ends_with("::*") || local.ends_with('*') {
                 continue;
             }
             if let Some(seg) = last_segment(&local) {
@@ -2348,6 +2432,27 @@ fn imported_local_names(opened: &OpenedFile) -> HashSet<String> {
         }
     }
     set
+}
+
+/// The [`ImportFact`]s of a SINGLE import/use statement `node` (BF2). Dispatches
+/// to the same per-grammar extractor `extract_facts` uses, but rooted at the one
+/// statement so the query matches only that declaration's imports — the local
+/// names then bind to the scope the statement sits in. Unhandled kinds (Rust
+/// `extern_crate_declaration`, Python `future_import_statement`) yield none,
+/// preserving pre-BF2 behavior (their names were never resolvable imports).
+fn imports_of_node(
+    lang: Lang,
+    node: TsNode,
+    src: &[u8],
+    ts_lang: &tree_sitter::Language,
+) -> Vec<ImportFact> {
+    match lang {
+        Lang::Rust => rust_imports(node, src, ts_lang),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => ts_imports(node, src, ts_lang),
+        Lang::Python => python_imports(node, src, ts_lang),
+        Lang::Go => go_imports(node, src, ts_lang),
+        _ => Vec::new(),
+    }
 }
 
 /// The final path segment of an import name/specifier (`a::b::C` → `C`,
@@ -2362,14 +2467,44 @@ fn last_segment(s: &str) -> Option<String> {
     }
 }
 
+/// The HEAD (first) dotted segment of a Python module path (`os.path` -> `os`,
+/// `a.b.c` -> `a`) — the ONLY name a bare `import a.b.c` binds locally; `None`
+/// when empty.
+fn python_head_segment(s: &str) -> Option<String> {
+    let seg = s.split('.').next().unwrap_or(s);
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
 /// Resolves the occurrence of `name` at byte `use_byte` in scope `scope` to a
-/// typed [`Resolution`]: the nearest enclosing scope with a matching VISIBLE
-/// binding wins (shadowing); otherwise a definite local import name; otherwise
-/// [`Resolution::Undecidable`]. A binding is visible iff it is [hoisted] OR its
-/// `start_byte` is at/before `use_byte` (F5 positional rule: a sequential
-/// `let`/`const`/`:=` is invisible to a use lexically before it, which then
-/// falls through — never a false LocalBinding). Local bindings ALWAYS take
-/// precedence over imports.
+/// typed [`Resolution`] by walking the scope chain from `scope` to the root: the
+/// nearest enclosing scope with a matching VISIBLE binding wins (shadowing);
+/// else the nearest enclosing scope whose `import_bindings` hold `name` (a
+/// definite import visible from here); else [`Resolution::Undecidable`]. A
+/// binding is visible iff it is [hoisted] OR its `start_byte` is at/before
+/// `use_byte` (F5 positional rule: a sequential `let`/`const`/`:=` is invisible
+/// to a use lexically before it, which then falls through — never a false
+/// LocalBinding). Local bindings ALWAYS take precedence over imports.
+///
+/// BF2 (import placement scoping): imports are checked PER-SCOPE in the chain,
+/// NOT as a file-wide fallback. A top-level import lands in the module root, so
+/// every occurrence's chain reaches it (file-wide as before); a fn/block-body
+/// import lands in that scope, so a SIBLING scope that cannot reach it resolves
+/// `Undecidable` — never a false file-wide `ImportedName`. A same-scope local
+/// binding is checked before that scope's imports, so it still shadows.
+///
+/// BF2 Rust `mod` boundary: a child module does NOT inherit its parent file/mod
+/// `use` bindings (rustc E0425 — a bare name in `mod inner` needs its own `use`
+/// or `super::`). So once the chain walk CROSSES a nested Rust `mod` scope (a
+/// `Module` with `Some` parent, `lang == Rust`), further-out `import_bindings`
+/// are no longer consulted: a top-level `use` collided in a nested `mod`
+/// resolved a false file-wide `ImportedName` before. The nested mod's OWN
+/// import_bindings (a `use` written inside it) stay visible — the gate flips
+/// only AFTER that scope is checked. Local bindings/poison are unaffected (the
+/// gate is import-only, matching the narrow E0425 truth this fixes).
 ///
 /// [hoisted]: Binding::hoisted
 ///
@@ -2380,13 +2515,17 @@ fn last_segment(s: &str) -> Option<String> {
 /// (conservative: a false `Undecidable`, never a false definite). Poison is
 /// checked per-level so an inner CERTAIN binding still shadows an outer poison.
 fn resolve_name(
+    lang: Lang,
     name: &str,
     scope: usize,
     use_byte: usize,
     scopes: &[Scope],
-    imports: &HashSet<String>,
 ) -> Resolution {
     let mut cur = Some(scope);
+    // Whether outer `import_bindings` are still reachable. Flips off once the
+    // walk climbs past a nested Rust `mod` boundary (E0425): its parent's use
+    // bindings do not reach inside it.
+    let mut imports_visible = true;
     while let Some(id) = cur {
         if scopes[id].poison.contains(name) {
             return Resolution::Undecidable;
@@ -2398,13 +2537,19 @@ fn resolve_name(
         {
             return Resolution::LocalBinding { scope: id };
         }
+        if imports_visible && scopes[id].import_bindings.contains(name) {
+            return Resolution::ImportedName;
+        }
+        // Crossing a nested Rust `mod` scope cuts off the parent's imports.
+        if matches!(lang, Lang::Rust)
+            && scopes[id].kind == ScopeKind::Module
+            && scopes[id].parent.is_some()
+        {
+            imports_visible = false;
+        }
         cur = scopes[id].parent;
     }
-    if imports.contains(name) {
-        Resolution::ImportedName
-    } else {
-        Resolution::Undecidable
-    }
+    Resolution::Undecidable
 }
 
 #[cfg(test)]
@@ -2819,6 +2964,180 @@ mod tests {
             .iter()
             .filter(|o| o.name == name && matches!(o.resolution, Resolution::LocalBinding { .. }))
             .collect()
+    }
+
+    /// The [`Resolution`] of the occurrence of `name` on 1-based `line` (the
+    /// exact use we want to pin — BF2 tests have same-spelled uses in sibling
+    /// scopes, so line disambiguates).
+    fn resolution_on_line(t: &ScopeTree, name: &str, line: usize) -> Resolution {
+        t.occurrences
+            .iter()
+            .find(|o| o.name == name && o.line == line)
+            .unwrap_or_else(|| panic!("no `{name}` occurrence on line {line}: {:?}", t.occurrences))
+            .resolution
+    }
+
+    #[test]
+    fn python_body_import_scoped_to_declaring_fn() {
+        // BF2: `helper` is imported INSIDE `g`'s body — its use in `g` resolves
+        // ImportedName, but the SIBLING `h`'s same-spelled use CANNOT see that
+        // body import and resolves Undecidable (never a false file-wide import).
+        let src = b"def g():\n    from mod import helper\n    return helper()\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "g's body-import use resolves ImportedName"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 5),
+            Resolution::Undecidable,
+            "sibling h cannot see g's body import"
+        );
+    }
+
+    #[test]
+    fn python_top_level_import_resolves_everywhere() {
+        // BF2 preserves top-level imports: a module-scope import is visible in
+        // EVERY function (its names land in the module root, which every chain
+        // reaches).
+        let src = b"from mod import helper\ndef g():\n    return helper()\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 5),
+            Resolution::ImportedName
+        );
+    }
+
+    #[test]
+    fn python_nested_fn_sees_ancestor_body_import() {
+        // A body import in `g` is visible to a nested function defined inside g
+        // (the chain climbs through g's scope), while an outer sibling is not.
+        let src = b"def g():\n    from mod import helper\n    def inner():\n        return helper()\n    return inner\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "nested inner() sees ancestor g's import"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 7),
+            Resolution::Undecidable,
+            "sibling h still cannot"
+        );
+    }
+
+    #[test]
+    fn rust_fn_body_use_scoped_to_declaring_fn() {
+        // BF2 for Rust: a fn-body `use crate::m::helper;` binds `helper` only in
+        // `g`; the sibling `h`'s use falls to Undecidable, never file-wide.
+        let src =
+            b"fn g() {\n    use crate::m::helper;\n    helper();\n}\nfn h() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "g's fn-body use resolves ImportedName"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::Undecidable,
+            "sibling h cannot see g's fn-body use"
+        );
+    }
+
+    #[test]
+    fn rust_nested_block_sees_fn_body_import() {
+        // A nested block inside the same fn sees the fn-body import via the chain.
+        let src = b"fn g() {\n    use crate::m::helper;\n    {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName
+        );
+    }
+
+    #[test]
+    fn rust_top_level_use_not_visible_in_nested_mod() {
+        // BF2 mod boundary (E0425): a top-level `use` does NOT reach inside a
+        // nested `mod` — a bare `helper` there is unresolved. Before the gate the
+        // chain climbed to root's import_bindings → false ImportedName.
+        let src =
+            b"use crate::m::helper;\nmod inner {\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::Undecidable,
+            "top-level use does not cross the mod boundary"
+        );
+    }
+
+    #[test]
+    fn rust_use_inside_mod_resolves_within_it() {
+        // The inverse of the gate: a `use` written INSIDE the mod binds there, so
+        // a use in the same mod's fn resolves ImportedName (the gate flips only
+        // AFTER the nested-mod scope is checked).
+        let src =
+            b"mod inner {\n    use crate::m::helper;\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "a use inside the mod is visible in that mod"
+        );
+    }
+
+    #[test]
+    fn rust_use_in_sibling_mod_not_visible() {
+        // p7 inverse: an import in `mod a` is not visible in a sibling `mod b`.
+        let src = b"mod a {\n    use crate::m::helper;\n}\nmod b {\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::Undecidable,
+            "mod a's import is invisible in sibling mod b"
+        );
+    }
+
+    #[test]
+    fn python_bare_dotted_import_binds_head_only() {
+        // Python `import os.path` binds ONLY the head `os` (real: `path` is a
+        // NameError). Before, the items-empty branch bound the tail `path` and
+        // dropped `os` → inverted bindings.
+        let src = b"import os.path\nx = path.join\ny = os.getcwd\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "path", 2),
+            Resolution::Undecidable,
+            "the dotted tail `path` is NOT locally bound"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "os", 3),
+            Resolution::ImportedName,
+            "the dotted head `os` IS locally bound"
+        );
+    }
+
+    #[test]
+    fn python_aliased_dotted_import_keeps_alias() {
+        // The aliased form (`import os.path as p`, non-empty items) is unchanged:
+        // the alias `p` binds, the head `os` does not.
+        let src = b"import os.path as p\nx = p.join\ny = os.getcwd\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "p", 2),
+            Resolution::ImportedName,
+            "the alias `p` binds"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "os", 3),
+            Resolution::Undecidable,
+            "no head binding for the aliased form"
+        );
     }
 
     #[test]
