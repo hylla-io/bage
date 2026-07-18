@@ -925,10 +925,10 @@ pub enum Resolution {
 /// `identifier` node is an occurrence, INCLUDING binding sites (a binding site
 /// resolves to its own `LocalBinding`) — so the resolution property holds over
 /// the whole identifier stream with no special-casing. EXCEPTION (never-guess):
-/// non-referencing identifier positions are dropped rather than mis-resolved —
-/// a Python `attribute` field (`obj.json` → `json`), a `keyword_argument` name
-/// (`f(json=1)` → `json`), and `global`/`nonlocal` declaration names are NOT
-/// occurrences (they would otherwise coerce a false `ImportedName`).
+/// non-referencing identifier positions are DROPPED rather than mis-resolved
+/// (see [`is_non_occurrence`]) — buffering one coerces a false `ImportedName`
+/// (the XB2/XH3 false-definite bug class). Only a WHOLE bare callee/use stays an
+/// occurrence; import binding-sites and qualified-path segments never do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Occurrence {
     /// The identifier text.
@@ -1114,10 +1114,11 @@ fn walk_scopes(
         None => cur,
     };
     // A value identifier is an occurrence in its enclosing (`cur`) scope, UNLESS
-    // it is a non-referencing position (Python attribute field / keyword-arg
-    // name / global-nonlocal declaration name — F4/F6), which is dropped so it
-    // can never coerce a false definite.
-    if kind == "identifier" && !is_non_occurrence(lang, node) {
+    // it is a non-referencing position (import/use span, qualified-path segment,
+    // Python attribute/keyword/global-nonlocal, TSX intrinsic tag, TS
+    // index-signature param — F4/F6/XH3), which is dropped so it can never coerce
+    // a false definite.
+    if kind == "identifier" && !is_non_occurrence(lang, node, src) {
         raw.push((
             ntext(node, src),
             cur,
@@ -1200,24 +1201,153 @@ fn python_global_names(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -
     set
 }
 
-/// Whether an `identifier` node is a NON-referencing position that must not
-/// become an [`Occurrence`] (Python only): the `attribute` field of an
-/// `attribute` (`obj.json`), the `name` of a `keyword_argument` (`f(json=1)`),
-/// or a `global`/`nonlocal` declaration name. Emitting these would coerce a
-/// false [`Resolution::ImportedName`] when the label collides with an import.
-fn is_non_occurrence(lang: Lang, node: TsNode) -> bool {
-    if !matches!(lang, Lang::Python) {
-        return false;
+/// Whether an `identifier` node is a NON-referencing position that must NOT
+/// become an [`Occurrence`] — a name that, if buffered, would coerce a false
+/// [`Resolution::ImportedName`] on a same-spelling import collision (the XB2/XH3
+/// false-definite bug class). FIVE drop classes, all four grammars, extending
+/// the F4 attribute-drop precedent (partitioning matches contract §8d):
+///
+/// 1. **import/use span** — ANY identifier inside an import/use/from-import
+///    declaration (Rust `use_declaration` incl. a fn-body-scoped
+///    `use crate::x::h;` AND `extern_crate_declaration`; TS/JS `import_statement`
+///    PLUS a re-export-`from` specifier/namespace name; Python `import_*`; Go
+///    `import_declaration`/`import_spec`): an import path/name/alias identifier
+///    is a binding-site, never a body use — buffering it drew a self/wrong-target
+///    Extracted edge to a same-named import.
+/// 2. **qualified-path TRAILING segment** — a Rust `scoped_identifier` `name`
+///    (`crate::internal::helper()` → `internal`,`helper`) or a Python
+///    `dotted_name` segment (`import a.b.c`): a trailing path segment cannot
+///    resolve lexically, so it is dropped rather than coerced. The path HEAD is a
+///    real reference and STAYS — Rust `T::default()`/`a::b` head (`path` field, a
+///    generic param / module), Python attribute-chain head `a` in `a.b.c` (but a
+///    `match`/`case a.b:` value-pattern parses as `dotted_name`, so its head is
+///    conservatively dropped too — no false definite; documented in §8d.1).
+/// 3. **Python `attribute` field** (`obj.json` → `json`) — a trailing attribute
+///    name is a member access, never a value reference (F4).
+/// 4. **Python `keyword_argument` name + `global`/`nonlocal` names**
+///    (`f(json=1)` → `json`; `global x`) — argument labels / declaration names,
+///    not uses (F4/F6).
+/// 5. **TSX intrinsic tag + TS index-signature parameter** — a lowercase JSX
+///    element name (`<div>`/`</div>`) is an HTML/SVG intrinsic (an uppercase
+///    component tag `<Foo/>` IS a reference and stays); `[key: string]: T`'s
+///    `key` is a type-position placeholder that binds no value.
+fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
+    // (1) Anything inside an import/use declaration span — all grammars.
+    if within_import_decl(lang, node) {
+        return true;
     }
     let Some(p) = node.parent() else {
         return false;
     };
-    match p.kind() {
-        "attribute" => p.child_by_field_name("attribute") == Some(node),
-        "keyword_argument" => p.child_by_field_name("name") == Some(node),
-        "global_statement" | "nonlocal_statement" => true,
+    match lang {
+        // (2a) Rust qualified-path TRAILING segment: the `name` field of a
+        // `scoped_identifier` (`crate::internal::helper` → `internal`,`helper`
+        // are each a `name`). The path HEAD (`T` in `T::default()`, `a` in
+        // `a::b`) is the `path` field — a real reference (generic param / module)
+        // that STAYS, mirroring the Python attribute-head rule.
+        Lang::Rust => {
+            p.kind() == "scoped_identifier" && p.child_by_field_name("name") == Some(node)
+        }
+        // (2b) Python attribute field / keyword-arg name / global-nonlocal
+        // (F4/F6) PLUS `dotted_name` import-path segments.
+        Lang::Python => match p.kind() {
+            "attribute" => p.child_by_field_name("attribute") == Some(node),
+            "keyword_argument" => p.child_by_field_name("name") == Some(node),
+            "global_statement" | "nonlocal_statement" => true,
+            "dotted_name" => true,
+            _ => false,
+        },
+        // (2c) TS/JS re-export-`from` specifier/namespace name + TSX intrinsic
+        // tag name + TS index-signature parameter name.
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            within_reexport_from(node)
+                || is_tsx_intrinsic_tag(p, node, src)
+                || is_ts_index_signature_param(p, node)
+        }
+        // Go qualified access is a `selector_expression` whose `field` is a
+        // `field_identifier` (never an occurrence); the `operand` head is a real
+        // bare use and stays. Nothing extra beyond the import span.
         _ => false,
     }
+}
+
+/// Whether `node` lies anywhere inside an import/use/from-import declaration.
+/// Climbs ancestors (import decls are statements whose subtree holds only path/
+/// list/alias nodes, so an import identifier reaches its decl in a few hops
+/// before any non-import identifier climbs to the root).
+fn within_import_decl(lang: Lang, node: TsNode) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if is_import_decl_kind(lang, n.kind()) {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// The per-grammar import/use declaration node kinds whose contained
+/// identifiers are binding-sites, never body uses.
+fn is_import_decl_kind(lang: Lang, kind: &str) -> bool {
+    match lang {
+        // `extern_crate_declaration` (`extern crate alloc;` / `… as a;`) is a
+        // crate-binding site, never a body use — its `name`/`alias` idents drop.
+        Lang::Rust => matches!(kind, "use_declaration" | "extern_crate_declaration"),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => kind == "import_statement",
+        Lang::Python => matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ),
+        Lang::Go => matches!(kind, "import_declaration" | "import_spec"),
+        _ => false,
+    }
+}
+
+/// Whether `node` lies inside a TS/JS re-export-`from` statement — an
+/// `export_statement` carrying a `source` field (`export {x} from './m'`,
+/// `export * as ns from './m'`, `export {default as x} from './m'`). Such
+/// `export_clause` specifier / `namespace_export` identifiers NAME another
+/// module's binding, never a local value use, so buffering one coerced a false
+/// `ImportedName` on a same-spelling import collision (the XH3 residual class).
+/// A SOURCELESS `export {x}` re-exports a LOCAL binding, so its `x` IS a real
+/// reference and stays (this helper returns `false` — no `source` field). Climbs
+/// ancestors; export statements do not nest, so the FIRST `export_statement`
+/// hit decides.
+fn within_reexport_from(node: TsNode) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "export_statement" {
+            return n.child_by_field_name("source").is_some();
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Whether `node` (parent `p`) is a lowercase JSX element name — an HTML/SVG
+/// INTRINSIC tag (`<div>`/`</div>`/`<span/>`), not a value reference. Uppercase
+/// component tags (`<Foo/>`) and member tags (`<a.b/>`, a `member_expression`,
+/// not an `identifier`) are real references and return `false`.
+fn is_tsx_intrinsic_tag(p: TsNode, node: TsNode, src: &[u8]) -> bool {
+    if !matches!(
+        p.kind(),
+        "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+    ) {
+        return false;
+    }
+    if p.child_by_field_name("name") != Some(node) {
+        return false;
+    }
+    // Intrinsic iff the tag spelling starts with an ASCII lowercase letter (the
+    // JSX/React convention; uppercase or `_`/`$` = component reference).
+    src.get(node.start_byte())
+        .is_some_and(u8::is_ascii_lowercase)
+}
+
+/// Whether `node` (parent `p`) is the parameter NAME of a TS `index_signature`
+/// (`[key: string]: T`) — a type-position placeholder that binds no value.
+fn is_ts_index_signature_param(p: TsNode, node: TsNode) -> bool {
+    p.kind() == "index_signature" && p.child_by_field_name("name") == Some(node)
 }
 
 /// The [`ScopeKind`] a grammar node opens, or `None` when it opens no scope.
@@ -2923,8 +3053,10 @@ mod tests {
             "m.rs",
             b"use a::bar;\nfn f() {\n    bar();\n    let bar = 2;\n    bar;\n}\n",
         );
+        // XH3: the import-site `bar` (line 1, `use a::bar`) is dropped, so the
+        // pre-let use `bar()` is now the FIRST `bar` occurrence (index 0).
         assert_eq!(
-            nth_occ(&t, "bar", 1).resolution,
+            nth_occ(&t, "bar", 0).resolution,
             Resolution::ImportedName,
             "pre-let use falls through to the import: {:?}",
             t.occurrences
@@ -2996,8 +3128,13 @@ mod tests {
             "no `foo` occurrence on the attribute/keyword lines: {:?}",
             t.occurrences
         );
-        // The import-site `foo` (line 1) is still a legitimate occurrence.
-        assert!(t.occurrences.iter().any(|o| o.name == "foo" && o.line == 1));
+        // XH3: the import-site `foo` (line 1) is a binding-site, not a body use,
+        // so it is DROPPED too — no `foo` occurrence anywhere in this fixture.
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "foo"),
+            "import-span `foo` is not a body-use occurrence: {:?}",
+            t.occurrences
+        );
     }
 
     #[test]
@@ -4129,6 +4266,170 @@ mod tests {
         assert!(
             matches!(read.resolution, Resolution::ImportedName),
             "bare `helper` in default method = ImportedName, not the assoc const: {:?}",
+            t.occurrences
+        );
+    }
+
+    // ------------------------------ BF1 occurrence-stream purity (XH3) --------
+    // Each fixture is a resolved falsifier probe: a path-position / import-span /
+    // intrinsic-tag / index-signature identifier that PRE-FIX buffered as an
+    // occurrence and false-resolved to a same-spelling import (a wrong-target
+    // Extracted edge downstream). Post-fix the polluting identifier is DROPPED.
+
+    #[test]
+    fn bf1_rust_scoped_path_segment_not_occurrence() {
+        // `crate::internal::helper()` with a colliding `use a::helper`. PRE-FIX
+        // the `name`-segment `helper` buffered as an occurrence and resolved to
+        // the import (false ImportedName). Post-fix: NO `helper` occurrence.
+        let t = scopes_of(
+            "m.rs",
+            b"use a::helper;\nfn f() {\n    crate::internal::helper();\n}\n",
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "scoped-path `helper` segment is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "internal"),
+            "scoped-path `internal` segment is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_bare_call_still_resolves_import() {
+        // REGRESSION: a WHOLE bare callee (`helper()`, not a path) stays an
+        // occurrence and resolves the import — the fix must not over-drop.
+        let t = scopes_of("m.rs", b"use a::helper;\nfn f() {\n    helper();\n}\n");
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "helper" && o.resolution == Resolution::ImportedName),
+            "bare `helper()` call resolves ImportedName: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_body_use_declaration_not_occurrence() {
+        // A fn-body-scoped `use crate::x::h;` (unused): its path identifiers are
+        // import binding-sites, never body uses. PRE-FIX `h` buffered as an
+        // occurrence and self-resolved. Post-fix: NO `h` occurrence.
+        let t = scopes_of("m.rs", b"fn f() {\n    use crate::x::h;\n}\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "h"),
+            "body `use` path `h` is not a body-use occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_python_dotted_import_segments_dropped_attr_head_stays() {
+        // `import a.b.c` — every `dotted_name` segment is an import path element,
+        // never a body use. The body `x = a.b.c` attribute-chain HEAD `a` IS a
+        // real bare use and STAYS; trailing `.b`/`.c` fields stay dropped (F4).
+        let t = scopes_of("m.py", b"import a.b.c\nx = a.b.c\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "b"),
+            "dotted segment `b` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "c"),
+            "dotted segment `c` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            t.occurrences.iter().any(|o| o.name == "a" && o.line == 2),
+            "attribute-chain head `a` (body) stays an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "a" && o.line == 1),
+            "import-path `a` segment (line 1) is dropped: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_tsx_intrinsic_tag_dropped_component_stays() {
+        // Lowercase `<div>`/`</div>` are HTML intrinsics (dropped); an uppercase
+        // component tag `<Foo/>` IS a value reference and stays an occurrence.
+        let t = scopes_of("m.tsx", b"const x = <div><Foo /></div>;\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "div"),
+            "intrinsic tag `div` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            t.occurrences.iter().any(|o| o.name == "Foo"),
+            "component tag `Foo` stays an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_reexport_from_specifiers_dropped_local_export_stays() {
+        // `export {helper} from './b'` re-exports another module's binding: the
+        // specifier `helper` is NOT a local value use. PRE-FIX it buffered as an
+        // occurrence and false-resolved to the colliding `import {helper}` (a
+        // wrong-target edge — './a' vs the real './b'). Post-fix: line-2 `helper`
+        // is dropped; the import-site `helper` (line 1) is also dropped (import
+        // span); a namespace re-export `export * as ns from …` `ns` drops too.
+        let t = scopes_of(
+            "m.ts",
+            b"import {helper} from './a';\nexport {helper} from './b';\nexport * as ns from './c';\n",
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "re-export-from `helper` specifier is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "ns"),
+            "namespace re-export `ns` is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_sourceless_local_reexport_stays() {
+        // REGRESSION: a SOURCELESS `export {local}` re-exports a LOCAL binding —
+        // its `local` IS a real reference and must NOT be dropped (only
+        // `export … from 'src'` specifiers drop). Resolves to the `const local`.
+        let t = scopes_of("m.ts", b"const local = 1;\nexport {local};\n");
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "local" && o.line == 2),
+            "sourceless `export {{local}}` specifier stays an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_extern_crate_name_not_occurrence() {
+        // `extern crate helper;` names a crate-binding site, never a body use.
+        // PRE-FIX the name `helper` buffered as an occurrence and false-resolved
+        // to the colliding `use a::helper`. Post-fix: NO `helper` occurrence.
+        let t = scopes_of("m.rs", b"use a::helper;\nextern crate helper;\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "extern-crate `helper` name is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_index_signature_param_not_occurrence() {
+        // `[key: string]: T` — `key` is a type-position placeholder that binds no
+        // value; PRE-FIX it buffered as an occurrence and could false-resolve to
+        // a same-spelling import. Post-fix: NO `key` occurrence.
+        let t = scopes_of("m.ts", b"interface I {\n  [key: string]: number;\n}\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "key"),
+            "index-signature param `key` is not an occurrence: {:?}",
             t.occurrences
         );
     }
