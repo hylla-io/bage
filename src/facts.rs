@@ -1288,6 +1288,12 @@ fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
     let Some(p) = node.parent() else {
         return false;
     };
+    // (1b) DEFINITION NAME site — the `name` field of any definition node (BF3):
+    // a declaration is not a use. Dropped BEFORE the per-grammar tail so it
+    // covers all four grammars uniformly.
+    if is_definition_name(lang, node, p) {
+        return true;
+    }
     match lang {
         // (2a) Rust qualified-path TRAILING segment: the `name` field of a
         // `scoped_identifier` (`crate::internal::helper` → `internal`,`helper`
@@ -1318,6 +1324,99 @@ fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
         // bare use and stays. Nothing extra beyond the import span.
         _ => false,
     }
+}
+
+/// Whether `node` is the NAME field of a DEFINITION node — a declaration SITE,
+/// never a resolvable use (BF3). Covers, per grammar: Rust `fn`/`struct`/`enum`/
+/// `union`/`trait`/`const`/`static`/`type`/`mod`/`macro_rules!` item names, trait
+/// `function_signature_item` names, assoc `fn`/`const` names in `impl`/`trait`
+/// bodies, and `enum_variant`/field names; TS/JS function (incl. ambient/overload
+/// `function_signature`)/class/interface/enum/type-alias/`namespace`+`module`
+/// declaration names plus method/field/property member declaration names; Python
+/// `def`/`class` names (incl. methods); Go func/method/type-spec/field names PLUS
+/// func-TYPE parameter names (via [`is_go_func_type_param`]). A definition NAME is
+/// ALREADY a binding via
+/// [`decl_name_binding`]/`collect_*` (run earlier off the PARENT node) — so
+/// dropping the identifier from the OCCURRENCE stream never perturbs binding
+/// collection; it only stops the fabrication where a definition name that
+/// collides with an imported name (`use origin::helper;` + `fn helper()`)
+/// resolves a false `ImportedName` and emits a phantom `Extracted` edge. A body
+/// USE of the same spelling is NOT a `name` field and is unaffected.
+fn is_definition_name(lang: Lang, node: TsNode, p: TsNode) -> bool {
+    // Go func-TYPE parameter names (`type F func(helper int)`) are declaration
+    // positions inside a `function_type` that open no scope and bind nothing —
+    // left in the stream they resolve a colliding import to a false
+    // `ImportedName`. A REAL func/method/literal param binds (LocalBinding) and
+    // stays; discriminated by the enclosing owner kind (see helper).
+    if lang == Lang::Go && is_go_func_type_param(node, p) {
+        return true;
+    }
+    let is_def_parent = match lang {
+        Lang::Rust => matches!(
+            p.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "mod_item"
+                | "macro_definition"
+                | "enum_variant"
+                | "field_declaration"
+        ),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => matches!(
+            p.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "function_signature"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+                | "public_field_definition"
+                | "property_signature"
+                | "enum_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "internal_module"
+                | "module"
+        ),
+        Lang::Python => matches!(p.kind(), "function_definition" | "class_definition"),
+        Lang::Go => matches!(
+            p.kind(),
+            "function_declaration" | "method_declaration" | "type_spec" | "field_declaration"
+        ),
+        _ => false,
+    };
+    is_def_parent && p.child_by_field_name("name") == Some(node)
+}
+
+/// Whether `node` is the `name` of a `parameter_declaration` whose IMMEDIATE
+/// enclosing owner is a Go `function_type` — i.e. a func-TYPE parameter name
+/// (`type F func(helper int)`, or a nested `func real(cb func(helper int))`).
+/// Such names are pure type-position placeholders: no scope is opened and no
+/// binding is collected, so left in the occurrence stream they resolve a
+/// same-spelled import to a false definite `ImportedName` (phantom `Extracted`
+/// edge). A REAL parameter lives under a `function_declaration`/
+/// `method_declaration`/`func_literal` `parameter_list` — its owner is NOT
+/// `function_type`, so it is left to bind (LocalBinding) and stay.
+fn is_go_func_type_param(node: TsNode, p: TsNode) -> bool {
+    if p.kind() != "parameter_declaration" || p.child_by_field_name("name") != Some(node) {
+        return false;
+    }
+    let Some(plist) = p.parent() else {
+        return false;
+    };
+    plist
+        .parent()
+        .is_some_and(|owner| owner.kind() == "function_type")
 }
 
 /// Whether `node` lies anywhere inside an import/use/from-import declaration.
@@ -2993,6 +3092,205 @@ mod tests {
             resolution_on_line(&t, "helper", 5),
             Resolution::Undecidable,
             "sibling h cannot see g's body import"
+        );
+    }
+
+    /// Whether NO occurrence of `name` sits on 1-based `line` (a definition-name
+    /// site must be absent from the occurrence stream, BF3).
+    fn no_occurrence_on_line(t: &ScopeTree, name: &str, line: usize) -> bool {
+        !t.occurrences
+            .iter()
+            .any(|o| o.name == name && o.line == line)
+    }
+
+    #[test]
+    fn bf3_rust_assoc_fn_const_and_variant_names_are_not_occurrences() {
+        // BF3: an assoc-fn/const NAME and an enum-variant NAME are DEFINITION
+        // sites, never uses — dropped from the stream so a same-spelling import
+        // cannot coerce a false `ImportedName` (the fabricated `Extracted` edge).
+        // A BODY use of the same name still resolves `ImportedName`.
+        let src = b"use crate::origin::helper;\nimpl S {\n    pub fn helper() {}\n    const helper2: u8 = 0;\n}\nenum E { helper }\nfn m() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "assoc-fn name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper2", 4),
+            "assoc-const name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper", 6),
+            "enum-variant name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 8),
+            Resolution::ImportedName,
+            "a BODY use of the imported name still resolves ImportedName"
+        );
+    }
+
+    #[test]
+    fn bf3_python_method_name_is_not_an_occurrence() {
+        // BF3: a Python method (`def`) NAME is a definition site — dropped —
+        // while a body use of the same imported spelling still resolves.
+        let src =
+            b"from mod import helper\nclass C:\n    def helper(self):\n        return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "method def name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "the body call still resolves the top-level import"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_class_member_and_fn_names_are_not_occurrences() {
+        // BF3: a TS function-declaration NAME and class-member (method/field)
+        // NAMES are definition sites, absent from the stream; a body use of the
+        // imported spelling still resolves ImportedName.
+        let src =
+            b"import { helper } from 'm';\nclass C {\n  helper() {}\n  helper2 = 1;\n}\nfunction helper3() { return helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "method name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper2", 4),
+            "field name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper3", 6),
+            "function-decl name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::ImportedName,
+            "the body call still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_rust_macro_definition_name_is_not_an_occurrence() {
+        // BF3: a `macro_rules!` NAME is a definition site — dropped — so a
+        // colliding `use origin::helper;` cannot coerce a false `ImportedName`
+        // (the fabricated `Extracted` edge). A body use still resolves.
+        let src =
+            b"use origin::helper;\nmacro_rules! helper { () => {} }\nfn m() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "macro_rules! name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "a body use of the imported name still resolves ImportedName"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_function_signature_names_are_not_occurrences() {
+        // BF3: ambient `declare function` AND overload `function_signature`
+        // NAMES are definition sites, absent from the stream; the implementing
+        // body use of the imported spelling still resolves ImportedName.
+        let src = b"import { helper } from 'm';\ndeclare function helper(): void;\nfunction over(a: number): void;\nfunction over(a: string): void { helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "declare-function name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "over", 3),
+            "overload-signature name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "over", 4),
+            "implementing-decl name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "the body call still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_namespace_and_module_names_are_not_occurrences() {
+        // BF3: `namespace` (internal_module) and `module` declaration NAMES are
+        // definition sites — dropped — so a colliding import is not fabricated
+        // at the name site; a body use still resolves ImportedName.
+        let src = b"import { helper } from 'm';\nnamespace helper { export const x = 1; }\nmodule other { export const y = helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "namespace name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "other", 3),
+            "module name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "the body use still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_go_func_and_method_names_are_not_occurrences() {
+        // BF3: a top-level `func` NAME colliding with an import alias is a
+        // definition site — dropped — while a body use resolves the (hoisted)
+        // func binding (LocalBinding). Method names are `field_identifier` and
+        // never reach the occurrence stream regardless.
+        let src = b"package p\nimport helper \"pkg\"\nfunc helper() {}\ntype R struct{}\nfunc (r R) m() { helper() }\n";
+        let t = scopes_of("m.go", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "func-decl name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            matches!(
+                resolution_on_line(&t, "helper", 5),
+                Resolution::LocalBinding { .. }
+            ),
+            "a body use resolves the hoisted top-level func binding: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf3_go_func_type_param_dropped_real_param_still_binds() {
+        // BF3: a func-TYPE parameter name (`type F func(helper int)`) opens no
+        // scope and binds nothing — dropped so it cannot resolve a colliding
+        // import to a false ImportedName. A REAL func parameter of the same
+        // spelling still binds and resolves LocalBinding in both directions.
+        let src = b"package p\nimport helper \"pkg\"\ntype F func(helper int)\nfunc real(helper int) int { return helper }\n";
+        let t = scopes_of("m.go", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "func-type param name is dropped: {:?}",
+            t.occurrences
+        );
+        assert!(
+            matches!(
+                resolution_on_line(&t, "helper", 4),
+                Resolution::LocalBinding { .. }
+            ),
+            "a real-func param use of the same spelling still binds locally: {:?}",
+            t.occurrences
         );
     }
 
