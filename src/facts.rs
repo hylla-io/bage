@@ -79,14 +79,37 @@ pub enum ExportKind {
     Other,
 }
 
+/// The visibility of a re-export row (BF4). `Public` = a crate-external `pub`;
+/// `Restricted` = a bounded `pub(crate)`/`pub(super)`/`pub(in path)` — NOT a
+/// crate-external export, but EMITTED for re-exports (never own decls) so a
+/// consumer can detect own-decl-vs-reexport COEXISTENCE at a facade (existence
+/// is what matters, not the exact bounding scope). Non-Rust exports are always
+/// `Public` — TS/JS carry no restricted module-export visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportVisibility {
+    /// A crate-external `pub` export (every own decl, every non-Rust export).
+    Public,
+    /// A Rust `pub(crate)`/`pub(super)`/`pub(in path)` re-export — bounded, not
+    /// crate-external; emitted for coexistence detection, never treated public.
+    Restricted,
+}
+
 /// A single export construct, normalized across languages. `name` is the
-/// exported symbol (`*`/`default` for glob/default exports); `kind` is its
-/// syntactic category; `re_exported_from` carries the source module when the
-/// export forwards another module's symbol (Rust `pub use`, TS `export … from`);
-/// `alias` is the exported-as name when renamed (`export { x as y }`).
+/// exported symbol (`*`/`default` for glob/default exports; a re-export LEAF —
+/// brace-group items are flattened to the leaf name with the intermediate path
+/// folded into `re_exported_from`, mirroring the import-leg recursion, BF4);
+/// `kind` is its syntactic category; `re_exported_from` carries the source
+/// module when the export forwards another module's symbol (Rust `pub use`, TS
+/// `export … from`); `alias` is the exported-as name when renamed
+/// (`export { x as y }`, `export * as ns from`); `glob` marks a wildcard
+/// re-export (`pub use a::*`, `export * from`, `export * as ns from`) whose
+/// members are unknown — a glob row beside a same-name own decl makes the
+/// facade AMBIGUOUS (BF4); `visibility` distinguishes a bounded restricted Rust
+/// re-export from a public one (BF4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportFact {
-    /// The exported symbol name (`*` glob, `default` default export).
+    /// The exported symbol name (`*` glob, `default` default export, else leaf).
     pub name: String,
     /// The syntactic category of the export.
     pub kind: ExportKind,
@@ -94,6 +117,11 @@ pub struct ExportFact {
     pub re_exported_from: Option<String>,
     /// The exported-as alias when the export renames the symbol.
     pub alias: Option<String>,
+    /// Whether this is a wildcard re-export (members unknown; `name` == `*`).
+    pub glob: bool,
+    /// `Restricted` for a `pub(crate)`/`pub(super)`/`pub(in …)` Rust re-export;
+    /// `Public` for a bare `pub` export and every non-Rust export.
+    pub visibility: ExportVisibility,
 }
 
 /// The result of fact extraction over one file. `Unsupported` is the typed
@@ -405,18 +433,31 @@ fn strip_crate_root(source: String) -> String {
         .unwrap_or(source)
 }
 
-/// Rust exports: `pub` item declarations plus `pub use` re-exports. A `pub use`
-/// yields one [`ExportFact`] per re-exported item (kind [`ExportKind::Reexport`],
-/// `re_exported_from` = the use source); a `pub` fn/struct/enum/trait/const/
-/// static/mod/type/union yields a kind-tagged export. Restricted visibilities
-/// (`pub(crate)`) are NOT public exports.
+/// Rust exports: `pub` item declarations plus `pub`/restricted `use`
+/// re-exports (BF4). A public OR restricted `use` yields one [`ExportFact`] per
+/// re-exported item (kind [`ExportKind::Reexport`], `re_exported_from` = the use
+/// source); a plain (visibility-less) `use` is a private import and yields NO
+/// export. A `pub` fn/struct/enum/trait/const/static/mod/type/union yields a
+/// kind-tagged export. Own item declarations stay PUBLIC-only (restricted own
+/// decls are not exports); ONLY re-exports carry a `Restricted` visibility, so a
+/// consumer can spot a bounded re-export coexisting with a same-name own decl.
+///
+/// BF4 re-export shaping (mirrors the import-leg recursion): a brace-group item
+/// (`pub use crate::{a::X}` → item `a::X` under source `crate`) is FLATTENED to
+/// leaf `X` with the intermediate path folded in (`re_exported_from = crate::a`),
+/// and a glob leaf (`pub use crate::a::*` OR nested `crate::{a::*}`) is emitted
+/// as a `glob=true` row (`name = *`, `re_exported_from` = the globbed module) so
+/// a facade glob-re-export beside a same-name own decl reads as AMBIGUOUS.
 fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
     let mut out = Vec::new();
-    // `pub use` re-exports (query use_declarations; keep only public ones).
+    // `use` re-exports: keep `pub` (Public) AND `pub(crate)`/`pub(super)`/
+    // `pub(in …)` (Restricted); a visibility-less `use` is a private import.
     for u in query_nodes("(use_declaration) @u", lang, root, src) {
-        if !has_pub_visibility(u, src) {
-            continue;
-        }
+        let visibility = match use_visibility(u, src) {
+            UseVisibility::Private => continue,
+            UseVisibility::Public => ExportVisibility::Public,
+            UseVisibility::Restricted => ExportVisibility::Restricted,
+        };
         let Some(arg) = u.child_by_field_name("argument") else {
             continue;
         };
@@ -428,19 +469,71 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
                 kind: ExportKind::Reexport,
                 re_exported_from: Some(source),
                 alias: None,
+                glob: true,
+                visibility,
+            });
+        } else if items.is_empty() && !source.is_empty() {
+            // Bare-identifier module re-export (`pub use util;` / `pub use
+            // serde;`): rust_use_arg yields a non-empty source with NO items and
+            // no glob. Without a row here the publicly re-exported module is
+            // invisible and a same-name export elsewhere reads as false-unique
+            // (BF4 BLOCKER). `name` = the source's last `::` segment (a bare
+            // identifier has one); `re_exported_from` = its parent, or the full
+            // source when unqualified.
+            let (parent, leaf) = match source.rsplit_once("::") {
+                Some((p, l)) => (p.to_string(), l.to_string()),
+                None => (source.clone(), source.clone()),
+            };
+            out.push(ExportFact {
+                name: leaf,
+                kind: ExportKind::Reexport,
+                re_exported_from: Some(parent),
+                alias: None,
+                glob: false,
+                visibility,
             });
         } else {
             for it in items {
+                // Split a brace-group leaf: `a::X` under source `crate` folds the
+                // intermediate `a` into the source, leaving leaf `X`; a glob leaf
+                // (`a::*`/`*`) becomes a `glob=true` `*` row over the module.
+                let (leaf_source, leaf_name, item_glob) = split_reexport_item(&source, &it.name);
                 out.push(ExportFact {
-                    name: it.name,
+                    name: leaf_name,
                     kind: ExportKind::Reexport,
-                    re_exported_from: Some(source.clone()),
+                    re_exported_from: Some(leaf_source),
                     alias: it.alias,
+                    glob: item_glob,
+                    visibility,
                 });
             }
         }
     }
-    // `pub` item declarations.
+    // `pub extern crate foo [as bar];` re-exports the external crate root under
+    // `foo` (or its alias) — a pre-2018 facade idiom. A visibility-less `extern
+    // crate` is a private dependency binding, NOT an export; `pub`/restricted
+    // yields a Reexport row (name = crate, source = the crate itself, alias from
+    // the `as` clause) so the re-exported name is not hidden (BF4 MAJOR).
+    for e in query_nodes("(extern_crate_declaration) @e", lang, root, src) {
+        let visibility = match use_visibility(e, src) {
+            UseVisibility::Private => continue,
+            UseVisibility::Public => ExportVisibility::Public,
+            UseVisibility::Restricted => ExportVisibility::Restricted,
+        };
+        let Some(name) = e.child_by_field_name("name").map(|n| ntext(n, src)) else {
+            continue;
+        };
+        let alias = e.child_by_field_name("alias").map(|a| ntext(a, src));
+        out.push(ExportFact {
+            re_exported_from: Some(name.clone()),
+            name,
+            kind: ExportKind::Reexport,
+            alias,
+            glob: false,
+            visibility,
+        });
+    }
+    // `pub` item declarations (own decls stay PUBLIC-only).
     let q = "[(function_item) (struct_item) (enum_item) (trait_item) (const_item) (static_item) (mod_item) (type_item) (union_item)] @item";
     for item in query_nodes(q, lang, root, src) {
         if !has_pub_visibility(item, src) {
@@ -455,9 +548,82 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
             kind: rust_item_kind(item.kind()),
             re_exported_from: None,
             alias: None,
+            glob: false,
+            visibility: ExportVisibility::Public,
         });
     }
     out
+}
+
+/// The visibility class of a Rust `use_declaration` (BF4). `Private` = no
+/// `visibility_modifier` (a plain import, NOT a re-export); `Public` = a bare
+/// `pub`; `Restricted` = a bounded `pub(crate)`/`pub(super)`/`pub(in path)`.
+/// Bounded re-exports are surfaced (unlike bounded own decls) because a
+/// consumer needs their EXISTENCE to detect own-decl-vs-reexport coexistence.
+enum UseVisibility {
+    /// No visibility modifier — a private import, never a re-export.
+    Private,
+    /// A bare `pub` — a crate-external re-export.
+    Public,
+    /// A `pub(crate)`/`pub(super)`/`pub(in path)` — a bounded re-export.
+    Restricted,
+}
+
+/// Classifies a `use_declaration`'s [`UseVisibility`]: the first
+/// `visibility_modifier` child decides — text exactly `pub` → `Public`, any
+/// `pub(…)` form → `Restricted`, absent → `Private`.
+fn use_visibility(n: TsNode, src: &[u8]) -> UseVisibility {
+    for i in 0..n.named_child_count() {
+        if let Some(c) = n.named_child(i as u32)
+            && c.kind() == "visibility_modifier"
+        {
+            return if ntext(c, src).trim() == "pub" {
+                UseVisibility::Public
+            } else {
+                UseVisibility::Restricted
+            };
+        }
+    }
+    UseVisibility::Private
+}
+
+/// Splits a re-export item's (possibly brace-group-qualified) `item_name` into
+/// its true `(source, leaf, glob)`, mirroring the import-leg leaf recursion
+/// (BF4). A glob leaf (`*` or `path::*`) returns `(source[::path], "*", true)`;
+/// a `{self}` leaf (`self` or `path::self`) re-exports the ENCLOSING module
+/// itself, resolved to the full module path then split into leaf + parent so
+/// `pub use a::b::{self}` reads as name `b` from `a` (NEVER a literal `self`
+/// binding — BF4 MAJOR); a qualified leaf (`a::X`) folds every path segment
+/// before the LAST `::` into the source (`(source::a, "X", false)`); a bare leaf
+/// passes through (`(source, item_name, false)`). `source` is the group's shared
+/// path prefix.
+fn split_reexport_item(source: &str, item_name: &str) -> (String, String, bool) {
+    if item_name == "*" {
+        return (source.to_string(), "*".to_string(), true);
+    }
+    if let Some(prefix) = item_name.strip_suffix("::*") {
+        return (qualify(source, prefix), "*".to_string(), true);
+    }
+    // `{self}`: the re-exported symbol is the enclosing module. Resolve its full
+    // path (`source` folded with any nested prefix before `self`), then split
+    // leaf/parent — `name` MUST be the module leaf, not the token `self`.
+    let self_path = if item_name == "self" {
+        Some(source.to_string())
+    } else {
+        item_name
+            .strip_suffix("::self")
+            .map(|prefix| qualify(source, prefix))
+    };
+    if let Some(resolved) = self_path {
+        return match resolved.rsplit_once("::") {
+            Some((parent, leaf)) => (parent.to_string(), leaf.to_string(), false),
+            None => (resolved.clone(), resolved, false),
+        };
+    }
+    match item_name.rsplit_once("::") {
+        Some((prefix, leaf)) => (qualify(source, prefix), leaf.to_string(), false),
+        None => (source.to_string(), item_name.to_string(), false),
+    }
 }
 
 /// Maps a Rust item node kind to an [`ExportKind`].
@@ -557,9 +723,13 @@ fn ts_named_imports(group: TsNode, src: &[u8], items: &mut Vec<ImportedItem>) {
 }
 
 /// TS/JS exports: every `export_statement`. Covers `export { … }` (optionally
-/// `from` another module → re-export), `export * from`, `export default …`,
+/// `from` another module → re-export), `export * from`, `export * as ns from`
+/// (a namespace glob re-export whose alias is preserved, BF4), `export default …`,
 /// and `export`-prefixed declarations (const/function/class/interface/type/
 /// enum). `export … from` is modeled here as a re-export, never as an import.
+/// TS/JS have no restricted module-export visibility, so every row is `Public`;
+/// TS re-export leaves are already leaf names (no brace-path mangling), so no
+/// leaf-split is needed — only the glob flag and the `* as ns` alias were gaps.
 fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
     let mut out = Vec::new();
     for stmt in query_nodes("(export_statement) @e", lang, root, src) {
@@ -589,8 +759,23 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                     name,
                     re_exported_from: source.clone(),
                     alias,
+                    glob: false,
+                    visibility: ExportVisibility::Public,
                 });
             }
+        } else if let Some(ns) = child_of_kind(stmt, "namespace_export") {
+            // `export * as ns from 'm'` — a namespace glob re-export; the alias
+            // (`ns`) is the sole named child. Preserve it (BF4: bage previously
+            // collapsed this to `*`/no-alias, losing the exported namespace name).
+            let alias = ns.named_child(0).map(|n| ntext(n, src));
+            out.push(ExportFact {
+                name: "*".to_string(),
+                kind: ExportKind::Reexport,
+                re_exported_from: source.clone(),
+                alias,
+                glob: true,
+                visibility: ExportVisibility::Public,
+            });
         } else if let Some(decl) = stmt.child_by_field_name("declaration") {
             ts_decl_exports(decl, src, &mut out);
         } else if stmt.child_by_field_name("value").is_some() {
@@ -600,6 +785,8 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                 kind: ExportKind::Default,
                 re_exported_from: None,
                 alias: None,
+                glob: false,
+                visibility: ExportVisibility::Public,
             });
         } else if let Some(from) = source {
             // `export * from 'm'` — a glob re-export (no clause/decl/value).
@@ -608,6 +795,8 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                 kind: ExportKind::Reexport,
                 re_exported_from: Some(from),
                 alias: None,
+                glob: true,
+                visibility: ExportVisibility::Public,
             });
         }
     }
@@ -645,6 +834,8 @@ fn ts_decl_exports(decl: TsNode, src: &[u8], out: &mut Vec<ExportFact>) {
                     kind: ExportKind::Variable,
                     re_exported_from: None,
                     alias: None,
+                    glob: false,
+                    visibility: ExportVisibility::Public,
                 });
             }
         }
@@ -663,6 +854,8 @@ fn push_named(decl: TsNode, kind: ExportKind, src: &[u8], out: &mut Vec<ExportFa
         kind,
         re_exported_from: None,
         alias: None,
+        glob: false,
+        visibility: ExportVisibility::Public,
     });
 }
 
@@ -2723,6 +2916,201 @@ mod tests {
             .find(|e| e.kind == ExportKind::Reexport && e.name == "Thing")
             .expect("pub use export");
         assert_eq!(ex.re_exported_from.as_deref(), Some("crate::m"));
+        // BF4: a bare `pub use` is a Public, non-glob re-export row.
+        assert_eq!(ex.visibility, ExportVisibility::Public);
+        assert!(!ex.glob);
+    }
+
+    // BF4 class 1: restricted-visibility re-exports (`pub(crate)`/`pub(super)`/
+    // `pub(in …)` use) are EMITTED as `Restricted` rows (existence is what a
+    // consumer needs to spot own-decl-vs-reexport coexistence); a plain
+    // (visibility-less) `use` stays a private import with NO export row.
+    #[test]
+    fn rust_restricted_visibility_reexports_emitted() {
+        let src = b"pub(crate) use crate::a::X;\npub(super) use crate::b::Y;\npub(in crate::z) use crate::c::W;\nuse crate::d::Priv;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let by = |n: &str| exports.iter().find(|e| e.name == n).unwrap();
+        // pub(crate) re-export → Restricted, source folded correctly.
+        let x = by("X");
+        assert_eq!(x.kind, ExportKind::Reexport);
+        assert_eq!(x.visibility, ExportVisibility::Restricted);
+        assert_eq!(x.re_exported_from.as_deref(), Some("crate::a"));
+        assert!(!x.glob);
+        assert_eq!(by("Y").visibility, ExportVisibility::Restricted);
+        assert_eq!(by("W").visibility, ExportVisibility::Restricted);
+        assert_eq!(by("W").re_exported_from.as_deref(), Some("crate::c"));
+        // A plain `use` is NOT a re-export (no export row).
+        assert!(
+            exports.iter().all(|e| e.name != "Priv"),
+            "visibility-less use is a private import, never exported"
+        );
+    }
+
+    // BF4 class 2: a brace-group re-export item is FLATTENED to its leaf name
+    // with the intermediate path folded into `re_exported_from` (mirrors the
+    // import-leg recursion) — never the path-mangled `a::X` name.
+    #[test]
+    fn rust_brace_group_reexport_flattened_to_leaf() {
+        let src = b"pub use crate::{a::X, b::c::Y as Z};\npub use crate::d::{E, F};\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        // `a::X` → leaf `X`, source `crate::a` (NOT name "a::X").
+        let x = exports.iter().find(|e| e.name == "X").unwrap();
+        assert_eq!(x.re_exported_from.as_deref(), Some("crate::a"));
+        assert!(
+            exports.iter().all(|e| e.name != "a::X"),
+            "leaf, not mangled"
+        );
+        // Deeper group + alias: `b::c::Y as Z` → leaf `Y`, source `crate::b::c`,
+        // alias `Z`.
+        let y = exports.iter().find(|e| e.name == "Y").unwrap();
+        assert_eq!(y.re_exported_from.as_deref(), Some("crate::b::c"));
+        assert_eq!(y.alias.as_deref(), Some("Z"));
+        // Sibling shared-prefix group items each keep the shared source.
+        let e = exports.iter().find(|e| e.name == "E").unwrap();
+        let f = exports.iter().find(|e| e.name == "F").unwrap();
+        assert_eq!(e.re_exported_from.as_deref(), Some("crate::d"));
+        assert_eq!(f.re_exported_from.as_deref(), Some("crate::d"));
+    }
+
+    // BF4 class 3: glob re-exports (`pub use a::*`, incl. nested-in-group
+    // `{a::*}`) emit a `glob=true` `*` row over the globbed module, so a facade
+    // glob re-export beside a same-name own decl reads as ambiguous.
+    #[test]
+    fn rust_glob_reexport_flagged() {
+        let src =
+            b"pub use crate::a::*;\npub use crate::{b::*, c::Keep};\npub(crate) use crate::d::*;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let globs: Vec<_> = exports.iter().filter(|e| e.glob).collect();
+        // Top-level glob over crate::a.
+        assert!(
+            globs
+                .iter()
+                .any(|e| e.name == "*" && e.re_exported_from.as_deref() == Some("crate::a")),
+            "top-level glob flagged"
+        );
+        // Nested-in-group glob over crate::b (sibling `Keep` stays a leaf row).
+        assert!(
+            globs
+                .iter()
+                .any(|e| e.re_exported_from.as_deref() == Some("crate::b")),
+            "nested-group glob flagged"
+        );
+        let keep = exports.iter().find(|e| e.name == "Keep").unwrap();
+        assert!(!keep.glob);
+        assert_eq!(keep.re_exported_from.as_deref(), Some("crate::c"));
+        // Restricted glob keeps both flags.
+        let d = globs
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("crate::d"))
+            .unwrap();
+        assert_eq!(d.visibility, ExportVisibility::Restricted);
+        assert!(d.glob && d.name == "*");
+    }
+
+    // BF4 TS sweep: `export * from` and `export * as ns from` are glob-flagged;
+    // the `* as ns` namespace alias is preserved (previously dropped).
+    #[test]
+    fn ts_glob_and_namespace_reexports_flagged() {
+        let src = b"export * from './a';\nexport * as ns from './b';\nexport { x } from './c';\n";
+        let (_i, exports) = supported(facts_of("m.ts", src));
+        let star = exports
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("./a"))
+            .unwrap();
+        assert!(star.glob && star.name == "*" && star.alias.is_none());
+        assert_eq!(star.visibility, ExportVisibility::Public);
+        // `* as ns` — glob row, alias preserved.
+        let ns = exports
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("./b"))
+            .unwrap();
+        assert!(ns.glob && ns.name == "*");
+        assert_eq!(ns.alias.as_deref(), Some("ns"));
+        // A named re-export is not a glob.
+        let x = exports.iter().find(|e| e.name == "x").unwrap();
+        assert!(!x.glob);
+    }
+
+    // BF4 BLOCKER: a bare-identifier module re-export (`pub use util;`) emits ONE
+    // Reexport row named after the module — without it the publicly re-exported
+    // module is invisible and a same-name export elsewhere reads as false-unique.
+    #[test]
+    fn rust_bare_module_reexport_emitted() {
+        let src = b"mod util;\npub use util;\npub use serde;\nuse priv_dep;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let util = exports
+            .iter()
+            .find(|e| e.name == "util" && e.kind == ExportKind::Reexport)
+            .expect("bare module re-export emitted");
+        assert_eq!(util.re_exported_from.as_deref(), Some("util"));
+        assert!(!util.glob && util.alias.is_none());
+        assert_eq!(util.visibility, ExportVisibility::Public);
+        // A second bare module re-export also surfaces.
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.name == "serde" && e.kind == ExportKind::Reexport),
+            "pub use serde surfaced"
+        );
+        // A visibility-less `use` is a private import — NO export row.
+        assert!(
+            exports.iter().all(|e| e.name != "priv_dep"),
+            "plain use never exported"
+        );
+    }
+
+    // BF4 MAJOR: `pub use module::{self}` re-exports the MODULE (leaf of the
+    // source), never a literal `self` binding; `{self as r}` keeps the alias.
+    #[test]
+    fn rust_use_list_self_reexports_module_leaf() {
+        let src = b"pub use crate::sub::{self, Thing};\npub use crate::other::{self as r};\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        // No literal `self` name ever leaks.
+        assert!(
+            exports.iter().all(|e| e.name != "self"),
+            "no literal self name"
+        );
+        // `{self}` → name = module leaf `sub`, source = its parent `crate`.
+        let sub = exports
+            .iter()
+            .find(|e| e.name == "sub" && e.kind == ExportKind::Reexport)
+            .expect("self → module leaf");
+        assert_eq!(sub.re_exported_from.as_deref(), Some("crate"));
+        assert!(sub.alias.is_none());
+        // A sibling leaf in the same group still flattens normally.
+        let thing = exports.iter().find(|e| e.name == "Thing").unwrap();
+        assert_eq!(thing.re_exported_from.as_deref(), Some("crate::sub"));
+        // `{self as r}` → module leaf `other`, alias preserved.
+        let other = exports.iter().find(|e| e.name == "other").unwrap();
+        assert_eq!(other.re_exported_from.as_deref(), Some("crate"));
+        assert_eq!(other.alias.as_deref(), Some("r"));
+    }
+
+    // BF4 MAJOR: `pub extern crate foo [as bar];` re-exports the crate root; a
+    // visibility-less `extern crate` is a private binding (no row).
+    #[test]
+    fn rust_pub_extern_crate_reexported() {
+        let src = b"pub extern crate serde;\npub extern crate rustc_ast as ast;\npub(crate) extern crate alloc;\nextern crate core;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let serde = exports
+            .iter()
+            .find(|e| e.name == "serde")
+            .expect("pub extern crate emitted");
+        assert_eq!(serde.kind, ExportKind::Reexport);
+        assert_eq!(serde.re_exported_from.as_deref(), Some("serde"));
+        assert_eq!(serde.visibility, ExportVisibility::Public);
+        assert!(serde.alias.is_none() && !serde.glob);
+        // Aliased extern crate: name = crate, alias = the `as` clause.
+        let ast = exports.iter().find(|e| e.name == "rustc_ast").unwrap();
+        assert_eq!(ast.alias.as_deref(), Some("ast"));
+        // Restricted extern crate → Restricted visibility.
+        let alloc = exports.iter().find(|e| e.name == "alloc").unwrap();
+        assert_eq!(alloc.visibility, ExportVisibility::Restricted);
+        // A visibility-less extern crate is a private binding — NO export row.
+        assert!(
+            exports.iter().all(|e| e.name != "core"),
+            "plain extern crate never exported"
+        );
     }
 
     #[test]
@@ -3006,22 +3394,26 @@ mod tests {
 
     #[test]
     fn rust_pub_use_group_reexports_each_leaf() {
-        // `pub use crate::{a::B, c::D}`: one Reexport ExportFact per leaf,
-        // never a composite — and the import side flags re_export.
+        // `pub use crate::{a::B, c::D}`: one Reexport ExportFact per LEAF
+        // (BF4 — flattened to leaf name, group path folded into
+        // `re_exported_from`), never a composite/path-mangled name; the import
+        // side flags re_export.
         let (imports, exports) = supported(facts_of("m.rs", b"pub use crate::{a::B, c::D};\n"));
         let re = imports.iter().find(|i| i.re_export).expect("pub use");
         assert_eq!(re.source_specifier, "crate");
-        for name in ["a::B", "c::D"] {
+        for (name, from) in [("B", "crate::a"), ("D", "crate::c")] {
             assert!(
                 exports.iter().any(|e| e.kind == ExportKind::Reexport
                     && e.name == name
-                    && e.re_exported_from.as_deref() == Some("crate")),
-                "reexport {name} in {exports:?}"
+                    && e.re_exported_from.as_deref() == Some(from)),
+                "reexport {name} from {from} in {exports:?}"
             );
         }
         assert!(
-            !exports.iter().any(|e| e.name.contains('{')),
-            "no composite reexport name"
+            !exports
+                .iter()
+                .any(|e| e.name.contains('{') || e.name.contains("::")),
+            "no composite/path-mangled reexport name"
         );
     }
 
