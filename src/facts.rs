@@ -79,14 +79,37 @@ pub enum ExportKind {
     Other,
 }
 
+/// The visibility of a re-export row (BF4). `Public` = a crate-external `pub`;
+/// `Restricted` = a bounded `pub(crate)`/`pub(super)`/`pub(in path)` — NOT a
+/// crate-external export, but EMITTED for re-exports (never own decls) so a
+/// consumer can detect own-decl-vs-reexport COEXISTENCE at a facade (existence
+/// is what matters, not the exact bounding scope). Non-Rust exports are always
+/// `Public` — TS/JS carry no restricted module-export visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportVisibility {
+    /// A crate-external `pub` export (every own decl, every non-Rust export).
+    Public,
+    /// A Rust `pub(crate)`/`pub(super)`/`pub(in path)` re-export — bounded, not
+    /// crate-external; emitted for coexistence detection, never treated public.
+    Restricted,
+}
+
 /// A single export construct, normalized across languages. `name` is the
-/// exported symbol (`*`/`default` for glob/default exports); `kind` is its
-/// syntactic category; `re_exported_from` carries the source module when the
-/// export forwards another module's symbol (Rust `pub use`, TS `export … from`);
-/// `alias` is the exported-as name when renamed (`export { x as y }`).
+/// exported symbol (`*`/`default` for glob/default exports; a re-export LEAF —
+/// brace-group items are flattened to the leaf name with the intermediate path
+/// folded into `re_exported_from`, mirroring the import-leg recursion, BF4);
+/// `kind` is its syntactic category; `re_exported_from` carries the source
+/// module when the export forwards another module's symbol (Rust `pub use`, TS
+/// `export … from`); `alias` is the exported-as name when renamed
+/// (`export { x as y }`, `export * as ns from`); `glob` marks a wildcard
+/// re-export (`pub use a::*`, `export * from`, `export * as ns from`) whose
+/// members are unknown — a glob row beside a same-name own decl makes the
+/// facade AMBIGUOUS (BF4); `visibility` distinguishes a bounded restricted Rust
+/// re-export from a public one (BF4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportFact {
-    /// The exported symbol name (`*` glob, `default` default export).
+    /// The exported symbol name (`*` glob, `default` default export, else leaf).
     pub name: String,
     /// The syntactic category of the export.
     pub kind: ExportKind,
@@ -94,6 +117,11 @@ pub struct ExportFact {
     pub re_exported_from: Option<String>,
     /// The exported-as alias when the export renames the symbol.
     pub alias: Option<String>,
+    /// Whether this is a wildcard re-export (members unknown; `name` == `*`).
+    pub glob: bool,
+    /// `Restricted` for a `pub(crate)`/`pub(super)`/`pub(in …)` Rust re-export;
+    /// `Public` for a bare `pub` export and every non-Rust export.
+    pub visibility: ExportVisibility,
 }
 
 /// The result of fact extraction over one file. `Unsupported` is the typed
@@ -405,18 +433,31 @@ fn strip_crate_root(source: String) -> String {
         .unwrap_or(source)
 }
 
-/// Rust exports: `pub` item declarations plus `pub use` re-exports. A `pub use`
-/// yields one [`ExportFact`] per re-exported item (kind [`ExportKind::Reexport`],
-/// `re_exported_from` = the use source); a `pub` fn/struct/enum/trait/const/
-/// static/mod/type/union yields a kind-tagged export. Restricted visibilities
-/// (`pub(crate)`) are NOT public exports.
+/// Rust exports: `pub` item declarations plus `pub`/restricted `use`
+/// re-exports (BF4). A public OR restricted `use` yields one [`ExportFact`] per
+/// re-exported item (kind [`ExportKind::Reexport`], `re_exported_from` = the use
+/// source); a plain (visibility-less) `use` is a private import and yields NO
+/// export. A `pub` fn/struct/enum/trait/const/static/mod/type/union yields a
+/// kind-tagged export. Own item declarations stay PUBLIC-only (restricted own
+/// decls are not exports); ONLY re-exports carry a `Restricted` visibility, so a
+/// consumer can spot a bounded re-export coexisting with a same-name own decl.
+///
+/// BF4 re-export shaping (mirrors the import-leg recursion): a brace-group item
+/// (`pub use crate::{a::X}` → item `a::X` under source `crate`) is FLATTENED to
+/// leaf `X` with the intermediate path folded in (`re_exported_from = crate::a`),
+/// and a glob leaf (`pub use crate::a::*` OR nested `crate::{a::*}`) is emitted
+/// as a `glob=true` row (`name = *`, `re_exported_from` = the globbed module) so
+/// a facade glob-re-export beside a same-name own decl reads as AMBIGUOUS.
 fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
     let mut out = Vec::new();
-    // `pub use` re-exports (query use_declarations; keep only public ones).
+    // `use` re-exports: keep `pub` (Public) AND `pub(crate)`/`pub(super)`/
+    // `pub(in …)` (Restricted); a visibility-less `use` is a private import.
     for u in query_nodes("(use_declaration) @u", lang, root, src) {
-        if !has_pub_visibility(u, src) {
-            continue;
-        }
+        let visibility = match use_visibility(u, src) {
+            UseVisibility::Private => continue,
+            UseVisibility::Public => ExportVisibility::Public,
+            UseVisibility::Restricted => ExportVisibility::Restricted,
+        };
         let Some(arg) = u.child_by_field_name("argument") else {
             continue;
         };
@@ -428,19 +469,71 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
                 kind: ExportKind::Reexport,
                 re_exported_from: Some(source),
                 alias: None,
+                glob: true,
+                visibility,
+            });
+        } else if items.is_empty() && !source.is_empty() {
+            // Bare-identifier module re-export (`pub use util;` / `pub use
+            // serde;`): rust_use_arg yields a non-empty source with NO items and
+            // no glob. Without a row here the publicly re-exported module is
+            // invisible and a same-name export elsewhere reads as false-unique
+            // (BF4 BLOCKER). `name` = the source's last `::` segment (a bare
+            // identifier has one); `re_exported_from` = its parent, or the full
+            // source when unqualified.
+            let (parent, leaf) = match source.rsplit_once("::") {
+                Some((p, l)) => (p.to_string(), l.to_string()),
+                None => (source.clone(), source.clone()),
+            };
+            out.push(ExportFact {
+                name: leaf,
+                kind: ExportKind::Reexport,
+                re_exported_from: Some(parent),
+                alias: None,
+                glob: false,
+                visibility,
             });
         } else {
             for it in items {
+                // Split a brace-group leaf: `a::X` under source `crate` folds the
+                // intermediate `a` into the source, leaving leaf `X`; a glob leaf
+                // (`a::*`/`*`) becomes a `glob=true` `*` row over the module.
+                let (leaf_source, leaf_name, item_glob) = split_reexport_item(&source, &it.name);
                 out.push(ExportFact {
-                    name: it.name,
+                    name: leaf_name,
                     kind: ExportKind::Reexport,
-                    re_exported_from: Some(source.clone()),
+                    re_exported_from: Some(leaf_source),
                     alias: it.alias,
+                    glob: item_glob,
+                    visibility,
                 });
             }
         }
     }
-    // `pub` item declarations.
+    // `pub extern crate foo [as bar];` re-exports the external crate root under
+    // `foo` (or its alias) — a pre-2018 facade idiom. A visibility-less `extern
+    // crate` is a private dependency binding, NOT an export; `pub`/restricted
+    // yields a Reexport row (name = crate, source = the crate itself, alias from
+    // the `as` clause) so the re-exported name is not hidden (BF4 MAJOR).
+    for e in query_nodes("(extern_crate_declaration) @e", lang, root, src) {
+        let visibility = match use_visibility(e, src) {
+            UseVisibility::Private => continue,
+            UseVisibility::Public => ExportVisibility::Public,
+            UseVisibility::Restricted => ExportVisibility::Restricted,
+        };
+        let Some(name) = e.child_by_field_name("name").map(|n| ntext(n, src)) else {
+            continue;
+        };
+        let alias = e.child_by_field_name("alias").map(|a| ntext(a, src));
+        out.push(ExportFact {
+            re_exported_from: Some(name.clone()),
+            name,
+            kind: ExportKind::Reexport,
+            alias,
+            glob: false,
+            visibility,
+        });
+    }
+    // `pub` item declarations (own decls stay PUBLIC-only).
     let q = "[(function_item) (struct_item) (enum_item) (trait_item) (const_item) (static_item) (mod_item) (type_item) (union_item)] @item";
     for item in query_nodes(q, lang, root, src) {
         if !has_pub_visibility(item, src) {
@@ -455,9 +548,82 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
             kind: rust_item_kind(item.kind()),
             re_exported_from: None,
             alias: None,
+            glob: false,
+            visibility: ExportVisibility::Public,
         });
     }
     out
+}
+
+/// The visibility class of a Rust `use_declaration` (BF4). `Private` = no
+/// `visibility_modifier` (a plain import, NOT a re-export); `Public` = a bare
+/// `pub`; `Restricted` = a bounded `pub(crate)`/`pub(super)`/`pub(in path)`.
+/// Bounded re-exports are surfaced (unlike bounded own decls) because a
+/// consumer needs their EXISTENCE to detect own-decl-vs-reexport coexistence.
+enum UseVisibility {
+    /// No visibility modifier — a private import, never a re-export.
+    Private,
+    /// A bare `pub` — a crate-external re-export.
+    Public,
+    /// A `pub(crate)`/`pub(super)`/`pub(in path)` — a bounded re-export.
+    Restricted,
+}
+
+/// Classifies a `use_declaration`'s [`UseVisibility`]: the first
+/// `visibility_modifier` child decides — text exactly `pub` → `Public`, any
+/// `pub(…)` form → `Restricted`, absent → `Private`.
+fn use_visibility(n: TsNode, src: &[u8]) -> UseVisibility {
+    for i in 0..n.named_child_count() {
+        if let Some(c) = n.named_child(i as u32)
+            && c.kind() == "visibility_modifier"
+        {
+            return if ntext(c, src).trim() == "pub" {
+                UseVisibility::Public
+            } else {
+                UseVisibility::Restricted
+            };
+        }
+    }
+    UseVisibility::Private
+}
+
+/// Splits a re-export item's (possibly brace-group-qualified) `item_name` into
+/// its true `(source, leaf, glob)`, mirroring the import-leg leaf recursion
+/// (BF4). A glob leaf (`*` or `path::*`) returns `(source[::path], "*", true)`;
+/// a `{self}` leaf (`self` or `path::self`) re-exports the ENCLOSING module
+/// itself, resolved to the full module path then split into leaf + parent so
+/// `pub use a::b::{self}` reads as name `b` from `a` (NEVER a literal `self`
+/// binding — BF4 MAJOR); a qualified leaf (`a::X`) folds every path segment
+/// before the LAST `::` into the source (`(source::a, "X", false)`); a bare leaf
+/// passes through (`(source, item_name, false)`). `source` is the group's shared
+/// path prefix.
+fn split_reexport_item(source: &str, item_name: &str) -> (String, String, bool) {
+    if item_name == "*" {
+        return (source.to_string(), "*".to_string(), true);
+    }
+    if let Some(prefix) = item_name.strip_suffix("::*") {
+        return (qualify(source, prefix), "*".to_string(), true);
+    }
+    // `{self}`: the re-exported symbol is the enclosing module. Resolve its full
+    // path (`source` folded with any nested prefix before `self`), then split
+    // leaf/parent — `name` MUST be the module leaf, not the token `self`.
+    let self_path = if item_name == "self" {
+        Some(source.to_string())
+    } else {
+        item_name
+            .strip_suffix("::self")
+            .map(|prefix| qualify(source, prefix))
+    };
+    if let Some(resolved) = self_path {
+        return match resolved.rsplit_once("::") {
+            Some((parent, leaf)) => (parent.to_string(), leaf.to_string(), false),
+            None => (resolved.clone(), resolved, false),
+        };
+    }
+    match item_name.rsplit_once("::") {
+        Some((prefix, leaf)) => (qualify(source, prefix), leaf.to_string(), false),
+        None => (source.to_string(), item_name.to_string(), false),
+    }
 }
 
 /// Maps a Rust item node kind to an [`ExportKind`].
@@ -557,9 +723,13 @@ fn ts_named_imports(group: TsNode, src: &[u8], items: &mut Vec<ImportedItem>) {
 }
 
 /// TS/JS exports: every `export_statement`. Covers `export { … }` (optionally
-/// `from` another module → re-export), `export * from`, `export default …`,
+/// `from` another module → re-export), `export * from`, `export * as ns from`
+/// (a namespace glob re-export whose alias is preserved, BF4), `export default …`,
 /// and `export`-prefixed declarations (const/function/class/interface/type/
 /// enum). `export … from` is modeled here as a re-export, never as an import.
+/// TS/JS have no restricted module-export visibility, so every row is `Public`;
+/// TS re-export leaves are already leaf names (no brace-path mangling), so no
+/// leaf-split is needed — only the glob flag and the `* as ns` alias were gaps.
 fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
     let mut out = Vec::new();
     for stmt in query_nodes("(export_statement) @e", lang, root, src) {
@@ -589,8 +759,23 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                     name,
                     re_exported_from: source.clone(),
                     alias,
+                    glob: false,
+                    visibility: ExportVisibility::Public,
                 });
             }
+        } else if let Some(ns) = child_of_kind(stmt, "namespace_export") {
+            // `export * as ns from 'm'` — a namespace glob re-export; the alias
+            // (`ns`) is the sole named child. Preserve it (BF4: bage previously
+            // collapsed this to `*`/no-alias, losing the exported namespace name).
+            let alias = ns.named_child(0).map(|n| ntext(n, src));
+            out.push(ExportFact {
+                name: "*".to_string(),
+                kind: ExportKind::Reexport,
+                re_exported_from: source.clone(),
+                alias,
+                glob: true,
+                visibility: ExportVisibility::Public,
+            });
         } else if let Some(decl) = stmt.child_by_field_name("declaration") {
             ts_decl_exports(decl, src, &mut out);
         } else if stmt.child_by_field_name("value").is_some() {
@@ -600,6 +785,8 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                 kind: ExportKind::Default,
                 re_exported_from: None,
                 alias: None,
+                glob: false,
+                visibility: ExportVisibility::Public,
             });
         } else if let Some(from) = source {
             // `export * from 'm'` — a glob re-export (no clause/decl/value).
@@ -608,6 +795,8 @@ fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<Exp
                 kind: ExportKind::Reexport,
                 re_exported_from: Some(from),
                 alias: None,
+                glob: true,
+                visibility: ExportVisibility::Public,
             });
         }
     }
@@ -645,6 +834,8 @@ fn ts_decl_exports(decl: TsNode, src: &[u8], out: &mut Vec<ExportFact>) {
                     kind: ExportKind::Variable,
                     re_exported_from: None,
                     alias: None,
+                    glob: false,
+                    visibility: ExportVisibility::Public,
                 });
             }
         }
@@ -663,6 +854,8 @@ fn push_named(decl: TsNode, kind: ExportKind, src: &[u8], out: &mut Vec<ExportFa
         kind,
         re_exported_from: None,
         alias: None,
+        glob: false,
+        visibility: ExportVisibility::Public,
     });
 }
 
@@ -897,6 +1090,18 @@ pub struct Scope {
     /// case patterns, walrus targets, future grammar additions).
     #[serde(skip)]
     poison: HashSet<String>,
+    /// LOCAL import names declared BY an import/use statement lexically inside
+    /// THIS scope (BF2): a top-level `use`/`import` lands in the module root
+    /// (visible file-wide, since every chain ends at root); a fn-body/block-
+    /// scoped import (Rust fn-body `use crate::x::h;`, Python `def g(): from m
+    /// import h`) lands in the ENCLOSING function/block scope, so its names are
+    /// visible ONLY down that scope's subtree — a SIBLING function that cannot
+    /// see the declaration resolves the name `Undecidable`, never a false
+    /// file-wide `ImportedName`. Checked per-level in [`resolve_name`] AFTER
+    /// this scope's local bindings (a same-scope local shadows the import).
+    /// Resolution-only, `#[serde(skip)]` — NOT part of the wire contract.
+    #[serde(skip)]
+    import_bindings: HashSet<String>,
 }
 
 /// The typed resolution of an identifier [`Occurrence`]. Exactly one variant
@@ -925,10 +1130,10 @@ pub enum Resolution {
 /// `identifier` node is an occurrence, INCLUDING binding sites (a binding site
 /// resolves to its own `LocalBinding`) — so the resolution property holds over
 /// the whole identifier stream with no special-casing. EXCEPTION (never-guess):
-/// non-referencing identifier positions are dropped rather than mis-resolved —
-/// a Python `attribute` field (`obj.json` → `json`), a `keyword_argument` name
-/// (`f(json=1)` → `json`), and `global`/`nonlocal` declaration names are NOT
-/// occurrences (they would otherwise coerce a false `ImportedName`).
+/// non-referencing identifier positions are DROPPED rather than mis-resolved
+/// (see [`is_non_occurrence`]) — buffering one coerces a false `ImportedName`
+/// (the XB2/XH3 false-definite bug class). Only a WHOLE bare callee/use stays an
+/// occurrence; import binding-sites and qualified-path segments never do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Occurrence {
     /// The identifier text.
@@ -977,9 +1182,13 @@ pub enum Scopes {
 /// are consistent with the outline the host anchors on.
 ///
 /// Two passes: (1) a scope-aware walk builds the scope arena, records each
-/// scope's bindings, and buffers every identifier occurrence with its enclosing
-/// scope; (2) each occurrence is resolved against the scope chain then the
-/// definite-import name set. Local bindings take precedence over imports.
+/// scope's bindings, buffers every identifier occurrence with its enclosing
+/// scope, and collects each import/use statement with the scope it sits in;
+/// (2) each import declaration's LOCAL names are attached to ITS scope's
+/// `import_bindings` (module root = file-wide; a fn/block-body import = that
+/// subtree only, BF2), then each occurrence is resolved by walking the scope
+/// chain — local bindings shadow imports, a name unreachable via the chain is
+/// `Undecidable` (no file-wide import fallback for body imports).
 pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
     let lang = opened.lang;
     let Some(ts_lang) = grammar(lang) else {
@@ -999,6 +1208,7 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
         end_line: root.end_position().row + 1,
         bindings: Vec::new(),
         poison: HashSet::new(),
+        import_bindings: HashSet::new(),
     };
     let Some(tree) = parser.parse(src, None) else {
         // Total parse failure over already-parsed bytes is unreachable in
@@ -1013,6 +1223,7 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
                 end_line: 1,
                 bindings: Vec::new(),
                 poison: HashSet::new(),
+                import_bindings: HashSet::new(),
             }],
             occurrences: Vec::new(),
         });
@@ -1029,18 +1240,27 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
         HashSet::new()
     };
     let mut scopes = vec![module_scope(root)];
-    // Buffered occurrences: (name, enclosing_scope, start_byte, end_byte, line).
-    let mut raw: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+    let mut out = WalkOut {
+        occurrences: Vec::new(),
+        import_decls: Vec::new(),
+    };
     for i in 0..root.named_child_count() {
         if let Some(c) = root.named_child(i as u32) {
-            walk_scopes(lang, c, 0, src, &mut scopes, &mut raw, &globals);
+            walk_scopes(lang, c, 0, src, &mut scopes, &mut out, &globals);
         }
     }
-    let imports = imported_local_names(opened);
-    let occurrences = raw
+    // Attach each import declaration's LOCAL names to the scope that contains
+    // it (BF2): module root for top-level imports (visible file-wide), the
+    // fn/block scope for body imports (visible only down that subtree).
+    for (sid, node) in out.import_decls {
+        let names = import_local_names(lang, &imports_of_node(lang, node, src, &ts_lang));
+        scopes[sid].import_bindings.extend(names);
+    }
+    let occurrences = out
+        .occurrences
         .into_iter()
         .map(|(name, scope, start_byte, end_byte, line)| {
-            let resolution = resolve_name(&name, scope, start_byte, &scopes, &imports);
+            let resolution = resolve_name(lang, &name, scope, start_byte, &scopes);
             Occurrence {
                 name,
                 scope,
@@ -1057,21 +1277,42 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
     })
 }
 
+/// The output buffers [`walk_scopes`] accumulates over one file: every
+/// value-identifier `occurrences` tuple `(name, scope, start, end, line)` and
+/// every import/use statement paired with the scope it sits in (`import_decls`,
+/// BF2). Both are resolved AFTER the walk (occurrences → [`resolve_name`];
+/// import decls → per-scope `import_bindings`). Bundled so the recursive walker
+/// threads one accumulator, not two.
+struct WalkOut<'t> {
+    /// Buffered occurrences: `(name, enclosing_scope, start_byte, end_byte, line)`.
+    occurrences: Vec<(String, usize, usize, usize, usize)>,
+    /// Import/use statement nodes paired with their lexically-enclosing scope.
+    import_decls: Vec<(usize, TsNode<'t>)>,
+}
+
 /// Scope-aware descent. Adds `node`'s enclosing-scope bindings (declaration
 /// names + `let`/`assignment`/`:=` locals) to `cur`, opens a child scope when
 /// `node` introduces one (binding its parameters there), buffers `node` as an
-/// occurrence when it is a value identifier, then recurses over named children
-/// under the (possibly new) scope.
-fn walk_scopes(
+/// occurrence when it is a value identifier, records an import/use statement
+/// against `cur` (BF2), then recurses over named children under the (possibly
+/// new) scope.
+fn walk_scopes<'t>(
     lang: Lang,
-    node: TsNode,
+    node: TsNode<'t>,
     cur: usize,
     src: &[u8],
     scopes: &mut Vec<Scope>,
-    raw: &mut Vec<(String, usize, usize, usize, usize)>,
+    out: &mut WalkOut<'t>,
     globals: &HashSet<String>,
 ) {
     let kind = node.kind();
+    // BF2: an import/use STATEMENT binds its local names into the scope it sits
+    // in (`cur`). Recorded here (not resolved yet — the query needs the grammar
+    // handle held in `extract_scopes`); `import_spec`/inner nodes are NOT trigger
+    // kinds, so a Go `import ( … )` block is collected once at the declaration.
+    if is_import_stmt_kind(lang, kind) {
+        out.import_decls.push((cur, node));
+    }
     // Names that bind in the ENCLOSING scope, or — for JS `function`/`class`
     // declarations — HOIST to the nearest enclosing Function/Module scope (F2).
     if let Some(b) = decl_name_binding(lang, node, src) {
@@ -1105,6 +1346,7 @@ fn walk_scopes(
                 end_line: node.end_position().row + 1,
                 bindings: Vec::new(),
                 poison: HashSet::new(),
+                import_bindings: HashSet::new(),
             });
             collect_param_bindings(lang, node, src, id, scopes);
             collect_pattern_scope_bindings(lang, node, src, id, scopes);
@@ -1114,11 +1356,12 @@ fn walk_scopes(
         None => cur,
     };
     // A value identifier is an occurrence in its enclosing (`cur`) scope, UNLESS
-    // it is a non-referencing position (Python attribute field / keyword-arg
-    // name / global-nonlocal declaration name — F4/F6), which is dropped so it
-    // can never coerce a false definite.
-    if kind == "identifier" && !is_non_occurrence(lang, node) {
-        raw.push((
+    // it is a non-referencing position (import/use span, qualified-path segment,
+    // Python attribute/keyword/global-nonlocal, TSX intrinsic tag, TS
+    // index-signature param — F4/F6/XH3), which is dropped so it can never coerce
+    // a false definite.
+    if kind == "identifier" && !is_non_occurrence(lang, node, src) {
+        out.occurrences.push((
             ntext(node, src),
             cur,
             node.start_byte(),
@@ -1136,7 +1379,7 @@ fn walk_scopes(
             } else {
                 child
             };
-            walk_scopes(lang, c, into, src, scopes, raw, globals);
+            walk_scopes(lang, c, into, src, scopes, out, globals);
         }
     }
 }
@@ -1200,24 +1443,274 @@ fn python_global_names(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -
     set
 }
 
-/// Whether an `identifier` node is a NON-referencing position that must not
-/// become an [`Occurrence`] (Python only): the `attribute` field of an
-/// `attribute` (`obj.json`), the `name` of a `keyword_argument` (`f(json=1)`),
-/// or a `global`/`nonlocal` declaration name. Emitting these would coerce a
-/// false [`Resolution::ImportedName`] when the label collides with an import.
-fn is_non_occurrence(lang: Lang, node: TsNode) -> bool {
-    if !matches!(lang, Lang::Python) {
-        return false;
+/// Whether an `identifier` node is a NON-referencing position that must NOT
+/// become an [`Occurrence`] — a name that, if buffered, would coerce a false
+/// [`Resolution::ImportedName`] on a same-spelling import collision (the XB2/XH3
+/// false-definite bug class). FIVE drop classes, all four grammars, extending
+/// the F4 attribute-drop precedent (partitioning matches contract §8d):
+///
+/// 1. **import/use span** — ANY identifier inside an import/use/from-import
+///    declaration (Rust `use_declaration` incl. a fn-body-scoped
+///    `use crate::x::h;` AND `extern_crate_declaration`; TS/JS `import_statement`
+///    PLUS a re-export-`from` specifier/namespace name; Python `import_*`; Go
+///    `import_declaration`/`import_spec`): an import path/name/alias identifier
+///    is a binding-site, never a body use — buffering it drew a self/wrong-target
+///    Extracted edge to a same-named import.
+/// 2. **qualified-path TRAILING segment** — a Rust `scoped_identifier` `name`
+///    (`crate::internal::helper()` → `internal`,`helper`) or a Python
+///    `dotted_name` segment (`import a.b.c`): a trailing path segment cannot
+///    resolve lexically, so it is dropped rather than coerced. The path HEAD is a
+///    real reference and STAYS — Rust `T::default()`/`a::b` head (`path` field, a
+///    generic param / module), Python attribute-chain head `a` in `a.b.c` (but a
+///    `match`/`case a.b:` value-pattern parses as `dotted_name`, so its head is
+///    conservatively dropped too — no false definite; documented in §8d.1).
+/// 3. **Python `attribute` field** (`obj.json` → `json`) — a trailing attribute
+///    name is a member access, never a value reference (F4).
+/// 4. **Python `keyword_argument` name + `global`/`nonlocal` names**
+///    (`f(json=1)` → `json`; `global x`) — argument labels / declaration names,
+///    not uses (F4/F6).
+/// 5. **TSX intrinsic tag + TS index-signature parameter** — a lowercase JSX
+///    element name (`<div>`/`</div>`) is an HTML/SVG intrinsic (an uppercase
+///    component tag `<Foo/>` IS a reference and stays); `[key: string]: T`'s
+///    `key` is a type-position placeholder that binds no value.
+fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
+    // (1) Anything inside an import/use declaration span — all grammars.
+    if within_import_decl(lang, node) {
+        return true;
     }
     let Some(p) = node.parent() else {
         return false;
     };
-    match p.kind() {
-        "attribute" => p.child_by_field_name("attribute") == Some(node),
-        "keyword_argument" => p.child_by_field_name("name") == Some(node),
-        "global_statement" | "nonlocal_statement" => true,
+    // (1b) DEFINITION NAME site — the `name` field of any definition node (BF3):
+    // a declaration is not a use. Dropped BEFORE the per-grammar tail so it
+    // covers all four grammars uniformly.
+    if is_definition_name(lang, node, p) {
+        return true;
+    }
+    match lang {
+        // (2a) Rust qualified-path TRAILING segment: the `name` field of a
+        // `scoped_identifier` (`crate::internal::helper` → `internal`,`helper`
+        // are each a `name`). The path HEAD (`T` in `T::default()`, `a` in
+        // `a::b`) is the `path` field — a real reference (generic param / module)
+        // that STAYS, mirroring the Python attribute-head rule.
+        Lang::Rust => {
+            p.kind() == "scoped_identifier" && p.child_by_field_name("name") == Some(node)
+        }
+        // (2b) Python attribute field / keyword-arg name / global-nonlocal
+        // (F4/F6) PLUS `dotted_name` import-path segments.
+        Lang::Python => match p.kind() {
+            "attribute" => p.child_by_field_name("attribute") == Some(node),
+            "keyword_argument" => p.child_by_field_name("name") == Some(node),
+            "global_statement" | "nonlocal_statement" => true,
+            "dotted_name" => true,
+            _ => false,
+        },
+        // (2c) TS/JS re-export-`from` specifier/namespace name + TSX intrinsic
+        // tag name + TS index-signature parameter name.
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            within_reexport_from(node)
+                || is_tsx_intrinsic_tag(p, node, src)
+                || is_ts_index_signature_param(p, node)
+        }
+        // Go qualified access is a `selector_expression` whose `field` is a
+        // `field_identifier` (never an occurrence); the `operand` head is a real
+        // bare use and stays. Nothing extra beyond the import span.
         _ => false,
     }
+}
+
+/// Whether `node` is the NAME field of a DEFINITION node — a declaration SITE,
+/// never a resolvable use (BF3). Covers, per grammar: Rust `fn`/`struct`/`enum`/
+/// `union`/`trait`/`const`/`static`/`type`/`mod`/`macro_rules!` item names, trait
+/// `function_signature_item` names, assoc `fn`/`const` names in `impl`/`trait`
+/// bodies, and `enum_variant`/field names; TS/JS function (incl. ambient/overload
+/// `function_signature`)/class/interface/enum/type-alias/`namespace`+`module`
+/// declaration names plus method/field/property member declaration names; Python
+/// `def`/`class` names (incl. methods); Go func/method/type-spec/field names PLUS
+/// func-TYPE parameter names (via [`is_go_func_type_param`]). A definition NAME is
+/// ALREADY a binding via
+/// [`decl_name_binding`]/`collect_*` (run earlier off the PARENT node) — so
+/// dropping the identifier from the OCCURRENCE stream never perturbs binding
+/// collection; it only stops the fabrication where a definition name that
+/// collides with an imported name (`use origin::helper;` + `fn helper()`)
+/// resolves a false `ImportedName` and emits a phantom `Extracted` edge. A body
+/// USE of the same spelling is NOT a `name` field and is unaffected.
+fn is_definition_name(lang: Lang, node: TsNode, p: TsNode) -> bool {
+    // Go func-TYPE parameter names (`type F func(helper int)`) are declaration
+    // positions inside a `function_type` that open no scope and bind nothing —
+    // left in the stream they resolve a colliding import to a false
+    // `ImportedName`. A REAL func/method/literal param binds (LocalBinding) and
+    // stays; discriminated by the enclosing owner kind (see helper).
+    if lang == Lang::Go && is_go_func_type_param(node, p) {
+        return true;
+    }
+    let is_def_parent = match lang {
+        Lang::Rust => matches!(
+            p.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "trait_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+                | "mod_item"
+                | "macro_definition"
+                | "enum_variant"
+                | "field_declaration"
+        ),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => matches!(
+            p.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "function_signature"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+                | "public_field_definition"
+                | "property_signature"
+                | "enum_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "internal_module"
+                | "module"
+        ),
+        Lang::Python => matches!(p.kind(), "function_definition" | "class_definition"),
+        Lang::Go => matches!(
+            p.kind(),
+            "function_declaration" | "method_declaration" | "type_spec" | "field_declaration"
+        ),
+        _ => false,
+    };
+    is_def_parent && p.child_by_field_name("name") == Some(node)
+}
+
+/// Whether `node` is the `name` of a `parameter_declaration` whose IMMEDIATE
+/// enclosing owner is a Go `function_type` — i.e. a func-TYPE parameter name
+/// (`type F func(helper int)`, or a nested `func real(cb func(helper int))`).
+/// Such names are pure type-position placeholders: no scope is opened and no
+/// binding is collected, so left in the occurrence stream they resolve a
+/// same-spelled import to a false definite `ImportedName` (phantom `Extracted`
+/// edge). A REAL parameter lives under a `function_declaration`/
+/// `method_declaration`/`func_literal` `parameter_list` — its owner is NOT
+/// `function_type`, so it is left to bind (LocalBinding) and stay.
+fn is_go_func_type_param(node: TsNode, p: TsNode) -> bool {
+    if p.kind() != "parameter_declaration" || p.child_by_field_name("name") != Some(node) {
+        return false;
+    }
+    let Some(plist) = p.parent() else {
+        return false;
+    };
+    plist
+        .parent()
+        .is_some_and(|owner| owner.kind() == "function_type")
+}
+
+/// Whether `node` lies anywhere inside an import/use/from-import declaration.
+/// Climbs ancestors (import decls are statements whose subtree holds only path/
+/// list/alias nodes, so an import identifier reaches its decl in a few hops
+/// before any non-import identifier climbs to the root).
+fn within_import_decl(lang: Lang, node: TsNode) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if is_import_decl_kind(lang, n.kind()) {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// The per-grammar import/use declaration node kinds whose contained
+/// identifiers are binding-sites, never body uses.
+fn is_import_decl_kind(lang: Lang, kind: &str) -> bool {
+    match lang {
+        // `extern_crate_declaration` (`extern crate alloc;` / `… as a;`) is a
+        // crate-binding site, never a body use — its `name`/`alias` idents drop.
+        Lang::Rust => matches!(kind, "use_declaration" | "extern_crate_declaration"),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => kind == "import_statement",
+        Lang::Python => matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ),
+        Lang::Go => matches!(kind, "import_declaration" | "import_spec"),
+        _ => false,
+    }
+}
+
+/// The per-grammar import/use STATEMENT node kinds that BIND local names into
+/// the enclosing scope (BF2). A superset-free subset of [`is_import_decl_kind`]:
+/// the STATEMENT level only, so an import is collected ONCE (a Go
+/// `import_declaration` holds every `import_spec`, so `import_spec` is NOT a
+/// trigger; the per-node extractor descends into the specs). Kinds outside a
+/// grammar's extractor (Rust `extern_crate_declaration`, Python
+/// `future_import_statement`) are harmless triggers — [`imports_of_node`]
+/// returns no facts for them, matching the pre-BF2 file-wide behavior (those
+/// names were never in the import set).
+fn is_import_stmt_kind(lang: Lang, kind: &str) -> bool {
+    match lang {
+        Lang::Rust => matches!(kind, "use_declaration" | "extern_crate_declaration"),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => kind == "import_statement",
+        Lang::Python => matches!(
+            kind,
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ),
+        Lang::Go => kind == "import_declaration",
+        _ => false,
+    }
+}
+
+/// Whether `node` lies inside a TS/JS re-export-`from` statement — an
+/// `export_statement` carrying a `source` field (`export {x} from './m'`,
+/// `export * as ns from './m'`, `export {default as x} from './m'`). Such
+/// `export_clause` specifier / `namespace_export` identifiers NAME another
+/// module's binding, never a local value use, so buffering one coerced a false
+/// `ImportedName` on a same-spelling import collision (the XH3 residual class).
+/// A SOURCELESS `export {x}` re-exports a LOCAL binding, so its `x` IS a real
+/// reference and stays (this helper returns `false` — no `source` field). Climbs
+/// ancestors; export statements do not nest, so the FIRST `export_statement`
+/// hit decides.
+fn within_reexport_from(node: TsNode) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "export_statement" {
+            return n.child_by_field_name("source").is_some();
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Whether `node` (parent `p`) is a lowercase JSX element name — an HTML/SVG
+/// INTRINSIC tag (`<div>`/`</div>`/`<span/>`), not a value reference. Uppercase
+/// component tags (`<Foo/>`) and member tags (`<a.b/>`, a `member_expression`,
+/// not an `identifier`) are real references and return `false`.
+fn is_tsx_intrinsic_tag(p: TsNode, node: TsNode, src: &[u8]) -> bool {
+    if !matches!(
+        p.kind(),
+        "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+    ) {
+        return false;
+    }
+    if p.child_by_field_name("name") != Some(node) {
+        return false;
+    }
+    // Intrinsic iff the tag spelling starts with an ASCII lowercase letter (the
+    // JSX/React convention; uppercase or `_`/`$` = component reference).
+    src.get(node.start_byte())
+        .is_some_and(u8::is_ascii_lowercase)
+}
+
+/// Whether `node` (parent `p`) is the parameter NAME of a TS `index_signature`
+/// (`[key: string]: T`) — a type-position placeholder that binds no value.
+fn is_ts_index_signature_param(p: TsNode, node: TsNode) -> bool {
+    p.kind() == "index_signature" && p.child_by_field_name("name") == Some(node)
 }
 
 /// The [`ScopeKind`] a grammar node opens, or `None` when it opens no scope.
@@ -2186,30 +2679,43 @@ fn left_assign_is_define(node: TsNode, src: &[u8]) -> bool {
         .is_some_and(|s| s.contains(":="))
 }
 
-/// The set of DEFINITE local import names for `opened` — the names an import
-/// binds into the local namespace (`alias` when renamed, else the last path
+/// The DEFINITE local import names bound by `imports` — the names each import
+/// puts into the local namespace (`alias` when renamed, else the last path
 /// segment of the imported symbol/module). Glob/wildcard imports contribute
 /// NOTHING (their members are unknown), upholding the never-guess invariant.
-fn imported_local_names(opened: &OpenedFile) -> HashSet<String> {
+/// BF2: called per-import-declaration (over [`imports_of_node`]'s facts) so the
+/// names attach to the DECLARING scope, not one file-wide set.
+///
+/// Python bare dotted import (`import a.b.c`, no alias): Python binds ONLY the
+/// HEAD package name `a` (`a.b.c` is then reached via attribute access), not the
+/// tail — so `path` in `import os.path` is NOT a local name (real `NameError`),
+/// `os` IS. The aliased form (`import a.b as x`) has non-empty `items` and takes
+/// the alias branch below unchanged; every other language's bare import binds
+/// the tail path segment (Go package name), so the head rule is Python-only.
+fn import_local_names(lang: Lang, imports: &[ImportFact]) -> HashSet<String> {
     let mut set = HashSet::new();
-    let Facts::Supported { imports, .. } = extract_facts(opened) else {
-        return set;
-    };
     for imp in imports {
         if imp.glob {
             // A wildcard brings unknown names; never fabricate specific ones.
             continue;
         }
         if imp.items.is_empty() {
-            // A bare module import binds a local module/package name.
-            if let Some(seg) = last_segment(&imp.source_specifier) {
+            // A bare module import binds a local module/package name: Python
+            // binds the dotted HEAD (`import os.path` -> `os`); other languages
+            // bind the tail path segment (`import "a/b/c"` -> `c`).
+            let seg = if matches!(lang, Lang::Python) {
+                python_head_segment(&imp.source_specifier)
+            } else {
+                last_segment(&imp.source_specifier)
+            };
+            if let Some(seg) = seg {
                 set.insert(seg);
             }
             continue;
         }
-        for it in imp.items {
-            let local = it.alias.unwrap_or(it.name);
-            if local == "*" || local.ends_with("::*") || local.ends_with("*") {
+        for it in &imp.items {
+            let local = it.alias.clone().unwrap_or_else(|| it.name.clone());
+            if local == "*" || local.ends_with("::*") || local.ends_with('*') {
                 continue;
             }
             if let Some(seg) = last_segment(&local) {
@@ -2218,6 +2724,27 @@ fn imported_local_names(opened: &OpenedFile) -> HashSet<String> {
         }
     }
     set
+}
+
+/// The [`ImportFact`]s of a SINGLE import/use statement `node` (BF2). Dispatches
+/// to the same per-grammar extractor `extract_facts` uses, but rooted at the one
+/// statement so the query matches only that declaration's imports — the local
+/// names then bind to the scope the statement sits in. Unhandled kinds (Rust
+/// `extern_crate_declaration`, Python `future_import_statement`) yield none,
+/// preserving pre-BF2 behavior (their names were never resolvable imports).
+fn imports_of_node(
+    lang: Lang,
+    node: TsNode,
+    src: &[u8],
+    ts_lang: &tree_sitter::Language,
+) -> Vec<ImportFact> {
+    match lang {
+        Lang::Rust => rust_imports(node, src, ts_lang),
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => ts_imports(node, src, ts_lang),
+        Lang::Python => python_imports(node, src, ts_lang),
+        Lang::Go => go_imports(node, src, ts_lang),
+        _ => Vec::new(),
+    }
 }
 
 /// The final path segment of an import name/specifier (`a::b::C` → `C`,
@@ -2232,14 +2759,44 @@ fn last_segment(s: &str) -> Option<String> {
     }
 }
 
+/// The HEAD (first) dotted segment of a Python module path (`os.path` -> `os`,
+/// `a.b.c` -> `a`) — the ONLY name a bare `import a.b.c` binds locally; `None`
+/// when empty.
+fn python_head_segment(s: &str) -> Option<String> {
+    let seg = s.split('.').next().unwrap_or(s);
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
 /// Resolves the occurrence of `name` at byte `use_byte` in scope `scope` to a
-/// typed [`Resolution`]: the nearest enclosing scope with a matching VISIBLE
-/// binding wins (shadowing); otherwise a definite local import name; otherwise
-/// [`Resolution::Undecidable`]. A binding is visible iff it is [hoisted] OR its
-/// `start_byte` is at/before `use_byte` (F5 positional rule: a sequential
-/// `let`/`const`/`:=` is invisible to a use lexically before it, which then
-/// falls through — never a false LocalBinding). Local bindings ALWAYS take
-/// precedence over imports.
+/// typed [`Resolution`] by walking the scope chain from `scope` to the root: the
+/// nearest enclosing scope with a matching VISIBLE binding wins (shadowing);
+/// else the nearest enclosing scope whose `import_bindings` hold `name` (a
+/// definite import visible from here); else [`Resolution::Undecidable`]. A
+/// binding is visible iff it is [hoisted] OR its `start_byte` is at/before
+/// `use_byte` (F5 positional rule: a sequential `let`/`const`/`:=` is invisible
+/// to a use lexically before it, which then falls through — never a false
+/// LocalBinding). Local bindings ALWAYS take precedence over imports.
+///
+/// BF2 (import placement scoping): imports are checked PER-SCOPE in the chain,
+/// NOT as a file-wide fallback. A top-level import lands in the module root, so
+/// every occurrence's chain reaches it (file-wide as before); a fn/block-body
+/// import lands in that scope, so a SIBLING scope that cannot reach it resolves
+/// `Undecidable` — never a false file-wide `ImportedName`. A same-scope local
+/// binding is checked before that scope's imports, so it still shadows.
+///
+/// BF2 Rust `mod` boundary: a child module does NOT inherit its parent file/mod
+/// `use` bindings (rustc E0425 — a bare name in `mod inner` needs its own `use`
+/// or `super::`). So once the chain walk CROSSES a nested Rust `mod` scope (a
+/// `Module` with `Some` parent, `lang == Rust`), further-out `import_bindings`
+/// are no longer consulted: a top-level `use` collided in a nested `mod`
+/// resolved a false file-wide `ImportedName` before. The nested mod's OWN
+/// import_bindings (a `use` written inside it) stay visible — the gate flips
+/// only AFTER that scope is checked. Local bindings/poison are unaffected (the
+/// gate is import-only, matching the narrow E0425 truth this fixes).
 ///
 /// [hoisted]: Binding::hoisted
 ///
@@ -2250,13 +2807,17 @@ fn last_segment(s: &str) -> Option<String> {
 /// (conservative: a false `Undecidable`, never a false definite). Poison is
 /// checked per-level so an inner CERTAIN binding still shadows an outer poison.
 fn resolve_name(
+    lang: Lang,
     name: &str,
     scope: usize,
     use_byte: usize,
     scopes: &[Scope],
-    imports: &HashSet<String>,
 ) -> Resolution {
     let mut cur = Some(scope);
+    // Whether outer `import_bindings` are still reachable. Flips off once the
+    // walk climbs past a nested Rust `mod` boundary (E0425): its parent's use
+    // bindings do not reach inside it.
+    let mut imports_visible = true;
     while let Some(id) = cur {
         if scopes[id].poison.contains(name) {
             return Resolution::Undecidable;
@@ -2268,13 +2829,19 @@ fn resolve_name(
         {
             return Resolution::LocalBinding { scope: id };
         }
+        if imports_visible && scopes[id].import_bindings.contains(name) {
+            return Resolution::ImportedName;
+        }
+        // Crossing a nested Rust `mod` scope cuts off the parent's imports.
+        if matches!(lang, Lang::Rust)
+            && scopes[id].kind == ScopeKind::Module
+            && scopes[id].parent.is_some()
+        {
+            imports_visible = false;
+        }
         cur = scopes[id].parent;
     }
-    if imports.contains(name) {
-        Resolution::ImportedName
-    } else {
-        Resolution::Undecidable
-    }
+    Resolution::Undecidable
 }
 
 #[cfg(test)]
@@ -2349,6 +2916,201 @@ mod tests {
             .find(|e| e.kind == ExportKind::Reexport && e.name == "Thing")
             .expect("pub use export");
         assert_eq!(ex.re_exported_from.as_deref(), Some("crate::m"));
+        // BF4: a bare `pub use` is a Public, non-glob re-export row.
+        assert_eq!(ex.visibility, ExportVisibility::Public);
+        assert!(!ex.glob);
+    }
+
+    // BF4 class 1: restricted-visibility re-exports (`pub(crate)`/`pub(super)`/
+    // `pub(in …)` use) are EMITTED as `Restricted` rows (existence is what a
+    // consumer needs to spot own-decl-vs-reexport coexistence); a plain
+    // (visibility-less) `use` stays a private import with NO export row.
+    #[test]
+    fn rust_restricted_visibility_reexports_emitted() {
+        let src = b"pub(crate) use crate::a::X;\npub(super) use crate::b::Y;\npub(in crate::z) use crate::c::W;\nuse crate::d::Priv;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let by = |n: &str| exports.iter().find(|e| e.name == n).unwrap();
+        // pub(crate) re-export → Restricted, source folded correctly.
+        let x = by("X");
+        assert_eq!(x.kind, ExportKind::Reexport);
+        assert_eq!(x.visibility, ExportVisibility::Restricted);
+        assert_eq!(x.re_exported_from.as_deref(), Some("crate::a"));
+        assert!(!x.glob);
+        assert_eq!(by("Y").visibility, ExportVisibility::Restricted);
+        assert_eq!(by("W").visibility, ExportVisibility::Restricted);
+        assert_eq!(by("W").re_exported_from.as_deref(), Some("crate::c"));
+        // A plain `use` is NOT a re-export (no export row).
+        assert!(
+            exports.iter().all(|e| e.name != "Priv"),
+            "visibility-less use is a private import, never exported"
+        );
+    }
+
+    // BF4 class 2: a brace-group re-export item is FLATTENED to its leaf name
+    // with the intermediate path folded into `re_exported_from` (mirrors the
+    // import-leg recursion) — never the path-mangled `a::X` name.
+    #[test]
+    fn rust_brace_group_reexport_flattened_to_leaf() {
+        let src = b"pub use crate::{a::X, b::c::Y as Z};\npub use crate::d::{E, F};\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        // `a::X` → leaf `X`, source `crate::a` (NOT name "a::X").
+        let x = exports.iter().find(|e| e.name == "X").unwrap();
+        assert_eq!(x.re_exported_from.as_deref(), Some("crate::a"));
+        assert!(
+            exports.iter().all(|e| e.name != "a::X"),
+            "leaf, not mangled"
+        );
+        // Deeper group + alias: `b::c::Y as Z` → leaf `Y`, source `crate::b::c`,
+        // alias `Z`.
+        let y = exports.iter().find(|e| e.name == "Y").unwrap();
+        assert_eq!(y.re_exported_from.as_deref(), Some("crate::b::c"));
+        assert_eq!(y.alias.as_deref(), Some("Z"));
+        // Sibling shared-prefix group items each keep the shared source.
+        let e = exports.iter().find(|e| e.name == "E").unwrap();
+        let f = exports.iter().find(|e| e.name == "F").unwrap();
+        assert_eq!(e.re_exported_from.as_deref(), Some("crate::d"));
+        assert_eq!(f.re_exported_from.as_deref(), Some("crate::d"));
+    }
+
+    // BF4 class 3: glob re-exports (`pub use a::*`, incl. nested-in-group
+    // `{a::*}`) emit a `glob=true` `*` row over the globbed module, so a facade
+    // glob re-export beside a same-name own decl reads as ambiguous.
+    #[test]
+    fn rust_glob_reexport_flagged() {
+        let src =
+            b"pub use crate::a::*;\npub use crate::{b::*, c::Keep};\npub(crate) use crate::d::*;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let globs: Vec<_> = exports.iter().filter(|e| e.glob).collect();
+        // Top-level glob over crate::a.
+        assert!(
+            globs
+                .iter()
+                .any(|e| e.name == "*" && e.re_exported_from.as_deref() == Some("crate::a")),
+            "top-level glob flagged"
+        );
+        // Nested-in-group glob over crate::b (sibling `Keep` stays a leaf row).
+        assert!(
+            globs
+                .iter()
+                .any(|e| e.re_exported_from.as_deref() == Some("crate::b")),
+            "nested-group glob flagged"
+        );
+        let keep = exports.iter().find(|e| e.name == "Keep").unwrap();
+        assert!(!keep.glob);
+        assert_eq!(keep.re_exported_from.as_deref(), Some("crate::c"));
+        // Restricted glob keeps both flags.
+        let d = globs
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("crate::d"))
+            .unwrap();
+        assert_eq!(d.visibility, ExportVisibility::Restricted);
+        assert!(d.glob && d.name == "*");
+    }
+
+    // BF4 TS sweep: `export * from` and `export * as ns from` are glob-flagged;
+    // the `* as ns` namespace alias is preserved (previously dropped).
+    #[test]
+    fn ts_glob_and_namespace_reexports_flagged() {
+        let src = b"export * from './a';\nexport * as ns from './b';\nexport { x } from './c';\n";
+        let (_i, exports) = supported(facts_of("m.ts", src));
+        let star = exports
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("./a"))
+            .unwrap();
+        assert!(star.glob && star.name == "*" && star.alias.is_none());
+        assert_eq!(star.visibility, ExportVisibility::Public);
+        // `* as ns` — glob row, alias preserved.
+        let ns = exports
+            .iter()
+            .find(|e| e.re_exported_from.as_deref() == Some("./b"))
+            .unwrap();
+        assert!(ns.glob && ns.name == "*");
+        assert_eq!(ns.alias.as_deref(), Some("ns"));
+        // A named re-export is not a glob.
+        let x = exports.iter().find(|e| e.name == "x").unwrap();
+        assert!(!x.glob);
+    }
+
+    // BF4 BLOCKER: a bare-identifier module re-export (`pub use util;`) emits ONE
+    // Reexport row named after the module — without it the publicly re-exported
+    // module is invisible and a same-name export elsewhere reads as false-unique.
+    #[test]
+    fn rust_bare_module_reexport_emitted() {
+        let src = b"mod util;\npub use util;\npub use serde;\nuse priv_dep;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let util = exports
+            .iter()
+            .find(|e| e.name == "util" && e.kind == ExportKind::Reexport)
+            .expect("bare module re-export emitted");
+        assert_eq!(util.re_exported_from.as_deref(), Some("util"));
+        assert!(!util.glob && util.alias.is_none());
+        assert_eq!(util.visibility, ExportVisibility::Public);
+        // A second bare module re-export also surfaces.
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.name == "serde" && e.kind == ExportKind::Reexport),
+            "pub use serde surfaced"
+        );
+        // A visibility-less `use` is a private import — NO export row.
+        assert!(
+            exports.iter().all(|e| e.name != "priv_dep"),
+            "plain use never exported"
+        );
+    }
+
+    // BF4 MAJOR: `pub use module::{self}` re-exports the MODULE (leaf of the
+    // source), never a literal `self` binding; `{self as r}` keeps the alias.
+    #[test]
+    fn rust_use_list_self_reexports_module_leaf() {
+        let src = b"pub use crate::sub::{self, Thing};\npub use crate::other::{self as r};\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        // No literal `self` name ever leaks.
+        assert!(
+            exports.iter().all(|e| e.name != "self"),
+            "no literal self name"
+        );
+        // `{self}` → name = module leaf `sub`, source = its parent `crate`.
+        let sub = exports
+            .iter()
+            .find(|e| e.name == "sub" && e.kind == ExportKind::Reexport)
+            .expect("self → module leaf");
+        assert_eq!(sub.re_exported_from.as_deref(), Some("crate"));
+        assert!(sub.alias.is_none());
+        // A sibling leaf in the same group still flattens normally.
+        let thing = exports.iter().find(|e| e.name == "Thing").unwrap();
+        assert_eq!(thing.re_exported_from.as_deref(), Some("crate::sub"));
+        // `{self as r}` → module leaf `other`, alias preserved.
+        let other = exports.iter().find(|e| e.name == "other").unwrap();
+        assert_eq!(other.re_exported_from.as_deref(), Some("crate"));
+        assert_eq!(other.alias.as_deref(), Some("r"));
+    }
+
+    // BF4 MAJOR: `pub extern crate foo [as bar];` re-exports the crate root; a
+    // visibility-less `extern crate` is a private binding (no row).
+    #[test]
+    fn rust_pub_extern_crate_reexported() {
+        let src = b"pub extern crate serde;\npub extern crate rustc_ast as ast;\npub(crate) extern crate alloc;\nextern crate core;\n";
+        let (_imports, exports) = supported(facts_of("m.rs", src));
+        let serde = exports
+            .iter()
+            .find(|e| e.name == "serde")
+            .expect("pub extern crate emitted");
+        assert_eq!(serde.kind, ExportKind::Reexport);
+        assert_eq!(serde.re_exported_from.as_deref(), Some("serde"));
+        assert_eq!(serde.visibility, ExportVisibility::Public);
+        assert!(serde.alias.is_none() && !serde.glob);
+        // Aliased extern crate: name = crate, alias = the `as` clause.
+        let ast = exports.iter().find(|e| e.name == "rustc_ast").unwrap();
+        assert_eq!(ast.alias.as_deref(), Some("ast"));
+        // Restricted extern crate → Restricted visibility.
+        let alloc = exports.iter().find(|e| e.name == "alloc").unwrap();
+        assert_eq!(alloc.visibility, ExportVisibility::Restricted);
+        // A visibility-less extern crate is a private binding — NO export row.
+        assert!(
+            exports.iter().all(|e| e.name != "core"),
+            "plain extern crate never exported"
+        );
     }
 
     #[test]
@@ -2632,22 +3394,26 @@ mod tests {
 
     #[test]
     fn rust_pub_use_group_reexports_each_leaf() {
-        // `pub use crate::{a::B, c::D}`: one Reexport ExportFact per leaf,
-        // never a composite — and the import side flags re_export.
+        // `pub use crate::{a::B, c::D}`: one Reexport ExportFact per LEAF
+        // (BF4 — flattened to leaf name, group path folded into
+        // `re_exported_from`), never a composite/path-mangled name; the import
+        // side flags re_export.
         let (imports, exports) = supported(facts_of("m.rs", b"pub use crate::{a::B, c::D};\n"));
         let re = imports.iter().find(|i| i.re_export).expect("pub use");
         assert_eq!(re.source_specifier, "crate");
-        for name in ["a::B", "c::D"] {
+        for (name, from) in [("B", "crate::a"), ("D", "crate::c")] {
             assert!(
                 exports.iter().any(|e| e.kind == ExportKind::Reexport
                     && e.name == name
-                    && e.re_exported_from.as_deref() == Some("crate")),
-                "reexport {name} in {exports:?}"
+                    && e.re_exported_from.as_deref() == Some(from)),
+                "reexport {name} from {from} in {exports:?}"
             );
         }
         assert!(
-            !exports.iter().any(|e| e.name.contains('{')),
-            "no composite reexport name"
+            !exports
+                .iter()
+                .any(|e| e.name.contains('{') || e.name.contains("::")),
+            "no composite/path-mangled reexport name"
         );
     }
 
@@ -2689,6 +3455,379 @@ mod tests {
             .iter()
             .filter(|o| o.name == name && matches!(o.resolution, Resolution::LocalBinding { .. }))
             .collect()
+    }
+
+    /// The [`Resolution`] of the occurrence of `name` on 1-based `line` (the
+    /// exact use we want to pin — BF2 tests have same-spelled uses in sibling
+    /// scopes, so line disambiguates).
+    fn resolution_on_line(t: &ScopeTree, name: &str, line: usize) -> Resolution {
+        t.occurrences
+            .iter()
+            .find(|o| o.name == name && o.line == line)
+            .unwrap_or_else(|| panic!("no `{name}` occurrence on line {line}: {:?}", t.occurrences))
+            .resolution
+    }
+
+    #[test]
+    fn python_body_import_scoped_to_declaring_fn() {
+        // BF2: `helper` is imported INSIDE `g`'s body — its use in `g` resolves
+        // ImportedName, but the SIBLING `h`'s same-spelled use CANNOT see that
+        // body import and resolves Undecidable (never a false file-wide import).
+        let src = b"def g():\n    from mod import helper\n    return helper()\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "g's body-import use resolves ImportedName"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 5),
+            Resolution::Undecidable,
+            "sibling h cannot see g's body import"
+        );
+    }
+
+    /// Whether NO occurrence of `name` sits on 1-based `line` (a definition-name
+    /// site must be absent from the occurrence stream, BF3).
+    fn no_occurrence_on_line(t: &ScopeTree, name: &str, line: usize) -> bool {
+        !t.occurrences
+            .iter()
+            .any(|o| o.name == name && o.line == line)
+    }
+
+    #[test]
+    fn bf3_rust_assoc_fn_const_and_variant_names_are_not_occurrences() {
+        // BF3: an assoc-fn/const NAME and an enum-variant NAME are DEFINITION
+        // sites, never uses — dropped from the stream so a same-spelling import
+        // cannot coerce a false `ImportedName` (the fabricated `Extracted` edge).
+        // A BODY use of the same name still resolves `ImportedName`.
+        let src = b"use crate::origin::helper;\nimpl S {\n    pub fn helper() {}\n    const helper2: u8 = 0;\n}\nenum E { helper }\nfn m() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "assoc-fn name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper2", 4),
+            "assoc-const name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper", 6),
+            "enum-variant name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 8),
+            Resolution::ImportedName,
+            "a BODY use of the imported name still resolves ImportedName"
+        );
+    }
+
+    #[test]
+    fn bf3_python_method_name_is_not_an_occurrence() {
+        // BF3: a Python method (`def`) NAME is a definition site — dropped —
+        // while a body use of the same imported spelling still resolves.
+        let src =
+            b"from mod import helper\nclass C:\n    def helper(self):\n        return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "method def name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "the body call still resolves the top-level import"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_class_member_and_fn_names_are_not_occurrences() {
+        // BF3: a TS function-declaration NAME and class-member (method/field)
+        // NAMES are definition sites, absent from the stream; a body use of the
+        // imported spelling still resolves ImportedName.
+        let src =
+            b"import { helper } from 'm';\nclass C {\n  helper() {}\n  helper2 = 1;\n}\nfunction helper3() { return helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "method name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper2", 4),
+            "field name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "helper3", 6),
+            "function-decl name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::ImportedName,
+            "the body call still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_rust_macro_definition_name_is_not_an_occurrence() {
+        // BF3: a `macro_rules!` NAME is a definition site — dropped — so a
+        // colliding `use origin::helper;` cannot coerce a false `ImportedName`
+        // (the fabricated `Extracted` edge). A body use still resolves.
+        let src =
+            b"use origin::helper;\nmacro_rules! helper { () => {} }\nfn m() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "macro_rules! name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "a body use of the imported name still resolves ImportedName"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_function_signature_names_are_not_occurrences() {
+        // BF3: ambient `declare function` AND overload `function_signature`
+        // NAMES are definition sites, absent from the stream; the implementing
+        // body use of the imported spelling still resolves ImportedName.
+        let src = b"import { helper } from 'm';\ndeclare function helper(): void;\nfunction over(a: number): void;\nfunction over(a: string): void { helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "declare-function name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "over", 3),
+            "overload-signature name is not an occurrence"
+        );
+        assert!(
+            no_occurrence_on_line(&t, "over", 4),
+            "implementing-decl name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "the body call still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_ts_namespace_and_module_names_are_not_occurrences() {
+        // BF3: `namespace` (internal_module) and `module` declaration NAMES are
+        // definition sites — dropped — so a colliding import is not fabricated
+        // at the name site; a body use still resolves ImportedName.
+        let src = b"import { helper } from 'm';\nnamespace helper { export const x = 1; }\nmodule other { export const y = helper(); }\n";
+        let t = scopes_of("m.ts", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 2),
+            "namespace name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            no_occurrence_on_line(&t, "other", 3),
+            "module name is not an occurrence"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "the body use still resolves the import"
+        );
+    }
+
+    #[test]
+    fn bf3_go_func_and_method_names_are_not_occurrences() {
+        // BF3: a top-level `func` NAME colliding with an import alias is a
+        // definition site — dropped — while a body use resolves the (hoisted)
+        // func binding (LocalBinding). Method names are `field_identifier` and
+        // never reach the occurrence stream regardless.
+        let src = b"package p\nimport helper \"pkg\"\nfunc helper() {}\ntype R struct{}\nfunc (r R) m() { helper() }\n";
+        let t = scopes_of("m.go", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "func-decl name is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            matches!(
+                resolution_on_line(&t, "helper", 5),
+                Resolution::LocalBinding { .. }
+            ),
+            "a body use resolves the hoisted top-level func binding: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf3_go_func_type_param_dropped_real_param_still_binds() {
+        // BF3: a func-TYPE parameter name (`type F func(helper int)`) opens no
+        // scope and binds nothing — dropped so it cannot resolve a colliding
+        // import to a false ImportedName. A REAL func parameter of the same
+        // spelling still binds and resolves LocalBinding in both directions.
+        let src = b"package p\nimport helper \"pkg\"\ntype F func(helper int)\nfunc real(helper int) int { return helper }\n";
+        let t = scopes_of("m.go", src);
+        assert!(
+            no_occurrence_on_line(&t, "helper", 3),
+            "func-type param name is dropped: {:?}",
+            t.occurrences
+        );
+        assert!(
+            matches!(
+                resolution_on_line(&t, "helper", 4),
+                Resolution::LocalBinding { .. }
+            ),
+            "a real-func param use of the same spelling still binds locally: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn python_top_level_import_resolves_everywhere() {
+        // BF2 preserves top-level imports: a module-scope import is visible in
+        // EVERY function (its names land in the module root, which every chain
+        // reaches).
+        let src = b"from mod import helper\ndef g():\n    return helper()\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 5),
+            Resolution::ImportedName
+        );
+    }
+
+    #[test]
+    fn python_nested_fn_sees_ancestor_body_import() {
+        // A body import in `g` is visible to a nested function defined inside g
+        // (the chain climbs through g's scope), while an outer sibling is not.
+        let src = b"def g():\n    from mod import helper\n    def inner():\n        return helper()\n    return inner\ndef h():\n    return helper()\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "nested inner() sees ancestor g's import"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 7),
+            Resolution::Undecidable,
+            "sibling h still cannot"
+        );
+    }
+
+    #[test]
+    fn rust_fn_body_use_scoped_to_declaring_fn() {
+        // BF2 for Rust: a fn-body `use crate::m::helper;` binds `helper` only in
+        // `g`; the sibling `h`'s use falls to Undecidable, never file-wide.
+        let src =
+            b"fn g() {\n    use crate::m::helper;\n    helper();\n}\nfn h() {\n    helper();\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 3),
+            Resolution::ImportedName,
+            "g's fn-body use resolves ImportedName"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::Undecidable,
+            "sibling h cannot see g's fn-body use"
+        );
+    }
+
+    #[test]
+    fn rust_nested_block_sees_fn_body_import() {
+        // A nested block inside the same fn sees the fn-body import via the chain.
+        let src = b"fn g() {\n    use crate::m::helper;\n    {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName
+        );
+    }
+
+    #[test]
+    fn rust_top_level_use_not_visible_in_nested_mod() {
+        // BF2 mod boundary (E0425): a top-level `use` does NOT reach inside a
+        // nested `mod` — a bare `helper` there is unresolved. Before the gate the
+        // chain climbed to root's import_bindings → false ImportedName.
+        let src =
+            b"use crate::m::helper;\nmod inner {\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::Undecidable,
+            "top-level use does not cross the mod boundary"
+        );
+    }
+
+    #[test]
+    fn rust_use_inside_mod_resolves_within_it() {
+        // The inverse of the gate: a `use` written INSIDE the mod binds there, so
+        // a use in the same mod's fn resolves ImportedName (the gate flips only
+        // AFTER the nested-mod scope is checked).
+        let src =
+            b"mod inner {\n    use crate::m::helper;\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 4),
+            Resolution::ImportedName,
+            "a use inside the mod is visible in that mod"
+        );
+    }
+
+    #[test]
+    fn rust_use_in_sibling_mod_not_visible() {
+        // p7 inverse: an import in `mod a` is not visible in a sibling `mod b`.
+        let src = b"mod a {\n    use crate::m::helper;\n}\nmod b {\n    fn f() {\n        helper();\n    }\n}\n";
+        let t = scopes_of("m.rs", src);
+        assert_eq!(
+            resolution_on_line(&t, "helper", 6),
+            Resolution::Undecidable,
+            "mod a's import is invisible in sibling mod b"
+        );
+    }
+
+    #[test]
+    fn python_bare_dotted_import_binds_head_only() {
+        // Python `import os.path` binds ONLY the head `os` (real: `path` is a
+        // NameError). Before, the items-empty branch bound the tail `path` and
+        // dropped `os` → inverted bindings.
+        let src = b"import os.path\nx = path.join\ny = os.getcwd\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "path", 2),
+            Resolution::Undecidable,
+            "the dotted tail `path` is NOT locally bound"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "os", 3),
+            Resolution::ImportedName,
+            "the dotted head `os` IS locally bound"
+        );
+    }
+
+    #[test]
+    fn python_aliased_dotted_import_keeps_alias() {
+        // The aliased form (`import os.path as p`, non-empty items) is unchanged:
+        // the alias `p` binds, the head `os` does not.
+        let src = b"import os.path as p\nx = p.join\ny = os.getcwd\n";
+        let t = scopes_of("m.py", src);
+        assert_eq!(
+            resolution_on_line(&t, "p", 2),
+            Resolution::ImportedName,
+            "the alias `p` binds"
+        );
+        assert_eq!(
+            resolution_on_line(&t, "os", 3),
+            Resolution::Undecidable,
+            "no head binding for the aliased form"
+        );
     }
 
     #[test]
@@ -2923,8 +4062,10 @@ mod tests {
             "m.rs",
             b"use a::bar;\nfn f() {\n    bar();\n    let bar = 2;\n    bar;\n}\n",
         );
+        // XH3: the import-site `bar` (line 1, `use a::bar`) is dropped, so the
+        // pre-let use `bar()` is now the FIRST `bar` occurrence (index 0).
         assert_eq!(
-            nth_occ(&t, "bar", 1).resolution,
+            nth_occ(&t, "bar", 0).resolution,
             Resolution::ImportedName,
             "pre-let use falls through to the import: {:?}",
             t.occurrences
@@ -2996,8 +4137,13 @@ mod tests {
             "no `foo` occurrence on the attribute/keyword lines: {:?}",
             t.occurrences
         );
-        // The import-site `foo` (line 1) is still a legitimate occurrence.
-        assert!(t.occurrences.iter().any(|o| o.name == "foo" && o.line == 1));
+        // XH3: the import-site `foo` (line 1) is a binding-site, not a body use,
+        // so it is DROPPED too — no `foo` occurrence anywhere in this fixture.
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "foo"),
+            "import-span `foo` is not a body-use occurrence: {:?}",
+            t.occurrences
+        );
     }
 
     #[test]
@@ -4129,6 +5275,170 @@ mod tests {
         assert!(
             matches!(read.resolution, Resolution::ImportedName),
             "bare `helper` in default method = ImportedName, not the assoc const: {:?}",
+            t.occurrences
+        );
+    }
+
+    // ------------------------------ BF1 occurrence-stream purity (XH3) --------
+    // Each fixture is a resolved falsifier probe: a path-position / import-span /
+    // intrinsic-tag / index-signature identifier that PRE-FIX buffered as an
+    // occurrence and false-resolved to a same-spelling import (a wrong-target
+    // Extracted edge downstream). Post-fix the polluting identifier is DROPPED.
+
+    #[test]
+    fn bf1_rust_scoped_path_segment_not_occurrence() {
+        // `crate::internal::helper()` with a colliding `use a::helper`. PRE-FIX
+        // the `name`-segment `helper` buffered as an occurrence and resolved to
+        // the import (false ImportedName). Post-fix: NO `helper` occurrence.
+        let t = scopes_of(
+            "m.rs",
+            b"use a::helper;\nfn f() {\n    crate::internal::helper();\n}\n",
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "scoped-path `helper` segment is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "internal"),
+            "scoped-path `internal` segment is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_bare_call_still_resolves_import() {
+        // REGRESSION: a WHOLE bare callee (`helper()`, not a path) stays an
+        // occurrence and resolves the import — the fix must not over-drop.
+        let t = scopes_of("m.rs", b"use a::helper;\nfn f() {\n    helper();\n}\n");
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "helper" && o.resolution == Resolution::ImportedName),
+            "bare `helper()` call resolves ImportedName: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_body_use_declaration_not_occurrence() {
+        // A fn-body-scoped `use crate::x::h;` (unused): its path identifiers are
+        // import binding-sites, never body uses. PRE-FIX `h` buffered as an
+        // occurrence and self-resolved. Post-fix: NO `h` occurrence.
+        let t = scopes_of("m.rs", b"fn f() {\n    use crate::x::h;\n}\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "h"),
+            "body `use` path `h` is not a body-use occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_python_dotted_import_segments_dropped_attr_head_stays() {
+        // `import a.b.c` — every `dotted_name` segment is an import path element,
+        // never a body use. The body `x = a.b.c` attribute-chain HEAD `a` IS a
+        // real bare use and STAYS; trailing `.b`/`.c` fields stay dropped (F4).
+        let t = scopes_of("m.py", b"import a.b.c\nx = a.b.c\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "b"),
+            "dotted segment `b` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "c"),
+            "dotted segment `c` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            t.occurrences.iter().any(|o| o.name == "a" && o.line == 2),
+            "attribute-chain head `a` (body) stays an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "a" && o.line == 1),
+            "import-path `a` segment (line 1) is dropped: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_tsx_intrinsic_tag_dropped_component_stays() {
+        // Lowercase `<div>`/`</div>` are HTML intrinsics (dropped); an uppercase
+        // component tag `<Foo/>` IS a value reference and stays an occurrence.
+        let t = scopes_of("m.tsx", b"const x = <div><Foo /></div>;\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "div"),
+            "intrinsic tag `div` is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            t.occurrences.iter().any(|o| o.name == "Foo"),
+            "component tag `Foo` stays an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_reexport_from_specifiers_dropped_local_export_stays() {
+        // `export {helper} from './b'` re-exports another module's binding: the
+        // specifier `helper` is NOT a local value use. PRE-FIX it buffered as an
+        // occurrence and false-resolved to the colliding `import {helper}` (a
+        // wrong-target edge — './a' vs the real './b'). Post-fix: line-2 `helper`
+        // is dropped; the import-site `helper` (line 1) is also dropped (import
+        // span); a namespace re-export `export * as ns from …` `ns` drops too.
+        let t = scopes_of(
+            "m.ts",
+            b"import {helper} from './a';\nexport {helper} from './b';\nexport * as ns from './c';\n",
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "re-export-from `helper` specifier is not an occurrence: {:?}",
+            t.occurrences
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "ns"),
+            "namespace re-export `ns` is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_sourceless_local_reexport_stays() {
+        // REGRESSION: a SOURCELESS `export {local}` re-exports a LOCAL binding —
+        // its `local` IS a real reference and must NOT be dropped (only
+        // `export … from 'src'` specifiers drop). Resolves to the `const local`.
+        let t = scopes_of("m.ts", b"const local = 1;\nexport {local};\n");
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "local" && o.line == 2),
+            "sourceless `export {{local}}` specifier stays an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_rust_extern_crate_name_not_occurrence() {
+        // `extern crate helper;` names a crate-binding site, never a body use.
+        // PRE-FIX the name `helper` buffered as an occurrence and false-resolved
+        // to the colliding `use a::helper`. Post-fix: NO `helper` occurrence.
+        let t = scopes_of("m.rs", b"use a::helper;\nextern crate helper;\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "helper"),
+            "extern-crate `helper` name is not an occurrence: {:?}",
+            t.occurrences
+        );
+    }
+
+    #[test]
+    fn bf1_ts_index_signature_param_not_occurrence() {
+        // `[key: string]: T` — `key` is a type-position placeholder that binds no
+        // value; PRE-FIX it buffered as an occurrence and could false-resolve to
+        // a same-spelling import. Post-fix: NO `key` occurrence.
+        let t = scopes_of("m.ts", b"interface I {\n  [key: string]: number;\n}\n");
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "key"),
+            "index-signature param `key` is not an occurrence: {:?}",
             t.occurrences
         );
     }
