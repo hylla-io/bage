@@ -10,12 +10,28 @@
 //! Content-Length framing and routes responses to pending calls and
 //! `textDocument/publishDiagnostics` notifications into a bounded queue that
 //! DROPS on overflow rather than ever blocking the read loop.
+//!
+//! CAUSALITY LIMIT of warm-pool push diagnostics (ruled DL-64/DL-65, accepted).
+//! The push model ([`textDocument/publishDiagnostics`]) carries no token tying a
+//! publish to the edit that caused it. The [ordering barrier][`BARRIER_METHOD`]
+//! guarantees ARRIVAL order — every publish the server emitted BEFORE answering
+//! the barrier lands ahead of the marker — but NOT CAUSALITY: a spec-legal
+//! debounced server may flush a publish CAUSED by a pre-barrier edit AFTER it
+//! answers the barrier, so [`Client::diagnostics`] can return that later
+//! (possibly stale-clean) round as authoritative. This is best-effort by
+//! construction; there is no push-side fix. The STRUCTURAL close is the
+//! PULL-based [`textDocument/diagnostic`] request (LSP 3.17) — the caller pulls
+//! and the server answers WITH a result-id, making the round causally bound —
+//! routed to the B2 request-leg work. Servers lacking pull support keep the
+//! arrival-ordered best-effort behavior here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,11 +43,27 @@ use thiserror::Error;
 
 use crate::edit::FileEdit;
 
-/// Depth of the publishDiagnostics queue. A server may publish several rounds
-/// (initial + refined) before a `diagnostics` call collects; a small buffer
-/// keeps the read loop from blocking without unbounded growth. Excess
-/// notifications past the buffer are dropped (the latest authoritative set is
-/// what matters), never blocking the read loop.
+/// Max `publishDiagnostics` rounds buffered for a pending `diagnostics` call.
+/// A server may publish several rounds (initial + refined, plus a warm-reuse
+/// `didClose` "clear") before the call collects; this bounds the buffer so the
+/// read loop neither blocks nor grows unboundedly.
+///
+/// RESERVED BARRIER SLOT (DL-65 item 2). The diagnostics `sync_channel` is
+/// sized `DIAG_BUFFER + 1`, and publishes are accounted SEPARATELY (see
+/// [`Client::diag_publishes`]) and capped at `DIAG_BUFFER`, so the extra slot is
+/// ALWAYS free for the single in-band [`DiagMsg::Barrier`] marker. A publish
+/// flood can therefore never occupy the marker's capacity: dropping the marker
+/// on a full buffer used to drain the authoritative post-barrier publish and
+/// raise a false [`LspError::DiagnosticsTimeout`] on a HEALTHY warm server.
+/// [`read_loop`] stays strictly non-blocking (`try_send`).
+///
+/// DROP-NEWEST reality for PUBLISHES: once `DIAG_BUFFER` publishes are
+/// outstanding the read loop drops the NEWEST arriving publish rather than
+/// block; older buffered rounds linger and [`Client::diagnostics`] drains them
+/// by ORDER — the barrier marker, NOT version tags, splits stale from
+/// authoritative (see [`Client::drain_to_barrier`]). NOTE (B2): a drop-OLDEST
+/// ring (retain the freshest publishes) is the smarter policy, deferred to the
+/// B2 readiness/observability work.
 const DIAG_BUFFER: usize = 8;
 
 /// Bounds how long `rename` waits for a still-indexing language server to
@@ -115,6 +147,35 @@ pub enum LspError {
     /// Writing to or managing the transport failed.
     #[error("lsp: {0}")]
     Io(#[from] io::Error),
+    /// A request was issued after [`LspPool::shutdown`]; the pool is terminal
+    /// and never silently respawns a server once closed.
+    #[error("lsp: pool shut down")]
+    PoolShutdown,
+    /// A pooled server cell was invalidated (concurrently evicted/removed)
+    /// while the pool is still LIVE — DISTINCT from [`LspError::PoolShutdown`]
+    /// (which is reserved for a terminally-closed pool). [`LspPool::with_client`]
+    /// retries this against a fresh reservation; it is an internal retry signal,
+    /// never surfaced to callers on the happy path.
+    #[error("lsp: pooled server cell invalidated; retrying")]
+    CellInvalidated,
+}
+
+/// Classifies a transport-fatal error: the connection is gone, so a pooled
+/// server can never serve again and its entry must be invalidated (next
+/// acquire respawns). `Closed` = read loop hit EOF; `Io` = a write failed
+/// (e.g. `BrokenPipe` to a killed child). `Timeout`/`Rpc`/`RenameDeadline`
+/// are NOT fatal — the server is alive, just slow or refusing one request.
+fn is_fatal_transport(e: &LspError) -> bool {
+    matches!(e, LspError::Closed { .. } | LspError::Io(_))
+}
+
+/// Stable-within-process content fingerprint used to decide whether a
+/// bage-generated `compile_commands.json` is still the file we wrote before
+/// removing it on close — never clobber a database a caller replaced.
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -438,10 +499,20 @@ fn discover_same_language_files(root: &Path, language_id: &str, cap: usize) -> V
 /// no C/C++ sources are found) nothing is written and `Ok(None)` is
 /// returned; otherwise a minimal database covering every `.c`/`.cc`/`.cpp`/
 /// `.cxx` file under `root` is written — one `{directory, file, command:
-/// "clang -c <file>"}` entry each — and `Ok(Some(path))` is returned so the
-/// creator ([`Client::initialize`] via [`Client::close`]/Drop) can remove
-/// the file it added. A pre-existing database is never touched or removed.
-pub fn ensure_compile_commands(root: &Path) -> io::Result<Option<PathBuf>> {
+/// "clang -c <file>"}` entry each — and `Ok(Some((path, hash)))` is returned
+/// (`hash` fingerprints the bytes written) so the creator
+/// ([`Client::initialize`] via [`Client::close`]/Drop) removes the file it
+/// added ONLY while it still matches — never clobbering a caller's
+/// replacement. A pre-existing database is never touched or removed.
+///
+/// OWNERSHIP CAVEAT (honest note): the database is keyed by `root`, but the
+/// pool keys servers by (root, language). Today only clangd (C/C++) generates
+/// one, so per-root ownership is unambiguous. If a future mixed-language root
+/// ran two clangd servers over the same directory, the first to close would
+/// remove a database the second still relies on (only when it still matches
+/// what bage wrote). Robust shared-root ownership (refcount / per-server temp
+/// database) is DESIGN-ROUTED to B2 (mixed-language-root work), not solved here.
+pub fn ensure_compile_commands(root: &Path) -> io::Result<Option<(PathBuf, u64)>> {
     let db = root.join(COMPILE_COMMANDS);
     if db.exists() {
         return Ok(None);
@@ -467,8 +538,9 @@ pub fn ensure_compile_commands(root: &Path) -> io::Result<Option<PathBuf>> {
         .collect();
     let body = serde_json::to_vec_pretty(&entries)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let hash = content_hash(&body);
     fs::write(&db, body)?;
-    Ok(Some(db))
+    Ok(Some((db, hash)))
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +648,31 @@ fn read_frame(r: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
 // Client (Go client.go)
 // ---------------------------------------------------------------------------
 
+/// Method of the diagnostics ORDERING BARRIER request (DL-64 #1). A `$/`-prefixed
+/// request the LSP spec lets a server answer with `MethodNotFound` — a
+/// side-effect-free ping every server MUST answer IN ORDER after the didOpen (and
+/// any warm-reuse didClose "clear") it just processed. Its response is the FIFO
+/// point that splits stale/clear publishes (pre-barrier) from the authoritative
+/// one (post-barrier), so `diagnostics` never counts clears or guesses versions.
+const BARRIER_METHOD: &str = "$/bage/barrier";
+
+/// A message routed from [`read_loop`] to [`Client::diagnostics`] over the
+/// bounded diagnostics channel, in strict server FIFO order.
+enum DiagMsg {
+    /// A `textDocument/publishDiagnostics` params payload (uri + version +
+    /// diagnostics).
+    Publish(lt::PublishDiagnosticsParams),
+    /// In-band ORDERING BARRIER marker (DL-64 #1): emitted the instant the read
+    /// loop routes the response to the barrier request whose id equals the armed
+    /// [`Client::barrier_arm`]. Forwarded on the SAME FIFO channel as publishes,
+    /// so every publish the server emitted BEFORE answering the barrier is
+    /// enqueued ahead of it and every one AFTER lands behind — the order-based
+    /// split `diagnostics` uses to drain stale/clear rounds and return the
+    /// authoritative publish. Carries the id so a marker from a prior
+    /// (timed-out) barrier is ignored, never mistaken for this call's.
+    Barrier(u64),
+}
+
 /// A JSON-RPC response payload routed from the read loop to a waiting call.
 enum RpcOutcome {
     /// The `result` member (possibly `Value::Null`).
@@ -598,7 +695,35 @@ type PendingMap = Arc<Mutex<HashMap<u64, Sender<RpcOutcome>>>>;
 pub struct Client {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pending: PendingMap,
-    diags: Receiver<Vec<lt::Diagnostic>>,
+    /// Bounded FIFO of [`DiagMsg`] — `publishDiagnostics` params (uri + version +
+    /// diagnostics) interleaved with the in-band barrier marker. Carrying the uri
+    /// lets [`Client::diagnostics`] match the requested file and drain a warm
+    /// server's stale publishes for others; the marker splits pre- from
+    /// post-barrier rounds.
+    diags: Receiver<DiagMsg>,
+    /// Count of [`DiagMsg::Publish`] messages currently in `diags`, the budget
+    /// that reserves the barrier slot (see [`DIAG_BUFFER`]). [`read_loop`] (the
+    /// SOLE producer) increments only after a successful `try_send` and refuses
+    /// to send a publish once this reaches `DIAG_BUFFER`; [`Client::diagnostics`]
+    /// (via [`Client::drain_to_barrier`], the sole publish consumer) decrements
+    /// on every publish it drains. Single-producer + subtract-only-consumer, and
+    /// the channel itself orders the messages, so `Relaxed` suffices.
+    diag_publishes: Arc<AtomicUsize>,
+    /// Request id of the diagnostics ORDERING BARRIER currently awaited (0 =
+    /// none). Set by [`Client::diagnostics`] before it issues the barrier ping;
+    /// [`read_loop`] forwards a [`DiagMsg::Barrier`] onto `diags` when it routes
+    /// the matching response. Shared with the read loop; ids are monotonic so a
+    /// stale arm never matches a future response, and the read loop only ever
+    /// `try_send`s the marker (never blocks — the DROP-on-overflow invariant).
+    barrier_arm: Arc<AtomicU64>,
+    /// Persistent reader-death flag, set true by [`read_loop`] the instant it
+    /// exits (EOF or transport error). Observed at the top of `call` AND
+    /// `diagnostics` so a request issued AFTER the read side died fails FATAL
+    /// (`Closed`) immediately instead of writing into a corpse and blocking the
+    /// full call/rename deadline — the half-dead escape (stdout EOF while the
+    /// pending map is empty) that let `rename` burn 30s and return a non-fatal
+    /// `Timeout`/`RenameDeadline`, leaving the pooled cell `Ready` forever.
+    dead: Arc<AtomicBool>,
     next_id: u64,
     ver: i32,
     child: Option<Child>,
@@ -608,9 +733,15 @@ pub struct Client {
     /// Workspace root recorded at initialize — the base directory workspace
     /// priming walks before a rename.
     root: Option<PathBuf>,
-    /// A compile_commands.json bage generated for clangd, removed again on
-    /// close/Drop; `None` when the database pre-existed or was never needed.
-    created_compile_commands: Option<PathBuf>,
+    /// URIs currently `didOpen` on the server. On warm reuse a re-open of an
+    /// already-open doc `didClose`s first, so a pooled server never receives a
+    /// spec-illegal duplicate `didOpen`.
+    open_docs: HashSet<String>,
+    /// A compile_commands.json bage generated for clangd (path + content
+    /// fingerprint at creation), removed again on close/Drop ONLY if the file
+    /// still matches — never clobber a caller's replacement. `None` when the
+    /// database pre-existed or was never needed.
+    created_compile_commands: Option<(PathBuf, u64)>,
     /// Bounds how long `rename` retries a still-indexing server (overridable
     /// in tests).
     pub rename_deadline: Duration,
@@ -656,21 +787,44 @@ impl Client {
     ) -> Client {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(writer)));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (diag_tx, diag_rx) = mpsc::sync_channel(DIAG_BUFFER);
+        // `+ 1` reserves a slot that the publish accounting (`diag_publishes`,
+        // capped at DIAG_BUFFER) can never claim, so the barrier marker is never
+        // dropped on a full buffer (DL-65 item 2).
+        let (diag_tx, diag_rx) = mpsc::sync_channel(DIAG_BUFFER + 1);
+        let diag_publishes = Arc::new(AtomicUsize::new(0));
+        let dead = Arc::new(AtomicBool::new(false));
+        let barrier_arm = Arc::new(AtomicU64::new(0));
         {
             let writer = Arc::clone(&writer);
             let pending = Arc::clone(&pending);
-            thread::spawn(move || read_loop(Box::new(reader), writer, pending, diag_tx));
+            let dead = Arc::clone(&dead);
+            let barrier_arm = Arc::clone(&barrier_arm);
+            let diag_publishes = Arc::clone(&diag_publishes);
+            thread::spawn(move || {
+                read_loop(
+                    Box::new(reader),
+                    writer,
+                    pending,
+                    diag_tx,
+                    diag_publishes,
+                    dead,
+                    barrier_arm,
+                )
+            });
         }
         Client {
             writer,
             pending,
             diags: diag_rx,
+            diag_publishes,
+            barrier_arm,
+            dead,
             next_id: 0,
             ver: 0,
             child: None,
             command: Vec::new(),
             root: None,
+            open_docs: HashSet::new(),
             created_compile_commands: None,
             rename_deadline: DEFAULT_RENAME_DEADLINE,
             rename_retry: DEFAULT_RENAME_RETRY,
@@ -680,10 +834,34 @@ impl Client {
 
     /// Sends one request and blocks for its response (bounded by `timeout`).
     fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, LspError> {
+        // Reader dead: the read loop already exited, so no response can ever
+        // arrive. Writing + blocking would burn the full `timeout` and return a
+        // non-fatal `Timeout` (the half-dead escape). Fail FATAL now so the
+        // pool invalidates + respawns the corpse.
+        if self.dead.load(Ordering::Acquire) {
+            return Err(LspError::Closed {
+                method: method.to_string(),
+            });
+        }
         self.next_id += 1;
         let id = self.next_id;
         let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(id, tx);
+        // TOCTOU re-check (DL-64 #2): the reader may have hit EOF — setting `dead`
+        // and DRAINING the pending map — AFTER the top-of-fn check but BEFORE this
+        // insert, leaving our freshly-inserted waiter unreachable by that drain.
+        // A write + block would then burn the full `timeout` and return a
+        // non-fatal `Timeout` (the half-dead escape). Re-checking the flag under
+        // the just-inserted entry closes the window: `Release`/`Acquire` ordering
+        // means observing `dead == false` here guarantees the reader's drain has
+        // not run yet and WILL fail our waiter; observing `true` means we self-
+        // remove and fail FATAL now, never writing into a corpse.
+        if self.dead.load(Ordering::Acquire) {
+            lock(&self.pending).remove(&id);
+            return Err(LspError::Closed {
+                method: method.to_string(),
+            });
+        }
 
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(e) = write_frame(lock(&self.writer).as_mut(), &req) {
@@ -742,20 +920,40 @@ impl Client {
     }
 
     /// Opens `path` in the server via `textDocument/didOpen` with the given
-    /// authoritative content.
+    /// authoritative content. On a warm server that already holds this doc
+    /// open (pooled reuse), a `textDocument/didClose` is sent first: the LSP
+    /// spec forbids a duplicate `didOpen`, so re-open = close-then-open.
     fn did_open(&mut self, path: &str, content: &str) -> Result<(), LspError> {
+        let uri = file_uri(path).to_string();
+        if self.open_docs.contains(&uri) {
+            self.did_close_uri(&uri)?;
+        }
         self.ver += 1;
         self.notify(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
-                    "uri": file_uri(path),
+                    "uri": uri,
                     "languageId": language_id_for_path(path),
                     "version": self.ver,
                     "text": content,
                 },
             }),
-        )
+        )?;
+        self.open_docs.insert(uri);
+        Ok(())
+    }
+
+    /// Sends `textDocument/didClose` for an already-open `uri` and forgets it,
+    /// so the next `did_open` of the same doc is a fresh open (the warm-reuse
+    /// duplicate-`didOpen` fix).
+    fn did_close_uri(&mut self, uri: &str) -> Result<(), LspError> {
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        )?;
+        self.open_docs.remove(uri);
+        Ok(())
     }
 
     /// Opens the file at `path` (sending `content` via didOpen so the server
@@ -790,6 +988,12 @@ impl Client {
         let mut last: String;
         loop {
             match self.call("textDocument/rename", params.clone(), self.call_timeout) {
+                // Fatal transport (connection gone / write failed): the server
+                // is DEAD, not merely still-indexing. Break the retry loop
+                // immediately with the TYPED error — never stringify a corpse
+                // into `last` and burn the full 30s rename deadline retrying it
+                // (MIN-1). `with_client` then invalidates + respawns.
+                Err(e) if is_fatal_transport(&e) => return Err(e),
                 Err(e) => last = e.to_string(),
                 Ok(v) => match serde_json::from_value::<Option<lt::WorkspaceEdit>>(v) {
                     Ok(Some(we)) if workspace_edit_has_changes(&we) => return Ok(we),
@@ -842,38 +1046,144 @@ impl Client {
     }
 
     /// Opens `path` in the server (didOpen with `content`) and collects the
-    /// first `textDocument/publishDiagnostics` notification the server pushes,
-    /// mapping each entry into Båge's reporting shape. The result arrives as
-    /// a server→client NOTIFICATION (not a request response), so it is
-    /// gathered from the read loop via the bounded diagnostics queue. Blocks
-    /// until the server publishes or `timeout` elapses; an empty publish (a
-    /// clean file) returns an empty vec.
+    /// `textDocument/publishDiagnostics` notification FOR `path`, mapping each
+    /// entry into Båge's reporting shape. The result arrives as a
+    /// server→client NOTIFICATION (not a request response), gathered from the
+    /// read loop via the bounded diagnostics queue. Blocks until the
+    /// authoritative publish for `path` arrives or `timeout` elapses; an empty
+    /// publish (a clean file) returns an empty vec.
+    ///
+    /// ORDERING BARRIER (DL-64 #1). After the (possibly warm) `did_open`, a
+    /// synchronous [`BARRIER_METHOD`] round-trip is issued; [`read_loop`] marks
+    /// its response in-band on the FIFO diagnostics channel. Every publish
+    /// enqueued BEFORE that marker is stale by construction — a prior file's, a
+    /// superseded round, or the version-less "clear" a warm re-open's `didClose`
+    /// emits (possibly SEVERAL, e.g. an interleaved rename's `didClose` plus this
+    /// call's) — and is drained. The FIRST same-uri publish AFTER the marker is
+    /// this file's answer. Order-based only: never counting clears nor guessing
+    /// versions (the lazy 1-clear counter this replaces missed a second
+    /// outstanding clear — false-clean `[]` — and misdrained a version-less clean
+    /// publish as a "clear" — false [`LspError::DiagnosticsTimeout`]).
+    ///
+    /// CAUSALITY LIMIT (accepted, ruled DL-65). The barrier proves ARRIVAL
+    /// order, not CAUSALITY: a debounced server may flush a pre-barrier-caused
+    /// publish AFTER answering the barrier, so a returned round can be
+    /// stale-clean on a warm server (module docs). Best-effort by construction;
+    /// the causal close is the pull-based [`textDocument/diagnostic`] request
+    /// (LSP 3.17), routed to B2. The inline-publisher path (a server that
+    /// publishes SYNCHRONOUSLY on `didOpen`, before answering the barrier) has no
+    /// post-barrier round to return here and degrades to an HONEST
+    /// [`LspError::DiagnosticsTimeout`] (PR-B shape) rather than a false-clean —
+    /// the retry-safe, never-silently-wrong outcome.
     pub fn diagnostics(
         &mut self,
         path: &str,
         content: &str,
         timeout: Duration,
     ) -> Result<Vec<Diagnostic>, LspError> {
+        // Reader dead: fail FATAL rather than block for `timeout` (parity with
+        // `call`). The diagnostics sender is also dropped when the read loop
+        // exits, but the explicit flag check makes the fatal outcome immediate
+        // even before a `didOpen` write is attempted into the corpse.
+        if self.dead.load(Ordering::Acquire) {
+            return Err(LspError::Closed {
+                method: "textDocument/publishDiagnostics".to_string(),
+            });
+        }
+        let want = file_uri(path).as_str().to_string();
         self.did_open(path, content)?;
-        match self.diags.recv_timeout(timeout) {
-            Ok(raw) => Ok(raw.iter().map(to_diagnostic).collect()),
-            Err(_) => Err(LspError::DiagnosticsTimeout {
-                path: path.to_string(),
-                after: timeout,
-            }),
+        // Arm + issue the barrier. The read loop stamps a `DiagMsg::Barrier` at
+        // the exact FIFO point this response occupies among the publishes.
+        self.next_id += 1;
+        let barrier_id = self.next_id;
+        self.barrier_arm.store(barrier_id, Ordering::Release);
+        let req = json!({
+            "jsonrpc": "2.0", "id": barrier_id, "method": BARRIER_METHOD, "params": Value::Null,
+        });
+        let write_res = write_frame(lock(&self.writer).as_mut(), &req);
+        let out = match write_res {
+            // Write failed: the transport is gone. FATAL (parity with `call`).
+            Err(e) => Err(LspError::Io(e)),
+            Ok(()) => self.drain_to_barrier(&want, path, barrier_id, timeout),
+        };
+        // Disarm unconditionally so a late barrier response cannot stamp a stale
+        // marker against a FUTURE call's channel.
+        self.barrier_arm.store(0, Ordering::Release);
+        out
+    }
+
+    /// Drains the diagnostics FIFO for the barrier awaited under `barrier_id`:
+    /// discards every message ahead of the [`DiagMsg::Barrier`] marker (stale
+    /// rounds, other files, warm-reuse clears) and returns the FIRST `uri`-match
+    /// publish AFTER it. A marker for a DIFFERENT (prior, timed-out) barrier is
+    /// ignored. `Disconnected` = read loop hit EOF → FATAL `Closed` (so
+    /// `with_client` invalidates + respawns the corpse, never a non-fatal
+    /// timeout that leaves it pooled `Ready`); exhausting `timeout` = a live but
+    /// quiet server → non-fatal, retry-safe `DiagnosticsTimeout`.
+    fn drain_to_barrier(
+        &self,
+        want: &str,
+        path: &str,
+        barrier_id: u64,
+        timeout: Duration,
+    ) -> Result<Vec<Diagnostic>, LspError> {
+        let deadline = Instant::now() + timeout;
+        let mut past_barrier = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(LspError::DiagnosticsTimeout {
+                    path: path.to_string(),
+                    after: timeout,
+                });
+            }
+            match self.diags.recv_timeout(remaining) {
+                Ok(DiagMsg::Barrier(id)) => {
+                    // Our barrier reached: everything ahead was pre-barrier and
+                    // already drained; the next uri-match publish is the answer.
+                    if id == barrier_id {
+                        past_barrier = true;
+                    }
+                    continue;
+                }
+                // Pre-barrier (stale/other-file/clear) OR a post-barrier publish
+                // for a DIFFERENT file: drain and keep waiting. Only a post-
+                // barrier same-uri publish is authoritative — including an empty
+                // one (a genuinely clean file → `Ok([])`).
+                Ok(DiagMsg::Publish(p)) => {
+                    // Consumed a publish from the channel: free its slot in the
+                    // accounting so the read loop can buffer another (and the
+                    // reserved barrier slot stays reserved). See `diag_publishes`.
+                    self.diag_publishes.fetch_sub(1, Ordering::Relaxed);
+                    if !past_barrier || p.uri.as_str() != want {
+                        continue;
+                    }
+                    return Ok(p.diagnostics.iter().map(to_diagnostic).collect());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(LspError::DiagnosticsTimeout {
+                        path: path.to_string(),
+                        after: timeout,
+                    });
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(LspError::Closed {
+                        method: "textDocument/publishDiagnostics".to_string(),
+                    });
+                }
+            }
         }
     }
 
     /// Requests an orderly LSP shutdown (shutdown + exit) and reaps the
     /// subprocess, killing it if it does not exit promptly. Removes a
-    /// compile_commands.json bage generated for clangd (a pre-existing
+    /// compile_commands.json bage generated for clangd — but only while it
+    /// still matches what bage wrote (a pre-existing OR caller-replaced
     /// database is never touched). Best-effort: a failed shutdown still
     /// proceeds to exit and reaping, and the first error encountered is
     /// returned.
     pub fn close(&mut self) -> Result<(), LspError> {
-        if let Some(db) = self.created_compile_commands.take() {
-            let _ = fs::remove_file(db);
-        }
+        remove_generated_compile_commands(self.created_compile_commands.take());
         let shutdown = self.call("shutdown", Value::Null, Duration::from_secs(2));
         let exit = self.notify("exit", Value::Null);
         if let Some(mut child) = self.child.take() {
@@ -898,19 +1208,629 @@ impl Client {
             _ => Ok(()),
         }
     }
+
+    /// OS process id of the spawned server, or `None` for a `from_conn`
+    /// client (no owned subprocess). Lets the pool / an observability layer
+    /// identify and verify reaping of the server child — the orphan-prevention
+    /// invariant the pool leans on.
+    pub fn server_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
 }
 
 impl Drop for Client {
     /// Backstop: kill and reap the server subprocess if `close` was skipped,
-    /// and remove a compile_commands.json bage created.
+    /// and remove a compile_commands.json bage created (only if it still
+    /// matches what bage wrote).
     fn drop(&mut self) {
-        if let Some(db) = self.created_compile_commands.take() {
-            let _ = fs::remove_file(db);
-        }
+        remove_generated_compile_commands(self.created_compile_commands.take());
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// Removes a bage-generated `compile_commands.json` ONLY while its bytes still
+/// hash to what bage wrote — a caller may have replaced the database, and
+/// clobbering foreign content is never acceptable. A read failure or hash
+/// mismatch leaves the file untouched.
+fn remove_generated_compile_commands(created: Option<(PathBuf, u64)>) {
+    if let Some((db, hash)) = created
+        && fs::read(&db)
+            .map(|b| content_hash(&b) == hash)
+            .unwrap_or(false)
+    {
+        let _ = fs::remove_file(db);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent server pool (B1)
+// ---------------------------------------------------------------------------
+
+/// Default idle window before [`LspPool::evict_idle`] tears a warm server
+/// down: long enough to keep a server hot across a burst of edits, short
+/// enough not to strand a language server indefinitely.
+pub const DEFAULT_POOL_IDLE_TTL: Duration = Duration::from_secs(300);
+
+/// Default cap on concurrently-live servers — bounds spawned subprocesses so
+/// a many-root session never fans out unboundedly; at cap the least-recently
+/// -used server is evicted to make room.
+pub const DEFAULT_POOL_MAX_SERVERS: usize = 8;
+
+/// Whether a pooled server is usable yet. The readiness signal B2 (hover /
+/// goto-def / find-refs) gates on: `Starting` = reserved and the initialize
+/// handshake is in flight (spawned OUTSIDE the pool map lock so it is
+/// observable), so NO request is legal; `Ready` = initialized, requests may be
+/// issued (a server may still be warming its cross-file index past this point
+/// — `rename` already retries that still-indexing window, and B2 will treat
+/// `Ready` as the floor past which a request is worth making); `Shutdown` =
+/// terminal, the server was evicted/closed and is never reused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Readiness {
+    /// Reserved; initialize in flight (not yet acknowledged). No request legal.
+    Starting,
+    /// Initialize acknowledged; the server is serving requests.
+    Ready,
+    /// Evicted/closed; terminal. A cell in this state is never handed out.
+    Shutdown,
+}
+
+/// Identity of a pooled server: one language server per (workspace root,
+/// language). Distinct roots or languages get distinct servers; repeat
+/// callers on the same pair reuse the one warm server.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct PoolKey {
+    /// Workspace root the server was initialized at.
+    root: PathBuf,
+    /// LSP `languageId` (from [`language_id_for_path`]).
+    language: String,
+}
+
+/// One pooled server plus its bookkeeping. `client` is `Mutex<Option<Client>>`
+/// so concurrent requests to the same key SERIALIZE onto the single connection
+/// (a [`Client`] is not safe for concurrent use) AND the lock doubles as the
+/// once-only init guard: spawn+initialize run under it OUTSIDE the pool map
+/// lock (`None` until the handshake completes), so a slow handshake blocks
+/// neither other keys nor a `readiness` observer. `readiness` is the B2
+/// gating signal; `last_used` drives idle + LRU eviction; `leases` COUNTS
+/// in-flight requests so a busy server is never evicted out from under one.
+struct PooledServer {
+    /// The live connection, `None` between reservation and a completed
+    /// handshake; the mutex is the single-server serialization + init guard.
+    client: Mutex<Option<Client>>,
+    /// B2-facing readiness signal (observable as `Starting` during init).
+    readiness: Mutex<Readiness>,
+    /// Last time a request ran against this server (idle/LRU input).
+    last_used: Mutex<Instant>,
+    /// Count of in-flight requests holding this server. A COUNTER, not a bool,
+    /// and incremented UNDER the map lock at acquire time (MIN-4/DL-63 #4): a
+    /// bool set post-acquire left a window where a just-returned `Ready` cell
+    /// was still evictable, and — worse — a same-key handoff (T1 drop clearing
+    /// T2's lease) stomped a live lease to `false`, un-pinning a busy server.
+    /// A per-request increment/decrement pair keeps concurrent leases on one
+    /// key independent; `> 0` == leased == never LRU/idle-evicted.
+    leases: Mutex<u32>,
+}
+
+impl PooledServer {
+    /// A fresh reservation: no client yet, `Starting`, unleased (0 in-flight).
+    fn reserved() -> PooledServer {
+        PooledServer {
+            client: Mutex::new(None),
+            readiness: Mutex::new(Readiness::Starting),
+            last_used: Mutex::new(Instant::now()),
+            leases: Mutex::new(0),
+        }
+    }
+}
+
+/// Whether a pooled cell may be evicted RIGHT NOW: NO in-flight lease (`leases
+/// == 0` — no request would be stranded) AND fully `Ready` (a `Starting`
+/// reservation is mid-handshake — evicting it strands the spawn and
+/// double-spawns the key; a `Shutdown` cell is already terminal). Shared by
+/// [`evict_lru`] and [`LspPool::evict_idle`] so the exemption set stays
+/// identical (MIN-4/DL-63 #4).
+fn evictable(s: &PooledServer) -> bool {
+    *lock(&s.leases) == 0 && *lock(&s.readiness) == Readiness::Ready
+}
+
+/// RAII release for ONE lease previously taken under the map lock (in
+/// [`LspPool::acquire`]). Drop decrements the lease count and stamps last-used,
+/// so a panic unwinding out of a request closure cannot leak a lease and pin
+/// the entry unevictable forever (MIN-4). The INCREMENT is deliberately NOT
+/// here — it happens under the map lock at acquire time (DL-63 #4) to close the
+/// acquire→guard window; this guard owns only the paired decrement.
+struct LeaseGuard(Arc<PooledServer>);
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        *lock(&self.0.last_used) = Instant::now();
+        let mut n = lock(&self.0.leases);
+        // Fail LOUD in debug on a double-release (DL-64 #5): every increment
+        // (under the map lock in `acquire`) is paired with exactly ONE decrement,
+        // so reaching 0 here means a leak/double-release bug — assert rather than
+        // silently `saturating_sub` past it. Release builds trust the invariant.
+        debug_assert!(*n > 0, "lease double-release: decrement at zero");
+        *n -= 1;
+    }
+}
+
+/// A persistent language-server pool keyed by (root, language): it replaces
+/// the old spawn-per-call model, keeping servers warm across requests while
+/// guaranteeing every spawned child is reaped on drop/shutdown (no orphans),
+/// bounding concurrently-live servers, and evicting idle ones. Requests run
+/// through [`LspPool::with_client`] / [`LspPool::with_client_for_file`] under
+/// the per-server lock. `Send`+`Sync` (the spawn factory is `Send`+`Sync`,
+/// every field is a `Mutex`), so a pool is shareable across threads — the
+/// substrate a future persistent MCP/GDD-IDE session drives.
+pub struct LspPool {
+    /// Spawns one fresh (un-initialized) server connection. The production
+    /// factory is `Client::new_stdio(command)`; tests inject an in-memory
+    /// transport. Boxed `Fn` so the pool stays a concrete type.
+    spawn: Box<dyn Fn() -> Result<Client, LspError> + Send + Sync>,
+    /// Idle window for [`LspPool::evict_idle`].
+    idle_ttl: Duration,
+    /// Hard cap on concurrently-live servers (>= 1). At cap a new key evicts LRU
+    /// EVICTABLE (idle, `Ready`) servers in a LOOP until strictly under the cap
+    /// BEFORE inserting (DL-63 #1) — so a pool that once overshot really shrinks
+    /// back on the next new-key acquire (the prior evict-one-insert-one was
+    /// net-zero and pinned the pool at the overshoot). When EVERY pooled server
+    /// is leased/handshaking the loop finds no victim and the pool transiently
+    /// overshoots the cap by this one reservation; that overshoot is NOT
+    /// reclaimed the instant a lease frees — it shrinks at the NEXT eviction
+    /// pass that finds a free victim (a subsequent new-key acquire once a lease
+    /// freed, or [`LspPool::evict_idle`] after `idle_ttl`). See [`evict_lru`].
+    max_servers: usize,
+    /// The warm servers, keyed by identity.
+    servers: Mutex<HashMap<PoolKey, Arc<PooledServer>>>,
+    /// Set by [`LspPool::shutdown`]: terminal. Once closed, `acquire` returns
+    /// [`LspError::PoolShutdown`] instead of silently respawning.
+    closed: AtomicBool,
+}
+
+impl LspPool {
+    /// Production pool: servers spawned via [`Client::new_stdio`] with
+    /// `command`, default idle TTL and server cap.
+    pub fn new(command: Vec<String>) -> LspPool {
+        LspPool::with_config(command, DEFAULT_POOL_IDLE_TTL, DEFAULT_POOL_MAX_SERVERS)
+    }
+
+    /// Production pool with an explicit idle window and server cap.
+    pub fn with_config(command: Vec<String>, idle_ttl: Duration, max_servers: usize) -> LspPool {
+        let spawn = move || Client::new_stdio(&command);
+        LspPool::from_spawn(Box::new(spawn), idle_ttl, max_servers)
+    }
+
+    /// Seam constructor over an arbitrary spawn factory (tests wire in-memory
+    /// transports; production goes through [`LspPool::with_config`]). The cap
+    /// is floored at 1 so the pool can always hold the server it just spawned.
+    fn from_spawn(
+        spawn: Box<dyn Fn() -> Result<Client, LspError> + Send + Sync>,
+        idle_ttl: Duration,
+        max_servers: usize,
+    ) -> LspPool {
+        LspPool {
+            spawn,
+            idle_ttl,
+            max_servers: max_servers.max(1),
+            servers: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Acquires (or spawns+initializes, once) the server for (`root`,
+    /// `language`) and runs `f` against it under the per-server lock, so
+    /// concurrent callers on the same key serialize onto ONE server. The
+    /// spawn+initialize happens OUTSIDE the map lock (only the reservation is
+    /// under it), so a key is spawned at most once under a stampede without
+    /// blocking other keys.
+    ///
+    /// Self-healing: if `f` fails with a fatal transport error (the pooled
+    /// connection died — e.g. the server was killed), the dead entry is
+    /// invalidated and `f` is retried ONCE against a freshly respawned server.
+    /// This restores the old spawn-per-call resilience — a dead server never
+    /// poisons the key for the pool's lifetime — hence `f: Fn` (may run
+    /// twice). `rename`/`diagnostics` are idempotent, so a retry is safe.
+    pub fn with_client<T>(
+        &self,
+        root: &Path,
+        language: &str,
+        f: impl Fn(&mut Client) -> Result<T, LspError>,
+    ) -> Result<T, LspError> {
+        let key = PoolKey {
+            root: root.to_path_buf(),
+            language: language.to_string(),
+        };
+        // Bounded self-healing (DL-63 #6). Two transient faults each cost one
+        // respawn+retry: a live-pool cell invalidation (a concurrent evict
+        // marked this reservation `Shutdown` — [`LspError::CellInvalidated`],
+        // an INTERNAL retry signal) and a fatal transport error (the pooled
+        // connection died). `MAX_ATTEMPTS = 2` heals a single concurrent
+        // invalidation/death, bounded so a pathological storm cannot loop.
+        // `CellInvalidated` NEVER escapes on the happy path: it retries. On
+        // exhaustion the surfaced error is HONEST (DL-64 #4): `PoolShutdown` ONLY
+        // when the pool actually closed under us; on a still-LIVE pool the
+        // UNDERLYING fatal transport error that drove the invalidation (remembered
+        // in `last_fatal`), else the retry signal itself — never a lying
+        // `PoolShutdown` on a live pool. A fatal transport error on the LAST
+        // attempt surfaces AS itself.
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut last_fatal: Option<LspError> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let (result, server) = match self.run_once(&key, &f) {
+                Ok(rs) => rs,
+                Err(LspError::CellInvalidated) => {
+                    // A live-pool evict race. Terminal ONLY if the pool closed;
+                    // otherwise retry against a fresh reservation.
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(LspError::PoolShutdown);
+                    }
+                    if attempt == MAX_ATTEMPTS {
+                        // Retries spent on a LIVE pool: surface the underlying
+                        // fatal error if the invalidation was death-driven, else
+                        // the honest retry signal — never a false `PoolShutdown`.
+                        return Err(last_fatal.take().unwrap_or(LspError::CellInvalidated));
+                    }
+                    continue;
+                }
+                // A typed spawn/handshake error (incl. terminal `PoolShutdown`)
+                // is authoritative — never retried, never masked.
+                Err(e) => return Err(e),
+            };
+            match result {
+                Err(e) if is_fatal_transport(&e) => {
+                    // Dead connection: invalidate so no later caller reuses it.
+                    self.remove_cell(&key, &server);
+                    if attempt == MAX_ATTEMPTS {
+                        // Retries spent: surface the fatal transport error.
+                        return Err(e);
+                    }
+                    // Remember it: a following-attempt `CellInvalidated` exhaustion
+                    // then surfaces THIS real cause instead of a bare signal.
+                    last_fatal = Some(e);
+                    drop(server);
+                    // else loop: respawn + retry once.
+                }
+                other => return other,
+            }
+        }
+        // Every `attempt == MAX_ATTEMPTS` arm above returns; unreachable.
+        unreachable!("with_client retry loop returns on the final attempt")
+    }
+
+    /// [`LspPool::with_client`] with the key derived from a file the way the
+    /// old spawn-per-call paths did: root = the file's parent (or "."),
+    /// language = [`language_id_for_path`]. The single migration entrypoint
+    /// for `rename` and `diagnostics`.
+    pub fn with_client_for_file<T>(
+        &self,
+        file: &Path,
+        f: impl Fn(&mut Client) -> Result<T, LspError>,
+    ) -> Result<T, LspError> {
+        let root = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let language = language_id_for_path(&file.to_string_lossy()).to_string();
+        self.with_client(&root, &language, f)
+    }
+
+    /// One acquire+run pass: acquires the (initialized) server — ALREADY leased
+    /// (the lease was taken under the map lock inside [`LspPool::acquire`], so
+    /// there is no evictable window between selecting the cell and pinning it) —
+    /// runs `f`, stamps last-used, and releases the lease. Returns `f`'s result
+    /// plus the server Arc so the caller can invalidate it on a fatal transport
+    /// error.
+    fn run_once<T>(
+        &self,
+        key: &PoolKey,
+        f: &impl Fn(&mut Client) -> Result<T, LspError>,
+    ) -> Result<(Result<T, LspError>, Arc<PooledServer>), LspError> {
+        let server = self.acquire(key)?;
+        // RAII release for the lease `acquire` already took under the map lock:
+        // the guard decrements it (and stamps last-used) on drop — including an
+        // UNWINDING PANIC out of `f`, which must never leak a lease and pin the
+        // entry unevictable forever (MIN-4). `f`'s panic still propagates.
+        let guard = LeaseGuard(Arc::clone(&server));
+        let result = {
+            let mut slot = lock(&server.client);
+            let client = slot
+                .as_mut()
+                .expect("acquire guarantees an initialized client");
+            f(client)
+        };
+        drop(guard);
+        Ok((result, server))
+    }
+
+    /// The B2 readiness signal for a key, or `None` when no server is pooled
+    /// for it yet.
+    pub fn readiness(&self, root: &Path, language: &str) -> Option<Readiness> {
+        let key = PoolKey {
+            root: root.to_path_buf(),
+            language: language.to_string(),
+        };
+        lock(&self.servers).get(&key).map(|s| *lock(&s.readiness))
+    }
+
+    /// Number of warm servers currently pooled.
+    pub fn len(&self) -> usize {
+        lock(&self.servers).len()
+    }
+
+    /// Whether the pool holds no warm servers.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Explicit maintenance entrypoint (NOT auto-scheduled — the pool runs no
+    /// background reaper; a future B2/GDD session loop drives it, and `Drop`
+    /// reaps everything regardless): closes and removes every server idle for
+    /// at least `idle_ttl`, returning how many were evicted. In-flight (leased)
+    /// servers are skipped — never torn down under an active request.
+    pub fn evict_idle(&self) -> usize {
+        let now = Instant::now();
+        // Drain the stale entries UNDER the map lock, then release it before
+        // closing: `close_server` blocks up to ~5s (shutdown RPC + child reap)
+        // and holding the global map lock across it stalled every other key's
+        // acquire (MIN-3).
+        let drained: Vec<Arc<PooledServer>> = {
+            let mut map = lock(&self.servers);
+            let stale: Vec<PoolKey> = map
+                .iter()
+                .filter(|(_, s)| {
+                    evictable(s) && now.duration_since(*lock(&s.last_used)) >= self.idle_ttl
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            let mut out = Vec::with_capacity(stale.len());
+            for k in &stale {
+                if let Some(s) = map.remove(k) {
+                    *lock(&s.readiness) = Readiness::Shutdown;
+                    out.push(s);
+                }
+            }
+            out
+        };
+        let n = drained.len();
+        for s in drained {
+            close_server(s);
+        }
+        n
+    }
+
+    /// Orderly teardown: mark the pool closed (terminal — `acquire` then
+    /// returns [`LspError::PoolShutdown`] rather than silently respawning) and
+    /// close+remove every pooled server. Called by `Drop`; also an explicit
+    /// shutdown API.
+    ///
+    /// In-flight handshake (DL-63 #5): a reservation whose spawn+initialize is
+    /// still running when shutdown drains the map keeps its own client `Arc`, so
+    /// `close_server` here no-ops on it (not the last ref); [`ensure_ready`]
+    /// then observes the `closed` flag it set, closes its freshly-spawned client
+    /// itself, and surfaces `PoolShutdown` — never installing a live server into
+    /// the now-terminal pool.
+    pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Drain under the lock, close AFTER releasing it (MIN-3): a
+        // ~5s-per-server teardown must not hold the global map lock and stall a
+        // concurrent `readiness`/`acquire`.
+        let drained: Vec<Arc<PooledServer>> = {
+            let mut map = lock(&self.servers);
+            map.drain()
+                .map(|(_, s)| {
+                    *lock(&s.readiness) = Readiness::Shutdown;
+                    s
+                })
+                .collect()
+        };
+        for s in drained {
+            close_server(s);
+        }
+    }
+
+    /// Acquires the initialized server for `key`, reserving+spawning one when
+    /// absent, and LEASES it (increment under the map lock) before returning so
+    /// there is no evictable window between selecting the cell and pinning it
+    /// (DL-63 #4). Phase 1 (map lock): find-or-reserve the cell (a `Starting`
+    /// placeholder) and take the lease, evicting LRU idle servers to make room
+    /// at cap. Phase 2 (per-cell lock, map lock RELEASED): spawn+initialize
+    /// exactly once — so a slow handshake blocks neither other keys nor a
+    /// `readiness` observer, and a concurrent stampede on one key still spawns a
+    /// single server. A failed handshake releases the lease and removes the
+    /// poisoned reservation so the cap is not consumed. The caller
+    /// ([`LspPool::run_once`]) owns the paired lease RELEASE via [`LeaseGuard`].
+    fn acquire(&self, key: &PoolKey) -> Result<Arc<PooledServer>, LspError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LspError::PoolShutdown);
+        }
+        let (cell, evicted) = {
+            let mut map = lock(&self.servers);
+            // Re-check under the lock: shutdown may have raced in.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(LspError::PoolShutdown);
+            }
+            let (cell, evicted) = if let Some(s) = map.get(key) {
+                (Arc::clone(s), Vec::new())
+            } else {
+                // At cap, evict evictable servers in a LOOP until strictly under
+                // the cap BEFORE inserting (DL-63 #1). The prior evict-ONE
+                // -insert-one was net-zero: once the pool overshot to N it stayed
+                // at N forever (each new-key acquire evicted 1 and added 1). When
+                // EVERY server is leased there is no victim and the loop stops,
+                // so a fully-busy pool still transiently overshoots by this one
+                // reservation — reclaimed at the NEXT acquire once a lease frees.
+                let mut evicted = Vec::new();
+                while map.len() >= self.max_servers {
+                    match evict_lru(&mut map) {
+                        Some(victim) => evicted.push(victim),
+                        None => break, // all leased/handshaking → transient overshoot
+                    }
+                }
+                let s = Arc::new(PooledServer::reserved());
+                map.insert(key.clone(), Arc::clone(&s));
+                (s, evicted)
+            };
+            // Take the lease WHILE still holding the map lock: a concurrent
+            // `evict_lru` in another acquire now sees `leases > 0` and skips it.
+            *lock(&cell.leases) += 1;
+            (cell, evicted)
+        };
+        // Close LRU victims AFTER releasing the map lock (MIN-3): a ~5s teardown
+        // each must not block every other key spawning here.
+        //
+        // RECLAIM-LATENCY (DL-64 #6, honest note): the close is SERIAL, so a
+        // loop-evict of several victims charges the sum of their teardowns to
+        // THIS acquire — up to ~5s per UNRESPONSIVE victim (`close_server` waits
+        // out the shutdown RPC + child reap). Acceptable for the MVP (eviction is
+        // rare and off the warm-hit path); deferring the teardown to a background
+        // reaper + surfacing reclaim latency is B2 observability work.
+        for victim in evicted {
+            close_server(victim);
+        }
+        if let Err(e) = self.ensure_ready(&cell, key) {
+            // Release the lease we took, then invalidate the poisoned/terminal
+            // reservation so the cap is not consumed by a dead cell.
+            {
+                let mut n = lock(&cell.leases);
+                // Paired with the increment above under the map lock; fail LOUD
+                // in debug on an unbalanced release (DL-64 #5).
+                debug_assert!(*n > 0, "lease double-release: decrement at zero");
+                *n -= 1;
+            }
+            self.remove_cell(key, &cell);
+            return Err(e);
+        }
+        Ok(cell)
+    }
+
+    /// Spawns+initializes `cell`'s connection exactly once, under the per-cell
+    /// client lock (map lock already released). A concurrent caller holding
+    /// the same `Arc` blocks here until the first finishes, then observes
+    /// `Ready` and reuses the connection. A `Shutdown` cell is refused.
+    ///
+    /// Post-handshake shutdown re-check (DL-63 #5): the handshake can be slow,
+    /// and [`LspPool::shutdown`] may flip the pool terminal WHILE it runs. If it
+    /// did, installing the freshly-spawned client would resurrect a live server
+    /// into a closed pool AND overwrite readiness to `Ready` on a cell shutdown
+    /// already drained from the map. So the pool's `closed` flag is re-checked
+    /// under the cell lock before install: on a race, the new client is closed
+    /// and `PoolShutdown` surfaced instead.
+    fn ensure_ready(&self, cell: &Arc<PooledServer>, key: &PoolKey) -> Result<(), LspError> {
+        let mut slot = lock(&cell.client);
+        match *lock(&cell.readiness) {
+            Readiness::Ready => return Ok(()),
+            // A `Shutdown` cell here means a concurrent evict/remove invalidated
+            // THIS reservation while the pool is live (NOT a pool shutdown):
+            // signal a retryable cell-invalidation so `with_client` respawns,
+            // never a spurious terminal `PoolShutdown` on a live pool (MIN-2).
+            Readiness::Shutdown => return Err(LspError::CellInvalidated),
+            Readiness::Starting => {}
+        }
+        let mut client = (self.spawn)()?;
+        client.initialize(&file_uri(&key.root.to_string_lossy()).to_string())?;
+        // Install UNDER the map lock, re-checking `closed` AND cell membership
+        // together (DL-64 #3): the handshake is slow, and between the old bare
+        // `closed`-load and the install a concurrent `shutdown` (drains the map,
+        // sets `closed`) OR an evict/`remove_cell` (unmaps this very Arc) could
+        // land — stranding a live client on a terminal-or-orphaned cell that a
+        // request then runs against. Serializing the checks with the install on
+        // the one lock `shutdown`/evict must also take closes the window:
+        //   - pool closed  → close the fresh client, surface `PoolShutdown`;
+        //   - cell unmapped (a concurrent evict replaced/removed it while live)
+        //                   → orderly-close the fresh client, surface the
+        //                     retryable `CellInvalidated` so `with_client`
+        //                     respawns — never a spurious terminal `PoolShutdown`.
+        {
+            let map = lock(&self.servers);
+            if self.closed.load(Ordering::Acquire) {
+                drop(map);
+                let _ = client.close();
+                return Err(LspError::PoolShutdown);
+            }
+            match map.get(key) {
+                Some(existing) if Arc::ptr_eq(existing, cell) => {}
+                _ => {
+                    drop(map);
+                    let _ = client.close();
+                    return Err(LspError::CellInvalidated);
+                }
+            }
+            *slot = Some(client);
+            *lock(&cell.readiness) = Readiness::Ready;
+        }
+        Ok(())
+    }
+
+    /// Invalidates `cell` for `key`: marks it `Shutdown` and removes it from
+    /// the map, but ONLY when it is still the mapped Arc (a concurrent respawn
+    /// may have replaced it — never evict the fresh one). Used on a fatal
+    /// transport error and on a failed handshake; the next acquire respawns.
+    fn remove_cell(&self, key: &PoolKey, cell: &Arc<PooledServer>) {
+        let removed = {
+            let mut map = lock(&self.servers);
+            match map.get(key) {
+                Some(existing) if Arc::ptr_eq(existing, cell) => {
+                    *lock(&cell.readiness) = Readiness::Shutdown;
+                    map.remove(key)
+                }
+                _ => None,
+            }
+        };
+        if let Some(s) = removed {
+            close_server(s);
+        }
+    }
+}
+
+impl Drop for LspPool {
+    /// Reap every warm server so no language-server child outlives the pool.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Removes the least-recently-used EVICTABLE server from `map` (marking it
+/// `Shutdown`) and returns the drained `Arc` for the caller to close OUTSIDE
+/// the map lock (MIN-3) — never closes under the lock itself. Leased
+/// (`leases > 0`) and non-`Ready` (`Starting` mid-handshake / `Shutdown`) cells
+/// are exempt via [`evictable`]: evicting one strands its connection/handshake
+/// and double-spawns the key.
+///
+/// Called in a LOOP by [`LspPool::acquire`] at cap (DL-63 #1), draining victims
+/// until the map is under the cap. When every server is exempt there is no
+/// victim (`None`) and the caller's new reservation transiently overshoots the
+/// cap; that overshoot shrinks at a LATER eviction pass that finds a free
+/// victim: a subsequent new-key acquire once a lease freed, or
+/// [`LspPool::evict_idle`] once a server has been idle `idle_ttl`. A no-op
+/// (`None`) on an empty map or an all-exempt map.
+fn evict_lru(map: &mut HashMap<PoolKey, Arc<PooledServer>>) -> Option<Arc<PooledServer>> {
+    let victim = map
+        .iter()
+        .filter(|(_, s)| evictable(s))
+        .min_by_key(|(_, s)| *lock(&s.last_used))
+        .map(|(k, _)| k.clone())?;
+    let s = map.remove(&victim)?;
+    *lock(&s.readiness) = Readiness::Shutdown;
+    Some(s)
+}
+
+/// Closes the server behind `server` when this is its last reference (an
+/// in-flight request holding another Arc reaps it via `Client`'s Drop
+/// backstop on return). A never-initialized reservation (`None` client) has
+/// nothing to close. Best-effort: a shutdown error is swallowed — the OS
+/// child is still killed+reaped by [`Client::close`]/Drop, which is the
+/// no-orphan guarantee that matters.
+fn close_server(server: Arc<PooledServer>) {
+    if let Some(inner) = Arc::into_inner(server)
+        && let Some(mut client) = inner
+            .client
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        let _ = client.close();
     }
 }
 
@@ -926,12 +1846,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// bounded diagnostics queue with `try_send` so a full buffer DROPS the
 /// message and never blocks the loop; other server→client requests are
 /// answered with method-not-found; malformed messages are skipped. On
-/// connection loss every pending call is failed with `Closed`.
+/// connection loss every pending call is failed with `Closed` AND the shared
+/// `dead` flag is set so a LATER request (issued when the pending map is empty,
+/// so nothing would disconnect its channel) fails fast in `call`/`diagnostics`
+/// instead of blocking the full deadline against a corpse.
 fn read_loop(
     reader: Box<dyn Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pending: PendingMap,
-    diags: SyncSender<Vec<lt::Diagnostic>>,
+    diags: SyncSender<DiagMsg>,
+    diag_publishes: Arc<AtomicUsize>,
+    dead: Arc<AtomicBool>,
+    barrier_arm: Arc<AtomicU64>,
 ) {
     let mut r = BufReader::new(reader);
     // Run until EOF or a transport error: the connection is gone.
@@ -947,8 +1873,17 @@ fn read_loop(
                     && let Ok(p) =
                         serde_json::from_value::<lt::PublishDiagnosticsParams>(params.clone())
                 {
-                    // Buffer full: drop rather than block the read loop.
-                    let _ = diags.try_send(p.diagnostics);
+                    // Forward the whole params (uri + version + diagnostics) so
+                    // the consumer can match the requested file. Publishes are
+                    // capped at DIAG_BUFFER (separate from the reserved barrier
+                    // slot): at the cap, DROP the newest rather than block OR
+                    // steal the marker's capacity. Increment only on a real send
+                    // so the count mirrors the channel (see `diag_publishes`).
+                    if diag_publishes.load(Ordering::Relaxed) < DIAG_BUFFER
+                        && diags.try_send(DiagMsg::Publish(p)).is_ok()
+                    {
+                        diag_publishes.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 continue;
             }
@@ -965,23 +1900,38 @@ fn read_loop(
             continue;
         }
 
-        // A response: route to the waiting call by id.
-        if let Some(id) = obj.get("id").and_then(Value::as_u64)
-            && let Some(tx) = lock(&pending).remove(&id)
-        {
-            let outcome = match obj.get("error") {
-                Some(e) if !e.is_null() => RpcOutcome::Err(
-                    e.get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| e.to_string()),
-                ),
-                _ => RpcOutcome::Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            let _ = tx.send(outcome);
+        // A response: route to the waiting call by id, and — if it answers the
+        // armed diagnostics barrier — stamp an in-band `DiagMsg::Barrier` marker
+        // at this exact FIFO point (DL-64 #1). `try_send` never blocks the read
+        // loop, and the RESERVED slot (channel sized DIAG_BUFFER + 1, publishes
+        // capped at DIAG_BUFFER) guarantees room for the single outstanding
+        // marker even under a publish flood (DL-65 item 2) — no false
+        // `DiagnosticsTimeout` on a healthy warm server. The `arm != 0` guard
+        // avoids matching the never-issued request id 0.
+        if let Some(id) = obj.get("id").and_then(Value::as_u64) {
+            let arm = barrier_arm.load(Ordering::Acquire);
+            if arm != 0 && arm == id {
+                let _ = diags.try_send(DiagMsg::Barrier(id));
+            }
+            if let Some(tx) = lock(&pending).remove(&id) {
+                let outcome = match obj.get("error") {
+                    Some(e) if !e.is_null() => RpcOutcome::Err(
+                        e.get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| e.to_string()),
+                    ),
+                    _ => RpcOutcome::Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                let _ = tx.send(outcome);
+            }
         }
     }
-    // Connection gone: fail any callers still waiting.
+    // Connection gone: mark the reader dead BEFORE failing waiters, so a
+    // request racing in right now observes the flag rather than writing into a
+    // corpse. `Release` pairs with the `Acquire` loads in `call`/`diagnostics`.
+    dead.store(true, Ordering::Release);
+    // Fail any callers still waiting.
     for (_, tx) in lock(&pending).drain() {
         let _ = tx.send(RpcOutcome::Closed);
     }
@@ -991,7 +1941,7 @@ fn read_loop(
 mod tests {
     use super::*;
     use crate::edit::splice_edits;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     // ---- byte_offset (Go convert_test.go TestByteOffset) ----
 
@@ -1388,10 +2338,34 @@ mod tests {
         .unwrap();
     }
 
-    /// A minimal fake LSP server: answers initialize/shutdown, pushes
-    /// `diags_on_open` publishDiagnostics notifications on every didOpen, and
-    /// delegates each textDocument/rename to `on_rename` (`Ok` → result,
-    /// `Err` → JSON-RPC error, the not-yet-ready server shape).
+    /// A `publishDiagnostics` frame tagged with an explicit document `version`
+    /// and a single diagnostic carrying `message` — lets version-ordering tests
+    /// distinguish a stale prior-version publish from the current one.
+    fn publish(uri: &str, version: i64, message: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": uri,
+                "version": version,
+                "diagnostics": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1},
+                    },
+                    "message": message,
+                }],
+            },
+        })
+    }
+
+    /// A minimal fake LSP server: answers initialize/shutdown, delegates each
+    /// textDocument/rename to `on_rename` (`Ok` → result, `Err` → JSON-RPC error,
+    /// the not-yet-ready server shape), and — modeling a REAL server's async
+    /// diagnostics round — publishes `diags_on_open` only AFTER answering the
+    /// ordering-barrier ping ([`BARRIER_METHOD`]), so they land POST-barrier for
+    /// [`Client::diagnostics`] (never a synchronous-on-didOpen shortcut real
+    /// servers don't take).
     fn spawn_fake_server(
         server_conn: (PipeReader, PipeWriter),
         mut on_rename: impl FnMut() -> Result<Value, String> + Send + 'static,
@@ -1409,7 +2383,11 @@ mod tests {
                 match method {
                     "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
                     "initialized" => {}
-                    "textDocument/didOpen" => {
+                    m if m == BARRIER_METHOD => {
+                        // Answer the barrier first (method-not-found is spec-legal
+                        // for `$/`), THEN emit the diagnostics round so it is
+                        // ordered POST-barrier on the FIFO channel.
+                        reply_err(&mut w, &id, "method not found");
                         for params in &diags_on_open {
                             write_frame(
                                 &mut w,
@@ -1544,6 +2522,50 @@ mod tests {
         let _ = c.close();
     }
 
+    #[test]
+    fn rename_breaks_deadline_loop_on_fatal_transport() {
+        // MIN-1: a server that DIES mid-rename must break the retry loop
+        // IMMEDIATELY with the typed fatal transport error — never stringify it
+        // into `last` and burn the full rename deadline retrying a corpse.
+        // Pre-fix looped until the deadline and returned `RenameDeadline`.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    // Die mid-rename: drop the write side and exit (no reply),
+                    // so the client's outstanding rename call sees `Closed`.
+                    "textDocument/rename" => {
+                        drop(w);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let mut c = test_client(client_conn); // rename_deadline = 2s
+        c.initialize("file:///work").unwrap();
+        let started = Instant::now();
+        let err = c
+            .rename("/work/main.rs", "fn main() {}\n", 0, 3, "renamed")
+            .unwrap_err();
+        assert!(
+            is_fatal_transport(&err),
+            "fatal transport surfaced, never RenameDeadline: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "must return fast, never burn the rename deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
     // ---- diagnostics (Go diagnostics_test.go TestDiagnosticsInMemoryFake) ----
 
     #[test]
@@ -1609,8 +2631,12 @@ mod tests {
         let mut c = test_client(client_conn);
         c.initialize("file:///work").unwrap();
         c.did_open("/work/main.go", "package main\n").unwrap();
-        // Sync point: a request round-trip proves the read loop has processed
-        // every notification the server wrote before its reply.
+        // Trigger the async flood: the barrier ping makes the fake emit its 20
+        // rounds (post-barrier, as a real server would). Its reply is a spec-legal
+        // method-not-found, ignored here.
+        let _ = c.call(BARRIER_METHOD, Value::Null, Duration::from_secs(2));
+        // Sync point: a second round-trip proves the read loop processed every
+        // flood notification the server wrote before this reply.
         c.call("shutdown", Value::Null, Duration::from_secs(2))
             .unwrap();
 
@@ -1622,6 +2648,219 @@ mod tests {
             received, DIAG_BUFFER,
             "buffer must cap at {DIAG_BUFFER}, dropping the rest"
         );
+    }
+
+    #[test]
+    fn read_loop_reserves_barrier_slot_under_publish_flood() {
+        // DL-65 item 2 DISCRIMINATOR: on a warm server a publish flood can fill
+        // the buffer BEFORE the barrier response arrives. The marker must NEVER
+        // be dropped while the pool is healthy (a dropped marker → the drain
+        // never crosses the barrier → false `DiagnosticsTimeout`). Drives the
+        // REAL `read_loop` synchronously (no concurrent drain → deterministic):
+        // feed `DIAG_BUFFER + 4` pre-barrier publishes, then the armed barrier
+        // response, to EOF; the marker must survive on the reserved slot.
+        //
+        // Pre-fix (channel sized DIAG_BUFFER, no reservation): the 8 publishes
+        // fill the buffer and the marker `try_send` is dropped — this test finds
+        // NO barrier and fails.
+        let barrier_id: u64 = 7;
+        let mut framed: Vec<u8> = Vec::new();
+        for i in 0..(DIAG_BUFFER + 4) {
+            let p = json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///work/main.go",
+                    "diagnostics": [{
+                        "range": {
+                            "start": {"line": i, "character": 0},
+                            "end": {"line": i, "character": 1},
+                        },
+                        "message": format!("round {i}"),
+                    }],
+                },
+            });
+            write_frame(&mut framed, &p).unwrap();
+        }
+        // The barrier response lands AFTER the buffer is already full.
+        write_frame(
+            &mut framed,
+            &json!({"jsonrpc": "2.0", "id": barrier_id, "result": Value::Null}),
+        )
+        .unwrap();
+
+        let reader = std::io::Cursor::new(framed);
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (diag_tx, diag_rx) = mpsc::sync_channel(DIAG_BUFFER + 1);
+        let diag_publishes = Arc::new(AtomicUsize::new(0));
+        let dead = Arc::new(AtomicBool::new(false));
+        let barrier_arm = Arc::new(AtomicU64::new(barrier_id));
+        // Runs to EOF (Cursor) then returns; no consumer draining concurrently.
+        read_loop(
+            Box::new(reader),
+            writer,
+            pending,
+            diag_tx,
+            diag_publishes,
+            dead,
+            barrier_arm,
+        );
+
+        let mut publishes = 0;
+        let mut markers = Vec::new();
+        while let Ok(msg) = diag_rx.try_recv() {
+            match msg {
+                DiagMsg::Publish(_) => publishes += 1,
+                DiagMsg::Barrier(id) => markers.push(id),
+            }
+        }
+        assert_eq!(
+            markers,
+            vec![barrier_id],
+            "the barrier marker must survive the flood on its reserved slot"
+        );
+        assert_eq!(
+            publishes, DIAG_BUFFER,
+            "publishes stay capped at {DIAG_BUFFER}, never stealing the reserved slot"
+        );
+    }
+
+    #[test]
+    fn diagnostics_matches_requested_file_draining_stale() {
+        // MIN (uri mismatch): a warm server may have a prior file's
+        // diagnostics still queued; `diagnostics(fileB)` must drain the stale
+        // fileA publish and return fileB's, never another file's. Pre-fix
+        // returned the first publish regardless of uri.
+        //
+        // The fake publishes TWO copies (tagged with the opened uri) POST-barrier
+        // per open, so after reading fileA one stale A-publish remains queued
+        // when fileB is requested.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut last_uri = String::new();
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didOpen" => {
+                        last_uri = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    m if m == BARRIER_METHOD => {
+                        reply_err(&mut w, &id, "method not found");
+                        for _ in 0..2 {
+                            write_frame(
+                                &mut w,
+                                &json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "textDocument/publishDiagnostics",
+                                    "params": {
+                                        "uri": last_uri,
+                                        "diagnostics": [{
+                                            "range": {
+                                                "start": {"line": 0, "character": 0},
+                                                "end": {"line": 0, "character": 1},
+                                            },
+                                            "message": last_uri,
+                                        }],
+                                    },
+                                }),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+
+        let mut c = test_client(client_conn);
+        c.initialize("file:///work").unwrap();
+        // fileA: consume one of its two publishes; one stale A-publish remains.
+        let a = c
+            .diagnostics("/work/a.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        let want_a = file_uri("/work/a.rs").as_str().to_string();
+        assert!(a.iter().all(|d| d.message == want_a), "fileA diags: {a:?}");
+        // fileB: the queue now holds [A(stale), B, B]; must skip A, return B.
+        let b = c
+            .diagnostics("/work/b.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        let want_b = file_uri("/work/b.rs").as_str().to_string();
+        assert!(!b.is_empty(), "fileB must yield its own diagnostics");
+        assert!(
+            b.iter().all(|d| d.message == want_b),
+            "must return fileB's diagnostics, not the stale fileA publish: {b:?}"
+        );
+        let _ = c.close();
+    }
+
+    #[test]
+    fn diagnostics_drains_pre_barrier_stale_same_uri_publish() {
+        // Order-based staleness (DL-64 #1, was MIN-6 version-aware): a SAME-uri
+        // publish emitted BEFORE the barrier is stale by construction and drained,
+        // regardless of version; only the FIRST same-uri publish AFTER the barrier
+        // is returned. The fake emits a "STALE" round on didOpen (pre-barrier) and
+        // the "CURRENT" round on the barrier (post-barrier) — no version guessing.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut last_uri = String::new();
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didOpen" => {
+                        let uri = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        // Pre-barrier stale round.
+                        write_frame(&mut w, &publish(&uri, 1, "STALE")).unwrap();
+                        last_uri = uri;
+                    }
+                    m if m == BARRIER_METHOD => {
+                        reply_err(&mut w, &id, "method not found");
+                        // Post-barrier authoritative round.
+                        write_frame(&mut w, &publish(&last_uri, 2, "CURRENT")).unwrap();
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+
+        let mut c = test_client(client_conn);
+        c.initialize("file:///work").unwrap();
+        let got = c
+            .diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        assert!(!got.is_empty(), "the post-barrier publish is returned");
+        assert!(
+            got.iter().all(|d| d.message == "CURRENT"),
+            "must drain the pre-barrier stale publish, return only current: {got:?}"
+        );
+        let _ = c.close();
     }
 
     // ---- resilience ----
@@ -1780,12 +3019,17 @@ mod tests {
         std::fs::write(root.join("skip.h"), "// header\n").unwrap();
         std::fs::write(root.join("skip.py"), "x = 1\n").unwrap();
 
-        let created = ensure_compile_commands(root)
+        let (created, created_hash) = ensure_compile_commands(root)
             .unwrap()
             .expect("database must be created");
         assert_eq!(created, root.join(COMPILE_COMMANDS));
 
         let body = std::fs::read(&created).unwrap();
+        assert_eq!(
+            content_hash(&body),
+            created_hash,
+            "returned hash must fingerprint the written bytes"
+        );
         let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             entries.len(),
@@ -1830,9 +3074,36 @@ mod tests {
         let (client_conn, server_conn) = conn_pair();
         spawn_fake_server(server_conn, || Ok(json!({})), Vec::new());
         let mut c = test_client(client_conn);
-        c.created_compile_commands = Some(db.clone());
+        c.created_compile_commands = Some((db.clone(), content_hash(b"[]")));
         let _ = c.close();
         assert!(!db.exists(), "close must remove the database bage created");
+    }
+
+    #[test]
+    fn close_preserves_caller_replaced_compile_commands() {
+        // A database whose content no longer matches what bage wrote (a caller
+        // replaced it) must be LEFT UNTOUCHED — never clobber foreign content.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(COMPILE_COMMANDS);
+        std::fs::write(&db, b"[]").unwrap();
+
+        let (client_conn, server_conn) = conn_pair();
+        spawn_fake_server(server_conn, || Ok(json!({})), Vec::new());
+        let mut c = test_client(client_conn);
+        // Fingerprint the ORIGINAL bytes bage "wrote", then the caller replaces
+        // the file with different content.
+        c.created_compile_commands = Some((db.clone(), content_hash(b"[]")));
+        std::fs::write(&db, b"[{\"caller\":\"owned\"}]").unwrap();
+        let _ = c.close();
+        assert!(
+            db.exists(),
+            "a caller-replaced database must not be removed"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"[{\"caller\":\"owned\"}]",
+            "content must be left intact"
+        );
     }
 
     /// A fake server that records every didOpen URI, for priming assertions.
@@ -1943,6 +3214,1398 @@ mod tests {
             opened,
             vec![target_uri],
             "with {NO_PRIME_ENV}=1 only the rename target may be opened"
+        );
+    }
+
+    // ---- persistent server pool (B1) ----
+
+    /// A pool whose spawn factory hands out in-memory fake servers (each a
+    /// fresh `conn_pair` + `spawn_fake_server` answering initialize/rename),
+    /// plus the spawn counter so tests can assert once-per-key spawning. Idle
+    /// TTL is short so `evict_idle` is testable without long waits.
+    fn fake_pool() -> (LspPool, Arc<AtomicUsize>) {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_millis(50), 8);
+        (pool, spawns)
+    }
+
+    /// Drives one rename against the pool for `root`/`file` — the ready fake
+    /// server always returns a non-empty edit, so this asserts success.
+    fn pool_rename(pool: &LspPool, root: &str, file: &str) {
+        pool.with_client(Path::new(root), "rust", |c| {
+            c.rename(file, "fn main() {}\n", 0, 3, "renamed")
+        })
+        .expect("pool rename");
+    }
+
+    #[test]
+    fn pool_spawns_once_per_key() {
+        let (pool, spawns) = fake_pool();
+        for _ in 0..3 {
+            pool_rename(&pool, "/work", "/work/main.rs");
+        }
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "same key reuses the one warm server"
+        );
+        assert_eq!(pool.len(), 1);
+        // A distinct key spawns a second, independent server.
+        pool_rename(&pool, "/other", "/other/main.rs");
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn pool_concurrent_requests_share_one_server() {
+        let (pool, spawns) = fake_pool();
+        let pool = Arc::new(pool);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                pool_rename(&p, "/work", "/work/main.rs");
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "concurrent same-key requests spawn exactly one server"
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn pool_readiness_ready_after_acquire() {
+        let (pool, _) = fake_pool();
+        let root = Path::new("/work");
+        assert_eq!(
+            pool.readiness(root, "rust"),
+            None,
+            "no readiness before a server is pooled"
+        );
+        pool_rename(&pool, "/work", "/work/main.rs");
+        assert_eq!(pool.readiness(root, "rust"), Some(Readiness::Ready));
+    }
+
+    #[test]
+    fn pool_drop_reaps_server() {
+        // Observation spy: the fake server flips `alive` false when its
+        // connection tears down, proving the pool releases the server on drop.
+        let alive = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&alive);
+        let spawn = move || -> Result<Client, LspError> {
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            let live = Arc::clone(&flag);
+            live.store(true, Ordering::SeqCst);
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                        "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                        "exit" => break,
+                        _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                        _ => {}
+                    }
+                }
+                live.store(false, Ordering::SeqCst); // connection gone = torn down
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
+        pool.with_client(Path::new("/work"), "rust", |_c| Ok(()))
+            .expect("acquire server");
+        assert!(alive.load(Ordering::SeqCst), "server up after acquire");
+        drop(pool);
+        for _ in 0..200 {
+            if !alive.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "server torn down when the pool drops"
+        );
+    }
+
+    #[test]
+    fn client_drop_reaps_subprocess() {
+        // The OS-level no-orphan guarantee the pool leans on: a real spawned
+        // child is killed+reaped on `Client` drop. `sleep` is a cheap
+        // long-lived process; the pre-drop liveness assert also guards against
+        // `kill` being unavailable (it would fail loudly, never false-pass).
+        let client = match Client::new_stdio(&["sleep".to_string(), "30".to_string()]) {
+            Ok(c) => c,
+            Err(e) => {
+                // Loud SKIP (never a silent false pass): `sleep` unavailable.
+                eprintln!("SKIP client_drop_reaps_subprocess: `sleep` unavailable: {e}");
+                return;
+            }
+        };
+        let pid = client.server_pid().expect("spawned child has a pid");
+        assert!(pid_alive(pid), "child running before drop");
+        drop(client);
+        let mut gone = false;
+        for _ in 0..200 {
+            if !pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(gone, "child {pid} reaped after Client drop");
+    }
+
+    #[test]
+    fn pool_evict_idle_closes_stale_servers() {
+        let (pool, spawns) = fake_pool(); // 50ms idle TTL
+        pool_rename(&pool, "/work", "/work/main.rs");
+        assert_eq!(pool.len(), 1);
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(pool.evict_idle(), 1, "stale server evicted");
+        assert_eq!(pool.len(), 0);
+        // Re-acquire spawns a fresh server (the old one is gone).
+        pool_rename(&pool, "/work", "/work/main.rs");
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pool_bounded_evicts_lru_at_capacity() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 2);
+        pool_rename(&pool, "/a", "/a/main.rs");
+        pool_rename(&pool, "/b", "/b/main.rs");
+        assert_eq!(pool.len(), 2);
+        thread::sleep(Duration::from_millis(2)); // make /a strictly newer than /b
+        pool_rename(&pool, "/a", "/a/main.rs"); // /b is now the LRU
+        pool_rename(&pool, "/c", "/c/main.rs"); // at cap → evicts LRU (/b)
+        assert_eq!(pool.len(), 2, "server count stays bounded at the cap");
+        assert!(
+            pool.readiness(Path::new("/b"), "rust").is_none(),
+            "LRU server /b was evicted"
+        );
+        assert!(pool.readiness(Path::new("/a"), "rust").is_some());
+        assert!(pool.readiness(Path::new("/c"), "rust").is_some());
+    }
+
+    #[test]
+    fn pool_respawns_after_server_dies_midlife() {
+        // MAJOR (dead-server key poisoning): a pooled server that dies after
+        // its first request must NOT poison the key. The next request through
+        // the same key transparently respawns and succeeds, and readiness is
+        // truthful (never stuck `Ready` on a corpse). Pre-fix: the second
+        // request hit a broken pipe with no respawn and readiness stayed
+        // `Ready` forever, so `pool_rename` would panic here.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        // Each spawned fake answers exactly ONE rename, then exits — the
+        // connection tears down, modeling a killed language server.
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                        "textDocument/rename" => {
+                            reply_ok(&mut w, &id, ready_rename_edit());
+                            break; // die after the first rename
+                        }
+                        "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                        "exit" => break,
+                        _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                        _ => {}
+                    }
+                }
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
+        pool_rename(&pool, "/work", "/work/main.rs"); // spawn #1, then it dies
+        pool_rename(&pool, "/work", "/work/main.rs"); // must respawn+succeed
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "dead server invalidated and respawned exactly once"
+        );
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Ready),
+            "readiness reflects the live respawned server"
+        );
+    }
+
+    #[test]
+    fn pool_readiness_starting_observable_during_init() {
+        // Init runs OUTSIDE the map lock, so a concurrent observer sees
+        // `Starting` while a server is handshaking. Pre-fix set `Ready` under
+        // the map lock, making `Starting` structurally unobservable (a dead
+        // variant) — `readiness` would block on the held map lock, then only
+        // ever return `Ready`.
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&started);
+        let rel = Arc::clone(&release);
+        let spawn = move || -> Result<Client, LspError> {
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            let s = Arc::clone(&s);
+            let rel = Arc::clone(&rel);
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "initialize" => {
+                            // Announce mid-handshake, then stall until released.
+                            s.store(true, Ordering::SeqCst);
+                            while !rel.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                        }
+                        "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                        "exit" => break,
+                        _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                        _ => {}
+                    }
+                }
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            8,
+        ));
+        let p = Arc::clone(&pool);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/work"), "rust", |_c| Ok(()))
+                .expect("acquire");
+        });
+        while !started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Starting),
+            "Starting must be observable while the handshake runs"
+        );
+        release.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Ready),
+            "handshake completion flips to Ready"
+        );
+    }
+
+    #[test]
+    fn pool_acquire_after_shutdown_is_typed_error() {
+        // Shutdown is terminal: a post-shutdown acquire returns a typed error,
+        // never a silent respawn. Pre-fix `shutdown` only drained the map, so
+        // the next `with_client` respawned and returned Ok.
+        let (pool, _) = fake_pool();
+        pool_rename(&pool, "/work", "/work/main.rs");
+        pool.shutdown();
+        let err = pool
+            .with_client(Path::new("/work"), "rust", |_c| Ok::<(), LspError>(()))
+            .unwrap_err();
+        assert!(matches!(err, LspError::PoolShutdown), "got {err}");
+    }
+
+    #[test]
+    fn pool_never_evicts_in_flight_server() {
+        // At cap, an at-capacity eviction must skip a leased (in-flight)
+        // server — evicting a busy entry stranded its connection and let the
+        // same key respawn a second live server. Pre-fix: `/a` (busy) was the
+        // LRU victim and vanished from the map, so `readiness(/a)` went `None`.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            Ok(test_client(client_conn))
+        };
+        // Cap 1: acquiring a second key forces an eviction attempt.
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            1,
+        ));
+        let running = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let p = Arc::clone(&pool);
+        let run = Arc::clone(&running);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/a"), "rust", |_c| {
+                run.store(true, Ordering::SeqCst);
+                let _ = release_rx.recv(); // hold the lease until released
+                Ok::<(), LspError>(())
+            })
+            .expect("/a request");
+        });
+        while !running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // /b at cap → eviction attempt must NOT evict the leased /a.
+        pool.with_client(Path::new("/b"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("/b request");
+        assert!(
+            pool.readiness(Path::new("/a"), "rust").is_some(),
+            "an in-flight server must never be LRU-evicted"
+        );
+        release_tx.send(()).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn pool_respawns_on_dead_reader_diagnostics() {
+        // M (class-escape): a pooled server whose READ side is dead (read loop
+        // hit EOF → diagnostics sender dropped) must surface as FATAL `Closed`,
+        // not a non-fatal `DiagnosticsTimeout`. `with_client` then invalidates
+        // the corpse and respawns. Pre-fix `diagnostics` mapped the
+        // disconnected channel to `DiagnosticsTimeout`, so the dead server
+        // stayed pooled `Ready` forever and the request failed with no respawn.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                // Ack initialize.
+                if let Ok(Some(body)) = read_frame(&mut r)
+                    && let Ok(msg) = serde_json::from_slice::<Value>(&body)
+                {
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                }
+                if n == 0 {
+                    // Poisoned server: drop the WRITE side so the client's read
+                    // loop hits EOF (dead reader), then keep the READ side alive
+                    // draining requests so client writes still succeed.
+                    drop(w);
+                    while let Ok(Some(_)) = read_frame(&mut r) {}
+                } else {
+                    // Healthy respawn: serve diagnostics POST-barrier (as a real
+                    // server's async round would land).
+                    let mut last_uri = String::new();
+                    while let Ok(Some(body)) = read_frame(&mut r) {
+                        let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                            continue;
+                        };
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                            "textDocument/didOpen" => {
+                                last_uri = msg
+                                    .pointer("/params/textDocument/uri")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                            m if m == BARRIER_METHOD => {
+                                reply_err(&mut w, &id, "method not found");
+                                write_frame(&mut w, &publish(&last_uri, 1, "live")).unwrap();
+                            }
+                            "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                            "exit" => break,
+                            _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
+        let got = pool
+            .with_client_for_file(Path::new("/work/main.rs"), |c| {
+                c.diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            })
+            .expect("dead-reader server must be invalidated + respawned, then succeed");
+        assert!(
+            got.iter().all(|d| d.message == "live"),
+            "served by the healthy respawn: {got:?}"
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "corpse invalidated + respawned exactly once"
+        );
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Ready)
+        );
+    }
+
+    #[test]
+    fn pool_cell_invalidated_on_live_pool_retries_not_shutdown() {
+        // MIN-2: a cell marked `Shutdown` by a concurrent evict/remove while the
+        // pool is LIVE must be retried (respawned), never surfaced as the
+        // terminal `PoolShutdown`. Pre-fix `ensure_ready` returned `PoolShutdown`
+        // for any `Shutdown` cell, so a live-pool race spuriously failed the
+        // acquire.
+        let (pool, spawns) = fake_pool();
+        let key = PoolKey {
+            root: PathBuf::from("/work"),
+            language: "rust".to_string(),
+        };
+        // Simulate the race outcome: a `Shutdown` reservation left mapped.
+        {
+            let cell = Arc::new(PooledServer::reserved());
+            *lock(&cell.readiness) = Readiness::Shutdown;
+            lock(&pool.servers).insert(key.clone(), cell);
+        }
+        pool.with_client(Path::new("/work"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("live-pool cell invalidation must retry, not PoolShutdown");
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Ready)
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "respawned exactly one fresh server past the invalidated cell"
+        );
+    }
+
+    #[test]
+    fn pool_lease_cleared_on_panic() {
+        // MIN-4 (RAII lease): a panic inside the request closure must still
+        // clear the lease, so the entry stays evictable. Pre-fix the lease
+        // leaked `true` and pinned the server forever (evict_idle never
+        // reclaimed it).
+        let (pool, _) = fake_pool(); // 50ms idle TTL
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.with_client(Path::new("/work"), "rust", |_c| -> Result<(), LspError> {
+                panic!("request closure blew up");
+            })
+        }));
+        assert!(res.is_err(), "the panic propagates out of with_client");
+        assert_eq!(pool.len(), 1, "the server is still pooled after the panic");
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            pool.evict_idle(),
+            1,
+            "a panic-cleared lease leaves the entry evictable"
+        );
+    }
+
+    #[test]
+    fn evict_lru_exempts_starting_cell() {
+        // MIN-4 (Starting exempt): a cell mid-handshake (`Starting`, not yet
+        // leased) must be exempt from LRU eviction — evicting it strands the
+        // in-flight spawn. Even though the Starting cell is the OLDER (LRU)
+        // entry, the only eligible victim is the newer `Ready` one.
+        let mut map: HashMap<PoolKey, Arc<PooledServer>> = HashMap::new();
+        let starting = Arc::new(PooledServer::reserved()); // Starting, last_used=now
+        let ready = Arc::new(PooledServer::reserved());
+        *lock(&ready.readiness) = Readiness::Ready;
+        *lock(&ready.last_used) = Instant::now() + Duration::from_millis(50); // newer
+        let s_key = PoolKey {
+            root: PathBuf::from("/s"),
+            language: "rust".to_string(),
+        };
+        let r_key = PoolKey {
+            root: PathBuf::from("/r"),
+            language: "rust".to_string(),
+        };
+        map.insert(s_key.clone(), Arc::clone(&starting));
+        map.insert(r_key.clone(), Arc::clone(&ready));
+
+        let victim = evict_lru(&mut map).expect("the Ready cell is evictable");
+        assert_eq!(
+            *lock(&victim.readiness),
+            Readiness::Shutdown,
+            "the drained victim is marked Shutdown"
+        );
+        assert!(
+            map.contains_key(&s_key),
+            "the Starting cell must survive eviction (not stranded mid-handshake)"
+        );
+        assert!(!map.contains_key(&r_key), "the Ready cell was the victim");
+    }
+
+    #[test]
+    fn pool_cap_overshoots_when_all_leased_then_reclaims_on_evict() {
+        // MIN-5 (cap honesty): with every server leased there is no eviction
+        // victim, so a new key transiently overshoots the cap. A freed lease
+        // does NOT itself reclaim — the overshoot shrinks only at a later
+        // eviction pass (here `evict_idle`). Locks the documented behavior.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            Ok(test_client(client_conn))
+        };
+        // Cap 1, short idle TTL so evict_idle can reclaim.
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_millis(30),
+            1,
+        ));
+        let running = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let p = Arc::clone(&pool);
+        let run = Arc::clone(&running);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/a"), "rust", |_c| {
+                run.store(true, Ordering::SeqCst);
+                let _ = release_rx.recv(); // hold the lease
+                Ok::<(), LspError>(())
+            })
+            .expect("/a");
+        });
+        while !running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // /b at cap while /a is leased: no victim → overshoot to 2.
+        pool.with_client(Path::new("/b"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("/b");
+        assert_eq!(
+            pool.len(),
+            2,
+            "all-leased eviction found no victim → cap overshoot"
+        );
+        // Free /a's lease — the overshoot is NOT reclaimed by that alone.
+        release_tx.send(()).unwrap();
+        h.join().unwrap();
+        assert_eq!(
+            pool.len(),
+            2,
+            "a freed lease does not itself reclaim the overshoot"
+        );
+        // A later eviction pass reclaims once servers are idle.
+        thread::sleep(Duration::from_millis(50));
+        assert!(pool.evict_idle() >= 1, "evict_idle reclaims the overshoot");
+        assert!(
+            pool.len() <= 1,
+            "back within the cap after an eviction pass"
+        );
+    }
+
+    #[test]
+    fn pool_close_runs_outside_map_lock() {
+        // MIN-3: `close_server` (up to ~5s: shutdown RPC + child reap) must run
+        // OUTSIDE the global map lock. While one server is torn down, a
+        // concurrent observer (`len`/`readiness`, both map-locked) must NOT
+        // block. Pre-fix closed under the map lock, stalling every observer for
+        // the full teardown.
+        let spawn = move || -> Result<Client, LspError> {
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    // Only answer initialize; never answer shutdown, so
+                    // `Client::close` blocks on its 2s shutdown-call timeout,
+                    // modeling a slow teardown.
+                    if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+                        reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                    }
+                }
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            8,
+        ));
+        pool.with_client(Path::new("/a"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("/a");
+
+        let p = Arc::clone(&pool);
+        let closing = thread::spawn(move || p.shutdown()); // blocks ~2s in close
+        thread::sleep(Duration::from_millis(50)); // let shutdown reach the close phase
+        let probe = Instant::now();
+        let _ = pool.len(); // must not block on the map lock held across close
+        assert!(
+            probe.elapsed() < Duration::from_millis(500),
+            "an observer must not block on the map lock during teardown: {:?}",
+            probe.elapsed()
+        );
+        closing.join().unwrap();
+    }
+
+    #[test]
+    fn warm_reuse_closes_before_reopen() {
+        // MIN (duplicate didOpen): the second rename of the SAME file through
+        // one warm pooled server must `didClose` the target before re-opening
+        // it (LSP forbids a duplicate didOpen). Pre-fix sent a second didOpen
+        // with no intervening didClose.
+        let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let l = Arc::clone(&log);
+        let spawn = move || -> Result<Client, LspError> {
+            let (client_conn, server_conn) = conn_pair();
+            spawn_open_close_recorder(server_conn, Arc::clone(&l));
+            Ok(test_client(client_conn))
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
+        // Two renames of the same file → same warm server (/work, rust).
+        for nn in ["a", "b"] {
+            pool.with_client(Path::new("/work"), "rust", |c| {
+                c.rename("/work/main.rs", "fn main() {}\n", 0, 3, nn)
+            })
+            .expect("warm rename");
+        }
+        let events = log.lock().unwrap().clone();
+        let target = file_uri("/work/main.rs").to_string();
+        let opens: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, u))| m == "didOpen" && *u == target)
+            .map(|(i, _)| i)
+            .collect();
+        let closes: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, u))| m == "didClose" && *u == target)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(opens.len(), 2, "two renames = two didOpens: {events:?}");
+        assert!(
+            closes.iter().any(|&c| c > opens[0] && c < opens[1]),
+            "a didClose must sit between the two didOpens: {events:?}"
+        );
+    }
+
+    #[test]
+    fn warm_real_server_double_rename() {
+        // Env-gated real-server tier (rust-analyzer): render two renames
+        // through ONE pooled server, proving the warm-reuse didOpen/didClose
+        // handshake keeps a real server usable. Loud SKIP when rust-analyzer
+        // is absent or the tier is not opted in — never a false pass.
+        if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
+            eprintln!("SKIP warm_real_server_double_rename: set BAGE_LSP_REAL_TEST=1 to run");
+            return;
+        }
+        if !command_on_path("rust-analyzer") {
+            eprintln!("SKIP warm_real_server_double_rename: rust-analyzer not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let main_rs = root.join("src/main.rs");
+        std::fs::write(
+            &main_rs,
+            "fn helper() -> i32 { 1 }\nfn main() { let _ = helper(); }\n",
+        )
+        .unwrap();
+
+        let pool = LspPool::new(vec!["rust-analyzer".to_string()]);
+        let root_key = root.join("src");
+        let content = std::fs::read_to_string(&main_rs).unwrap();
+        // Two renames of `helper` through one warm server (same root+lang).
+        for new_name in ["renamed_one", "renamed_two"] {
+            let we = pool
+                .with_client(&root_key, "rust", |c| {
+                    c.rename(main_rs.to_str().unwrap(), &content, 0, 3, new_name)
+                })
+                .expect("warm real rename");
+            assert!(
+                workspace_edit_has_changes(&we),
+                "rust-analyzer must resolve the rename"
+            );
+        }
+    }
+
+    /// Records `("didOpen"|"didClose", uri)` for every such notification, plus
+    /// answers initialize/rename/shutdown — the observation spy for the
+    /// warm-reuse didClose-before-reopen assertion.
+    fn spawn_open_close_recorder(
+        server_conn: (PipeReader, PipeWriter),
+        log: Arc<Mutex<Vec<(String, String)>>>,
+    ) {
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                match method {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didOpen" | "textDocument/didClose" => {
+                        if let Some(uri) = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                        {
+                            let m = method.trim_start_matches("textDocument/").to_string();
+                            log.lock().unwrap().push((m, uri.to_string()));
+                        }
+                    }
+                    "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Whether `program` resolves on `PATH` (real-server test gating).
+    fn command_on_path(program: &str) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    #[test]
+    fn pool_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LspPool>();
+    }
+
+    /// Reports whether `pid` is a live process, via `kill -0` (POSIX; no extra
+    /// dependency). A missing `kill` yields `false`, which the caller's
+    /// pre-drop assert converts into a loud failure rather than a false pass.
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    // ---- DL-63 round-4 rulings ----
+
+    #[test]
+    fn rename_fatal_fast_on_dead_reader() {
+        // DL-63 #2: a HALF-DEAD server (stdout EOF while the pending map is
+        // empty) must make the next rename fail FATAL (`Closed`) immediately via
+        // the persistent reader-dead flag — never write into the corpse and burn
+        // the rename deadline returning a non-fatal `RenameDeadline`.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            // Ack initialize, then DROP the write side (client read loop hits EOF
+            // = half-dead) while still draining reads so client writes succeed.
+            if let Ok(Some(body)) = read_frame(&mut r)
+                && let Ok(msg) = serde_json::from_slice::<Value>(&body)
+            {
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                reply_ok(&mut w, &id, json!({"capabilities": {}}));
+            }
+            drop(w);
+            while let Ok(Some(_)) = read_frame(&mut r) {}
+        });
+        let mut c = test_client(client_conn);
+        c.call_timeout = Duration::from_millis(50);
+        c.initialize("file:///work").unwrap();
+        // Deterministic: wait until the read loop observed EOF and set `dead`.
+        for _ in 0..2000 {
+            if c.dead.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            c.dead.load(Ordering::Acquire),
+            "reader-dead flag set on EOF"
+        );
+        let started = Instant::now();
+        let err = c
+            .rename("/work/main.rs", "fn main() {}\n", 0, 3, "renamed")
+            .unwrap_err();
+        assert!(
+            is_fatal_transport(&err),
+            "half-dead rename surfaces FATAL, never RenameDeadline: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "must fail fast via the dead flag, never burn the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn pool_respawns_on_dead_reader_rename() {
+        // DL-63 #2 (pool leg): a warm server whose READ side died (half-dead)
+        // must make the next rename FATAL so `with_client` invalidates + respawns
+        // — never a non-fatal RenameDeadline leaving the corpse pooled `Ready`.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                if let Ok(Some(body)) = read_frame(&mut r)
+                    && let Ok(msg) = serde_json::from_slice::<Value>(&body)
+                {
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                }
+                if n == 0 {
+                    drop(w); // half-dead: read loop hits EOF
+                    while let Ok(Some(_)) = read_frame(&mut r) {}
+                } else {
+                    while let Ok(Some(body)) = read_frame(&mut r) {
+                        let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                            continue;
+                        };
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                            "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
+                            "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                            "exit" => break,
+                            _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            let mut c = test_client(client_conn);
+            c.call_timeout = Duration::from_millis(50); // bound the racy first call
+            Ok(c)
+        };
+        let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
+        let we = pool
+            .with_client_for_file(Path::new("/work/main.rs"), |c| {
+                c.rename("/work/main.rs", "fn main() {}\n", 0, 3, "renamed")
+            })
+            .expect("dead-reader rename invalidated + respawned, then succeeds");
+        assert!(workspace_edit_has_changes(&we));
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "corpse invalidated + respawned exactly once"
+        );
+    }
+
+    /// Emits a version-LESS empty "clear" publish for `uri` — the spec-shaped
+    /// notification a server sends on `didClose`, ordered ahead of a warm
+    /// re-open's real round on the FIFO channel.
+    fn clear_publish(w: &mut PipeWriter, uri: &str) {
+        write_frame(
+            w,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": { "uri": uri, "diagnostics": [] },
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn diagnostics_probe_s2_rename_interleaved_warm_false_clean() {
+        // PROBE S2 (DL-64 #1) — the shape the botched lazy 1-clear counter left
+        // ALIVE: diagnostics → rename → diagnostics. Both the rename's didClose
+        // AND the second diagnostics' didClose emit a version-less "clear", so TWO
+        // clears are outstanding ahead of the re-open's real "boom" round. The
+        // barrier drains ALL pre-barrier publishes (both clears) by ORDER and
+        // returns the post-barrier "boom". Pre-fix drained exactly ONE clear and
+        // returned the second as a false-clean `[]` — this test would FAIL then.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut last_uri = String::new();
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didClose" => {
+                        if let Some(uri) = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                        {
+                            clear_publish(&mut w, uri);
+                        }
+                    }
+                    "textDocument/didOpen" => {
+                        last_uri = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
+                    m if m == BARRIER_METHOD => {
+                        reply_err(&mut w, &id, "method not found");
+                        // Authoritative round lands POST-barrier.
+                        write_frame(&mut w, &publish(&last_uri, 1, "boom")).unwrap();
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+        let mut c = test_client(client_conn);
+        c.initialize("file:///work").unwrap();
+        // Cold: no prior didClose → no clear → post-barrier "boom".
+        let cold = c
+            .diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            cold.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            vec!["boom"],
+            "cold open returns the real error"
+        );
+        // Interleaved rename re-opens (its didClose emits clear #1).
+        let _ = c.rename("/work/main.rs", "x\n", 0, 0, "renamed").unwrap();
+        // Warm re-open: its didClose emits clear #2. TWO clears now precede
+        // "boom". Order-based drain must return "boom", never a false-clean [].
+        let warm = c
+            .diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            warm.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+            vec!["boom"],
+            "warm re-open past a rename must drain BOTH clears and return boom, not a false-clean []"
+        );
+        let _ = c.close();
+    }
+
+    #[test]
+    fn diagnostics_probe_s1_no_clear_versionless_clean() {
+        // PROBE S1 (DL-64 #1) — the shape the botched counter REGRESSED: a server
+        // that sends NO didClose clear and publishes a genuinely clean file as a
+        // version-LESS empty round. That clean publish arrives POST-barrier and
+        // must return `Ok([])`. Pre-fix mis-drained the version-less empty publish
+        // as if it were a "clear" on the warm path → false `DiagnosticsTimeout`.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut last_uri = String::new();
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    // No didClose clear: this server simply never emits one.
+                    "textDocument/didOpen" => {
+                        last_uri = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    m if m == BARRIER_METHOD => {
+                        reply_err(&mut w, &id, "method not found");
+                        // Genuinely clean file: version-LESS empty round, post-barrier.
+                        clear_publish(&mut w, &last_uri);
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+        let mut c = test_client(client_conn);
+        c.initialize("file:///work").unwrap();
+        // Cold: the version-less clean publish is post-barrier → Ok([]).
+        let cold = c
+            .diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        assert!(cold.is_empty(), "cold clean file returns Ok([]): {cold:?}");
+        // Warm re-open: still Ok([]) — the version-less empty publish is the
+        // authoritative post-barrier answer, never mis-drained into a timeout.
+        let warm = c
+            .diagnostics("/work/main.rs", "x\n", Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            warm.is_empty(),
+            "warm clean file returns Ok([]), never a false DiagnosticsTimeout: {warm:?}"
+        );
+        let _ = c.close();
+    }
+
+    #[test]
+    fn pool_reclaims_overshoot_on_next_new_key_acquire() {
+        // DL-63 #1 (MIN-5 real eviction): after an all-leased overshoot (cap 1 →
+        // len 2), the NEXT new-key acquire must LOOP-evict back under the cap.
+        // The prior evict-one-insert-one was net-zero and pinned the pool at 2.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let spawn = move || -> Result<Client, LspError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            Ok(test_client(client_conn))
+        };
+        // Long idle TTL so evict_idle is NOT what reclaims (isolate the
+        // new-key-acquire reclaim path).
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            1,
+        ));
+        let running = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let p = Arc::clone(&pool);
+        let run = Arc::clone(&running);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/a"), "rust", |_c| {
+                run.store(true, Ordering::SeqCst);
+                let _ = release_rx.recv(); // hold the lease
+                Ok::<(), LspError>(())
+            })
+            .expect("/a");
+        });
+        while !running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // /b at cap while /a leased → no victim → overshoot to 2.
+        pool.with_client(Path::new("/b"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("/b");
+        assert_eq!(pool.len(), 2, "all-leased overshoot");
+        // Free /a's lease; both /a and /b now idle+Ready+unleased.
+        release_tx.send(()).unwrap();
+        h.join().unwrap();
+        assert_eq!(pool.len(), 2, "a freed lease alone does not reclaim");
+        // A new-key acquire at cap must loop-evict BOTH stale servers → len 1.
+        pool.with_client(Path::new("/c"), "rust", |_c| Ok::<(), LspError>(()))
+            .expect("/c");
+        assert_eq!(
+            pool.len(),
+            1,
+            "new-key acquire loop-evicts the overshoot back under the cap"
+        );
+        assert!(pool.readiness(Path::new("/c"), "rust").is_some());
+    }
+
+    #[test]
+    fn lease_counter_survives_same_key_handoff() {
+        // DL-63 #4: the lease is a COUNTER, so one request's release cannot
+        // un-pin another's in-flight lease on the SAME cell (the bool-stomp: T1
+        // drop clearing T2's lease and letting a busy server be evicted).
+        let (pool, _) = fake_pool();
+        pool_rename(&pool, "/a", "/a/main.rs"); // establish the /a cell
+        let key = PoolKey {
+            root: PathBuf::from("/a"),
+            language: "rust".to_string(),
+        };
+        let cell = lock(&pool.servers).get(&key).cloned().unwrap();
+        // Two overlapping leases (a same-key handoff): T1 and T2.
+        *lock(&cell.leases) += 1;
+        *lock(&cell.leases) += 1;
+        assert!(!evictable(&cell), "two leases pin the cell");
+        // T1 releases via a guard drop — must NOT un-pin T2.
+        drop(LeaseGuard(Arc::clone(&cell)));
+        assert_eq!(
+            *lock(&cell.leases),
+            1,
+            "T1's release leaves T2's lease intact (counter, not a stomped bool)"
+        );
+        assert!(
+            !evictable(&cell),
+            "still leased by T2 — never un-pinned by T1"
+        );
+        {
+            let mut map = lock(&pool.servers);
+            assert!(
+                evict_lru(&mut map).is_none(),
+                "a still-leased cell is never an LRU victim"
+            );
+        }
+        // T2 releases — now fully idle and evictable.
+        drop(LeaseGuard(Arc::clone(&cell)));
+        assert_eq!(*lock(&cell.leases), 0);
+        assert!(evictable(&cell), "both released → evictable");
+    }
+
+    #[test]
+    fn pool_shutdown_during_init_surfaces_poolshutdown() {
+        // DL-63 #5: shutdown racing in DURING a slow handshake must not resurrect
+        // a live server into a terminal pool. ensure_ready re-checks `closed`
+        // after init: it closes the freshly-spawned client and surfaces
+        // PoolShutdown, never installing it `Ready`.
+        let alive = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let av = Arc::clone(&alive);
+        let st = Arc::clone(&started);
+        let rl = Arc::clone(&release);
+        let spawn = move || -> Result<Client, LspError> {
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, mut w) = server_conn;
+            let av = Arc::clone(&av);
+            let st = Arc::clone(&st);
+            let rl = Arc::clone(&rl);
+            av.store(true, Ordering::SeqCst);
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                    match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                        "initialize" => {
+                            st.store(true, Ordering::SeqCst); // announce mid-handshake
+                            while !rl.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                        }
+                        "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                        "exit" => break,
+                        _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                        _ => {}
+                    }
+                }
+                av.store(false, Ordering::SeqCst); // torn down (client closed it)
+            });
+            Ok(test_client(client_conn))
+        };
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            8,
+        ));
+        let p = Arc::clone(&pool);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/work"), "rust", |_c| Ok::<(), LspError>(()))
+        });
+        while !started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        pool.shutdown(); // terminal WHILE init is stalled
+        release.store(true, Ordering::SeqCst); // let init complete
+        let res = h.join().unwrap();
+        assert!(
+            matches!(res, Err(LspError::PoolShutdown)),
+            "install into a terminal pool must surface PoolShutdown, got {res:?}"
+        );
+        for _ in 0..400 {
+            if !alive.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "the mid-handshake client is closed, never resurrected into the terminal pool"
+        );
+        assert!(
+            pool.readiness(Path::new("/work"), "rust").is_none(),
+            "no Ready cell survives in the terminal pool"
+        );
+    }
+
+    #[test]
+    fn pool_cell_invalidated_on_live_pool_never_lies_poolshutdown() {
+        // DL-64 #4: a poisoner keeps a `Shutdown` cell mapped so every acquire
+        // sees an invalidated reservation; the pool is NEVER closed. On retry
+        // exhaustion the honest outcome is the retry signal itself
+        // (`CellInvalidated`) — there is no underlying fatal transport error to
+        // surface here — and NEVER `PoolShutdown`, which would falsely claim a
+        // LIVE pool is terminal (the lie the old code codified). `Ok` when a
+        // window let the install land.
+        let (pool, _) = fake_pool();
+        let pool = Arc::new(pool);
+        let key = PoolKey {
+            root: PathBuf::from("/work"),
+            language: "rust".to_string(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let p = Arc::clone(&pool);
+        let k = key.clone();
+        let sp = Arc::clone(&stop);
+        let poisoner = thread::spawn(move || {
+            while !sp.load(Ordering::SeqCst) {
+                {
+                    let mut map = lock(&p.servers);
+                    let needs = match map.get(&k) {
+                        Some(c) => *lock(&c.readiness) != Readiness::Shutdown,
+                        None => true,
+                    };
+                    if needs {
+                        let cell = Arc::new(PooledServer::reserved());
+                        *lock(&cell.readiness) = Readiness::Shutdown;
+                        map.insert(k.clone(), cell);
+                    }
+                }
+                thread::yield_now();
+            }
+        });
+        for _ in 0..200 {
+            match pool.with_client(Path::new("/work"), "rust", |_c| Ok::<(), LspError>(())) {
+                Ok(()) | Err(LspError::CellInvalidated) => {}
+                Err(LspError::PoolShutdown) => {
+                    panic!("live pool must never surface PoolShutdown (the lie DL-64 #4 fixes)")
+                }
+                Err(e) => panic!("unexpected error surfaced: {e}"),
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        poisoner.join().unwrap();
+    }
+
+    #[test]
+    fn call_after_reader_eof_never_burns_timeout() {
+        // DL-64 #2 (dead-flag TOCTOU): if the read loop sets `dead` and DRAINS the
+        // pending map between call's top-of-fn check and its pending-insert, the
+        // freshly-inserted waiter is unreachable by that drain. Against a HALF-dead
+        // transport (read side EOF, write side still accepting) the write then
+        // succeeds and a bare `recv_timeout` would burn the FULL call timeout and
+        // return a non-fatal `Timeout`. The post-insert re-check must fail FATAL
+        // fast. Stressed to hit the narrow window.
+        for _ in 0..300 {
+            let (client_conn, server_conn) = conn_pair();
+            let (reader, w) = server_conn;
+            // Half-dead server: keep the READ side draining (client writes still
+            // succeed) but drop the WRITE side so the client read loop hits EOF.
+            let sr = thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                drop(w);
+                while let Ok(Some(_)) = read_frame(&mut r) {}
+            });
+            let mut c = test_client(client_conn); // call_timeout = 2s
+            // Bias toward the TOCTOU ordering: let the read loop process EOF
+            // (set dead + drain) before the insert lands.
+            thread::yield_now();
+            let start = Instant::now();
+            let err = c
+                .call("ping", Value::Null, Duration::from_secs(2))
+                .unwrap_err();
+            assert!(
+                matches!(err, LspError::Closed { .. } | LspError::Io(_)),
+                "half-dead transport must fail FATAL, got {err}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "must fail fast, never burn the call timeout: {:?}",
+                start.elapsed()
+            );
+            drop(c); // closes the write side → server read loop EOFs → thread exits
+            sr.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ensure_ready_rechecks_membership_before_install() {
+        // DL-64 #3: a concurrent evict/remove that UNMAPS this reservation during
+        // a slow handshake must make ensure_ready surface the retryable
+        // `CellInvalidated` and orderly-close the fresh client — never install a
+        // live client into a cell absent from the map (a stranded/orphaned server
+        // a request would then run against). `with_client` heals via a respawn;
+        // the second (uninterfered) handshake installs and serves. Pre-fix (bare
+        // closed-check, no membership check) installed the orphan → ONE spawn and
+        // no Ready cell left mapped.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let sc = Arc::clone(&spawns);
+        let st = Arc::clone(&started);
+        let rl = Arc::clone(&release);
+        let spawn = move || -> Result<Client, LspError> {
+            let n = sc.fetch_add(1, Ordering::SeqCst);
+            let (client_conn, server_conn) = conn_pair();
+            spawn_fake_server(server_conn, || Ok(ready_rename_edit()), Vec::new());
+            if n == 0 {
+                // First handshake: announce, then stall so the test can unmap the
+                // reservation before the install.
+                st.store(true, Ordering::SeqCst);
+                while !rl.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(test_client(client_conn))
+        };
+        let pool = Arc::new(LspPool::from_spawn(
+            Box::new(spawn),
+            Duration::from_secs(60),
+            8,
+        ));
+        let key = PoolKey {
+            root: PathBuf::from("/work"),
+            language: "rust".to_string(),
+        };
+        let p = Arc::clone(&pool);
+        let h = thread::spawn(move || {
+            p.with_client(Path::new("/work"), "rust", |_c| Ok::<(), LspError>(()))
+        });
+        while !started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Unmap the reservation mid-handshake (a concurrent evict/remove on a
+        // still-LIVE pool).
+        {
+            let mut map = lock(&pool.servers);
+            map.remove(&key);
+        }
+        release.store(true, Ordering::SeqCst);
+        let res = h.join().unwrap();
+        assert!(res.is_ok(), "with_client heals via respawn: {res:?}");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            2,
+            "the unmapped first handshake must NOT install; a respawn serves"
+        );
+        assert_eq!(
+            pool.readiness(Path::new("/work"), "rust"),
+            Some(Readiness::Ready),
+            "the healed respawn is installed Ready and mapped"
         );
     }
 }

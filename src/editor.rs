@@ -69,6 +69,9 @@ pub struct Editor {
     sess: Session,
     wal_dir: PathBuf,
     lsp_command: Vec<String>,
+    /// Persistent server pool: renames reuse one warm server per (root,
+    /// language) for the editor's lifetime; every child is reaped on drop.
+    lsp_pool: lsp::LspPool,
 }
 
 impl Editor {
@@ -92,6 +95,7 @@ impl Editor {
         Ok(Editor {
             sess,
             wal_dir: cfg.wal_dir,
+            lsp_pool: lsp::LspPool::new(cfg.lsp_command.clone()),
             lsp_command: cfg.lsp_command,
         })
     }
@@ -202,8 +206,13 @@ impl Editor {
     /// requests the rename, converts the server's `WorkspaceEdit` into
     /// byte-range edits, grounds each as a region with a content
     /// region_hash, builds one file anchor per file, and prepares them. The
-    /// caller commits (or rolls back) the returned plan; the server is shut
-    /// down before rename returns.
+    /// caller commits (or rolls back) the returned plan. The language server
+    /// is kept warm in the editor's [`lsp::LspPool`] (keyed by the file's
+    /// root+language) for reuse by later renames, and reaped when the editor
+    /// drops (`LspPool`'s `Drop` shuts every server down). There is NO
+    /// background idle reaper: the pool exposes `evict_idle` for a caller-driven
+    /// maintenance pass, but `Editor` never schedules it, so a warm server
+    /// lives until the pool drops or its slot is LRU-evicted by a new key.
     pub fn rename(
         &self,
         file: &str,
@@ -227,23 +236,9 @@ impl Editor {
             source: e,
         })?;
 
-        let mut client = lsp::Client::new_stdio(&self.lsp_command)?;
-        let root = abs
-            .parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        let result = (|| {
-            client.initialize(&lsp::file_uri(&root).to_string())?;
+        let we = self.lsp_pool.with_client_for_file(&abs, |client| {
             client.rename(&abs_str, &content, line, col, new_name)
-        })();
-        let we = match result {
-            Ok(we) => we,
-            Err(e) => {
-                let _ = client.close();
-                return Err(e.into());
-            }
-        };
-        let _ = client.close();
+        })?;
 
         let file_edits = lsp::workspace_edit_to_file_edits(&we, |p| std::fs::read(p))?;
         if file_edits.is_empty() {
