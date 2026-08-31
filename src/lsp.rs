@@ -86,6 +86,15 @@ const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
 /// Pause between query attempts while waiting for the server to become ready.
 const DEFAULT_QUERY_RETRY: Duration = Duration::from_millis(300);
 
+/// Bounds how long [`Client::await_ready`] keeps probing before declaring the
+/// server not ready. Generous because it covers a cold index build, and the
+/// alternative — proceeding anyway — silently yields empty answers for every
+/// query the caller then makes.
+const DEFAULT_READY_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Pause between readiness probes.
+const DEFAULT_READY_RETRY: Duration = Duration::from_millis(500);
+
 /// Errors surfaced by the LSP boundary.
 #[derive(Debug, Error)]
 pub enum LspError {
@@ -144,10 +153,14 @@ pub enum LspError {
         /// The last not-ready error observed.
         last: String,
     },
-    /// A code-navigation query kept being refused by a server that never
-    /// became ready within its deadline. DISTINCT from an empty result: the
-    /// server never answered the question, so the caller must not read the
-    /// absence of locations as "this symbol has no definition".
+    /// A code-navigation query kept being REFUSED (JSON-RPC error) by a server
+    /// that never became ready within its deadline.
+    ///
+    /// This covers only the refusing server. A server that is still indexing
+    /// far more often ANSWERS with an empty result, which is indistinguishable
+    /// on the wire from a genuine no-result and therefore never reaches this
+    /// variant — see [`LspError::ReadyDeadline`] and [`Client::await_ready`]
+    /// for the outcome that does carry readiness.
     #[error("lsp: {method} {path:?}: not ready after {after:?}: {last}")]
     QueryDeadline {
         /// The request method.
@@ -157,6 +170,24 @@ pub enum LspError {
         /// The configured query deadline.
         after: Duration,
         /// The last not-ready error observed.
+        last: String,
+    },
+    /// [`Client::await_ready`] probed for its whole deadline and the probe
+    /// position never produced a location, so the server is not ready to be
+    /// queried. THIS is the outcome that carries readiness information: a
+    /// caller that gets it must not proceed to query, because every answer it
+    /// would receive is an empty result it cannot interpret.
+    #[error("lsp: not ready: {path:?}:{line}:{character} still empty after {after:?}: {last}")]
+    ReadyDeadline {
+        /// The file the probe targeted.
+        path: String,
+        /// Zero-based probe line.
+        line: u32,
+        /// Zero-based probe character, in UTF-16 code units.
+        character: u32,
+        /// The configured readiness deadline.
+        after: Duration,
+        /// The last outcome observed (an empty result, or a refusal message).
         last: String,
     },
     /// The server never published diagnostics within the timeout.
@@ -728,6 +759,21 @@ fn to_symbol_location(uri: &lt::Uri, range: &lt::Range) -> SymbolLocation {
     }
 }
 
+/// Decodes a raw goto-style response body into locations, absorbing the
+/// spec-legal `null` as the empty answer. Shared so the readiness probe reads
+/// a response exactly as the query methods do — a probe that decoded
+/// differently could call a server ready on a shape the queries then reject.
+fn decode_goto(method: &str, v: Value) -> Result<Vec<SymbolLocation>, LspError> {
+    match serde_json::from_value::<Option<lt::GotoDefinitionResponse>>(v) {
+        Ok(Some(resp)) => Ok(goto_locations(resp)),
+        Ok(None) => Ok(Vec::new()),
+        Err(e) => Err(LspError::Rpc {
+            method: method.to_string(),
+            message: format!("decode response: {e}"),
+        }),
+    }
+}
+
 /// Flattens a goto-style response into locations. A `LocationLink` resolves to
 /// its `targetSelectionRange` (the callee's NAME span) rather than
 /// `targetRange` (the whole declaration body), since a cross-file reference
@@ -910,6 +956,10 @@ pub struct Client {
     pub query_deadline: Duration,
     /// Pause between query attempts (overridable in tests).
     pub query_retry: Duration,
+    /// Bounds how long [`Client::await_ready`] probes (overridable in tests).
+    pub ready_deadline: Duration,
+    /// Pause between readiness probes (overridable in tests).
+    pub ready_retry: Duration,
 }
 
 impl Client {
@@ -992,6 +1042,8 @@ impl Client {
             call_timeout: DEFAULT_CALL_TIMEOUT,
             query_deadline: DEFAULT_QUERY_DEADLINE,
             query_retry: DEFAULT_QUERY_RETRY,
+            ready_deadline: DEFAULT_READY_DEADLINE,
+            ready_retry: DEFAULT_READY_RETRY,
         }
     }
 
@@ -1409,13 +1461,69 @@ impl Client {
             "position": {"line": line, "character": col},
         });
         let v = self.query_with_retry(method, path, params)?;
-        match serde_json::from_value::<Option<lt::GotoDefinitionResponse>>(v) {
-            Ok(Some(resp)) => Ok(goto_locations(resp)),
-            Ok(None) => Ok(Vec::new()),
-            Err(e) => Err(LspError::Rpc {
-                method: method.to_string(),
-                message: format!("decode response: {e}"),
-            }),
+        decode_goto(method, v)
+    }
+
+    /// Blocks until the server can actually answer code-navigation queries,
+    /// or fails with [`LspError::ReadyDeadline`] — THE readiness gate every
+    /// consumer must pass before reading an empty result as "found nothing".
+    ///
+    /// Probing is the only mechanism that works. A successful response with an
+    /// empty result is what a still-indexing server returns, and it is
+    /// indistinguishable from a genuine no-result; no `$/progress` token
+    /// substitutes, being neither necessary (a server can answer before
+    /// priming starts) nor sufficient (queries still come back empty at
+    /// priming's end). So this issues `textDocument/definition` at the
+    /// caller's position and polls every `ready_retry` until a location comes
+    /// back or `ready_deadline` is spent.
+    ///
+    /// THE CALLER SUPPLIES THE POSITION because only the caller knows a
+    /// location whose answer MUST be non-empty; a position picked here would
+    /// be a language-specific guess, and a probe that can legitimately answer
+    /// empty can never terminate. Point it at a reference the workspace
+    /// resolves — an import, a call to a declared function.
+    ///
+    /// A refusal (JSON-RPC error) is also not-ready and keeps polling; a fatal
+    /// transport error aborts at once so the pool respawns the corpse rather
+    /// than probing a dead process for the full deadline. Readiness is a
+    /// property of the SERVER, not of the probe position, so one successful
+    /// gate covers the queries that follow on that server.
+    pub fn await_ready(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<(), LspError> {
+        const METHOD: &str = "textDocument/definition";
+        self.did_open(path, content)?;
+        let params = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": col},
+        });
+        let deadline = Instant::now() + self.ready_deadline;
+        let mut last;
+        loop {
+            match self.call(METHOD, params.clone(), self.call_timeout) {
+                Ok(v) => {
+                    if !decode_goto(METHOD, v)?.is_empty() {
+                        return Ok(());
+                    }
+                    last = "empty result".to_string();
+                }
+                Err(e) if is_fatal_transport(&e) => return Err(e),
+                Err(e) => last = e.to_string(),
+            }
+            if Instant::now() > deadline {
+                return Err(LspError::ReadyDeadline {
+                    path: path.to_string(),
+                    line,
+                    character: col,
+                    after: self.ready_deadline,
+                    last,
+                });
+            }
+            thread::sleep(self.ready_retry);
         }
     }
 
@@ -1423,11 +1531,16 @@ impl Client {
     /// in `path` is DEFINED — the query that turns a reference into a
     /// cross-file edge. `content` is the authoritative text sent via didOpen.
     ///
-    /// An empty vec means the server answered and found no definition: a
-    /// first-class outcome, distinct from [`LspError::QueryDeadline`] (never
-    /// became ready), [`LspError::Timeout`] (no answer) and
-    /// [`LspError::Closed`] (server gone). Positions in and out are UTF-16
-    /// code units; see [`SymbolLocation`].
+    /// AN EMPTY VEC CARRIES NO READINESS INFORMATION. A server still building
+    /// its index answers successfully with an empty result, byte-identical to
+    /// the answer for a symbol that genuinely has no definition; `null` versus
+    /// `[]` does not separate them either, and neither does latency. The
+    /// caller must establish readiness ITSELF — see [`Client::await_ready`] —
+    /// and may only read an empty vec as "no definition" once it has.
+    ///
+    /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
+    /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
+    /// units; see [`SymbolLocation`].
     ///
     /// Unlike `rename` this does NOT prime the workspace: priming re-opens
     /// every sibling file, which is amortizable across one rename but not
@@ -1446,7 +1559,9 @@ impl Client {
 
     /// [`Client::definition`] for the TYPE of the symbol at the position —
     /// what resolves a variable or field reference to the declaration of its
-    /// type rather than to the variable itself. Same outcome discipline.
+    /// type rather than to the variable itself. Same outcome discipline: an
+    /// empty vec does NOT distinguish "no type definition" from "not ready",
+    /// so gate with [`Client::await_ready`] first.
     pub fn type_definition(
         &mut self,
         path: &str,
@@ -1463,9 +1578,10 @@ impl Client {
     ///
     /// This is the entry point when the caller has a CONTAINING function but
     /// not the position of each call site inside it — the case a plain
-    /// `definition` cannot serve. An empty vec means the position names no
-    /// call-hierarchy symbol; the error taxonomy is that of
-    /// [`Client::definition`].
+    /// `definition` cannot serve. An empty vec does NOT distinguish "the
+    /// position names no call-hierarchy symbol" from "the server is not ready
+    /// to say"; gate with [`Client::await_ready`] first. The error taxonomy is
+    /// that of [`Client::definition`].
     pub fn prepare_call_hierarchy(
         &mut self,
         path: &str,
@@ -1498,8 +1614,9 @@ impl Client {
     /// file where the call appears, which is exactly one code-graph edge each.
     ///
     /// `target` must come from [`Client::prepare_call_hierarchy`] against this
-    /// server — its opaque item is echoed back unmodified. An empty vec means
-    /// the symbol calls nothing.
+    /// server — its opaque item is echoed back unmodified. An empty vec does
+    /// NOT distinguish "the symbol calls nothing" from "the server is not
+    /// ready to say"; gate with [`Client::await_ready`] first.
     pub fn outgoing_calls(&mut self, target: &CallTarget) -> Result<Vec<OutgoingCall>, LspError> {
         const METHOD: &str = "callHierarchy/outgoingCalls";
         let params = json!({"item": target.item});
@@ -5232,6 +5349,149 @@ mod tests {
             }
             other => panic!("want QueryDeadline, got {other:?}"),
         }
+    }
+
+    /// A client whose readiness polling is slow enough that a single extra
+    /// poll is unmistakable in the elapsed time.
+    fn ready_client(conn: (PipeReader, PipeWriter)) -> Client {
+        let mut c = query_client(conn);
+        c.ready_retry = Duration::from_secs(2);
+        c.ready_deadline = Duration::from_secs(10);
+        c
+    }
+
+    #[test]
+    fn await_ready_short_circuits_on_first_non_empty_answer() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([{
+                "uri": "file:///work/dep.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 2},
+                },
+            }]))),
+            _ => None,
+        });
+        let mut c = ready_client(client_conn);
+        let start = Instant::now();
+        c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "an already-ready server must not cost a poll interval, took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(count(&log, "textDocument/definition"), 1);
+    }
+
+    #[test]
+    fn await_ready_polls_until_server_answers() {
+        let (client_conn, server_conn) = conn_pair();
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = Arc::clone(&calls);
+        // The cold shapes measured against real servers: a successful response
+        // carrying `[]`, then one carrying `null`, then the real answer.
+        spawn_query_server(server_conn, move |method, _| match method {
+            "textDocument/definition" => match server_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Some(Ok(json!([]))),
+                1 => Some(Ok(Value::Null)),
+                _ => Some(Ok(json!([{
+                    "uri": "file:///work/dep.rs",
+                    "range": {
+                        "start": {"line": 7, "character": 4},
+                        "end": {"line": 7, "character": 9},
+                    },
+                }]))),
+            },
+            _ => None,
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "must keep probing through the empty answers, not trust the first"
+        );
+    }
+
+    #[test]
+    fn await_ready_polls_through_a_refusal() {
+        let (client_conn, server_conn) = conn_pair();
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = Arc::clone(&calls);
+        spawn_query_server(server_conn, move |method, _| match method {
+            "textDocument/definition" => {
+                if server_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Some(Err("waiting for cargo metadata".to_string()))
+                } else {
+                    Some(Ok(json!([{
+                        "uri": "file:///work/dep.rs",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 2},
+                        },
+                    }])))
+                }
+            }
+            _ => None,
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a refusal is not-ready");
+    }
+
+    #[test]
+    fn await_ready_deadline_when_answers_stay_empty() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.ready_deadline = Duration::from_millis(120);
+        let err = c
+            .await_ready("/work/main.rs", "fn main() {}\n", 4, 11)
+            .unwrap_err();
+        match err {
+            LspError::ReadyDeadline {
+                ref path,
+                line,
+                character,
+                ref last,
+                ..
+            } => {
+                assert_eq!(path, "/work/main.rs");
+                assert_eq!((line, character), (4, 11));
+                assert!(last.contains("empty"), "last: {last}");
+            }
+            other => panic!("want ReadyDeadline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn await_ready_fatal_transport_is_not_polled_to_deadline() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut c = ready_client(client_conn);
+        let _ = c.notify("exit", Value::Null);
+        let start = Instant::now();
+        let err = c
+            .await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap_err();
+        assert!(
+            is_fatal_transport(&err),
+            "want a fatal transport error the pool respawns on, got {err:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "failed fast");
     }
 
     #[test]
