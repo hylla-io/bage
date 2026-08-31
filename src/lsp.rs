@@ -78,6 +78,14 @@ const DEFAULT_RENAME_RETRY: Duration = Duration::from_millis(300);
 /// caller-supplied context for the same purpose).
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounds how long a code-navigation query ([`Client::definition`] and
+/// friends) retries a server that refuses the request because it is still
+/// building its index.
+const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Pause between query attempts while waiting for the server to become ready.
+const DEFAULT_QUERY_RETRY: Duration = Duration::from_millis(300);
+
 /// Errors surfaced by the LSP boundary.
 #[derive(Debug, Error)]
 pub enum LspError {
@@ -132,6 +140,21 @@ pub enum LspError {
         /// The file the rename targeted.
         path: String,
         /// The configured rename deadline.
+        after: Duration,
+        /// The last not-ready error observed.
+        last: String,
+    },
+    /// A code-navigation query kept being refused by a server that never
+    /// became ready within its deadline. DISTINCT from an empty result: the
+    /// server never answered the question, so the caller must not read the
+    /// absence of locations as "this symbol has no definition".
+    #[error("lsp: {method} {path:?}: not ready after {after:?}: {last}")]
+    QueryDeadline {
+        /// The request method.
+        method: String,
+        /// The file the query targeted.
+        path: String,
+        /// The configured query deadline.
         after: Duration,
         /// The last not-ready error observed.
         last: String,
@@ -225,6 +248,39 @@ pub fn byte_offset(src: &[u8], line: u32, character: u32) -> Result<usize, LspEr
         offset += size;
     }
     Ok(offset)
+}
+
+/// Maps a UTF-8 byte offset within `src` to the zero-based LSP position
+/// (line, UTF-16 character) naming it — the inverse of [`byte_offset`], and
+/// the entry point for a byte-addressed caller asking a query method about a
+/// span it already holds.
+///
+/// An offset past the end of `src` clamps to the end. An offset landing INSIDE
+/// a multi-byte char rounds DOWN to that char's position: a position must name
+/// a whole character, and rounding down keeps a symbol's start byte naming the
+/// symbol rather than the character after it.
+pub fn position_at(src: &[u8], byte: usize) -> Result<(u32, u32), LspError> {
+    let target = byte.min(src.len());
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (i, &b) in src[..target].iter().enumerate() {
+        if b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    let mut character = 0u32;
+    let mut offset = line_start;
+    while offset < target {
+        let (c, size) = decode_char(&src[offset..]).ok_or(LspError::MalformedUtf8(offset))?;
+        // A target inside this char rounds down: stop before counting it.
+        if offset + size > target {
+            break;
+        }
+        character += c.len_utf16() as u32;
+        offset += size;
+    }
+    Ok((line, character))
 }
 
 /// Decodes the first UTF-8 char in `bytes`, returning it with its byte width,
@@ -603,6 +659,106 @@ fn severity_label(sev: Option<lt::DiagnosticSeverity>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Code-navigation query results
+// ---------------------------------------------------------------------------
+
+/// A span a code-navigation query resolved to: a filesystem path plus the
+/// zero-based range naming the symbol.
+///
+/// Positions are UTF-16 code units, the LSP default that [`Client::initialize`]
+/// deliberately leaves un-negotiated, so a byte-addressed caller converts them
+/// with [`byte_offset`] against the target file's bytes (and builds request
+/// positions with [`position_at`]). Keeping the wire units here means the
+/// conversion stays at the single boundary the module already owns instead of
+/// this type reading files behind the caller's back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolLocation {
+    /// Filesystem path, percent-decoded from the server's `file://` URI.
+    pub path: String,
+    /// Zero-based start line.
+    pub start_line: u32,
+    /// Zero-based start character, in UTF-16 code units.
+    pub start_char: u32,
+    /// Zero-based end line.
+    pub end_line: u32,
+    /// Zero-based end character, in UTF-16 code units.
+    pub end_char: u32,
+}
+
+/// A symbol the server admits to a call hierarchy, as returned by
+/// [`Client::prepare_call_hierarchy`] and required, unmodified, by
+/// [`Client::outgoing_calls`].
+///
+/// The server's own item — including its opaque `data` member, which a server
+/// may use to carry resolution state between the two requests — is retained
+/// privately and echoed back verbatim, so only a server can mint a target and
+/// a caller can never corrupt one.
+#[derive(Debug, Clone)]
+pub struct CallTarget {
+    /// The symbol's name.
+    pub name: String,
+    /// Server-supplied extra detail (e.g. a signature); empty when omitted.
+    pub detail: String,
+    /// The symbol's NAME span (the item's `selectionRange`), which is what a
+    /// cross-file edge should anchor to — the enclosing body range is not.
+    pub location: SymbolLocation,
+    /// The server's verbatim `CallHierarchyItem`, echoed back on follow-up
+    /// requests.
+    item: Value,
+}
+
+/// One callee of a [`CallTarget`], from [`Client::outgoing_calls`].
+#[derive(Debug, Clone)]
+pub struct OutgoingCall {
+    /// The symbol being called.
+    pub to: CallTarget,
+    /// Where the call appears — spans in the CALLER's file, not the callee's,
+    /// which is what makes an edge attributable to a source position.
+    pub call_sites: Vec<SymbolLocation>,
+}
+
+/// Flattens a server URI + range into [`SymbolLocation`].
+fn to_symbol_location(uri: &lt::Uri, range: &lt::Range) -> SymbolLocation {
+    SymbolLocation {
+        path: uri_to_path(uri),
+        start_line: range.start.line,
+        start_char: range.start.character,
+        end_line: range.end.line,
+        end_char: range.end.character,
+    }
+}
+
+/// Flattens a goto-style response into locations. A `LocationLink` resolves to
+/// its `targetSelectionRange` (the callee's NAME span) rather than
+/// `targetRange` (the whole declaration body), since a cross-file reference
+/// edge points at the name.
+fn goto_locations(resp: lt::GotoDefinitionResponse) -> Vec<SymbolLocation> {
+    match resp {
+        lt::GotoDefinitionResponse::Scalar(l) => vec![to_symbol_location(&l.uri, &l.range)],
+        lt::GotoDefinitionResponse::Array(ls) => ls
+            .iter()
+            .map(|l| to_symbol_location(&l.uri, &l.range))
+            .collect(),
+        lt::GotoDefinitionResponse::Link(links) => links
+            .iter()
+            .map(|l| to_symbol_location(&l.target_uri, &l.target_selection_range))
+            .collect(),
+    }
+}
+
+/// Flattens a `CallHierarchyItem` into a [`CallTarget`], retaining the raw
+/// item for the follow-up request.
+fn to_call_target(item: &lt::CallHierarchyItem) -> Result<CallTarget, LspError> {
+    Ok(CallTarget {
+        name: item.name.clone(),
+        detail: item.detail.clone().unwrap_or_default(),
+        location: to_symbol_location(&item.uri, &item.selection_range),
+        item: serde_json::to_value(item)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC framing
 // ---------------------------------------------------------------------------
 
@@ -749,6 +905,11 @@ pub struct Client {
     pub rename_retry: Duration,
     /// Per-request response bound.
     pub call_timeout: Duration,
+    /// Bounds how long a code-navigation query retries a not-ready server
+    /// (overridable in tests).
+    pub query_deadline: Duration,
+    /// Pause between query attempts (overridable in tests).
+    pub query_retry: Duration,
 }
 
 impl Client {
@@ -829,6 +990,8 @@ impl Client {
             rename_deadline: DEFAULT_RENAME_DEADLINE,
             rename_retry: DEFAULT_RENAME_RETRY,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            query_retry: DEFAULT_QUERY_RETRY,
         }
     }
 
@@ -912,7 +1075,18 @@ impl Client {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
-                "workspace": {"workspaceEdit": {"documentChanges": true}}
+                "workspace": {"workspaceEdit": {"documentChanges": true}},
+                // Servers gate features on what the client claims to
+                // understand: without `callHierarchy` a prepare is refused
+                // outright, and without `linkSupport` a definition comes back
+                // as a bare Location, losing the target's NAME span.
+                // `positionEncoding` is deliberately NOT negotiated — the
+                // UTF-16 default is the one `byte_offset`/`position_at` implement.
+                "textDocument": {
+                    "definition": {"linkSupport": true},
+                    "typeDefinition": {"linkSupport": true},
+                    "callHierarchy": {"dynamicRegistration": false},
+                },
             },
         });
         self.call("initialize", params, self.call_timeout)?;
@@ -1173,6 +1347,190 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Issues `method` with `params`, retrying while the server REFUSES the
+    /// request — the shared engine behind the code-navigation queries.
+    ///
+    /// A JSON-RPC error is how a server still building its index says "not
+    /// yet" (the same not-ready shape [`Client::rename`] retries), so it is
+    /// retried until the server answers or `query_deadline` is spent, pausing
+    /// `query_retry` between attempts; exhaustion is a typed
+    /// [`LspError::QueryDeadline`], never an empty result. A fatal transport
+    /// error breaks out immediately with its own typed error, so the pool
+    /// invalidates and respawns a corpse instead of retrying it for the full
+    /// deadline.
+    ///
+    /// A SUCCESSFUL response is final, including `null` and `[]`: the spec's
+    /// way of saying the server looked and found nothing. Retrying it would
+    /// turn every genuine no-result — the common case when a graph builder
+    /// probes every identifier — into a deadline-long stall.
+    fn query_with_retry(
+        &mut self,
+        method: &str,
+        path: &str,
+        params: Value,
+    ) -> Result<Value, LspError> {
+        let deadline = Instant::now() + self.query_deadline;
+        let mut last: String;
+        loop {
+            match self.call(method, params.clone(), self.call_timeout) {
+                Ok(v) => return Ok(v),
+                Err(e) if is_fatal_transport(&e) => return Err(e),
+                Err(e) => last = e.to_string(),
+            }
+            if Instant::now() > deadline {
+                return Err(LspError::QueryDeadline {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    after: self.query_deadline,
+                    last,
+                });
+            }
+            thread::sleep(self.query_retry);
+        }
+    }
+
+    /// Opens `path` (didOpen with `content`, so the server holds the
+    /// authoritative text) and runs a goto-style query at the zero-based
+    /// (line, UTF-16 col) position, decoding the three spec-legal response
+    /// shapes into locations.
+    fn goto(
+        &mut self,
+        method: &str,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<SymbolLocation>, LspError> {
+        self.did_open(path, content)?;
+        let params = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": col},
+        });
+        let v = self.query_with_retry(method, path, params)?;
+        match serde_json::from_value::<Option<lt::GotoDefinitionResponse>>(v) {
+            Ok(Some(resp)) => Ok(goto_locations(resp)),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(LspError::Rpc {
+                method: method.to_string(),
+                message: format!("decode response: {e}"),
+            }),
+        }
+    }
+
+    /// Resolves where the symbol at the zero-based (line, UTF-16 col) position
+    /// in `path` is DEFINED — the query that turns a reference into a
+    /// cross-file edge. `content` is the authoritative text sent via didOpen.
+    ///
+    /// An empty vec means the server answered and found no definition: a
+    /// first-class outcome, distinct from [`LspError::QueryDeadline`] (never
+    /// became ready), [`LspError::Timeout`] (no answer) and
+    /// [`LspError::Closed`] (server gone). Positions in and out are UTF-16
+    /// code units; see [`SymbolLocation`].
+    ///
+    /// Unlike `rename` this does NOT prime the workspace: priming re-opens
+    /// every sibling file, which is amortizable across one rename but not
+    /// across the per-reference call rate a graph build produces. Against a
+    /// server that only considers OPEN documents, open the relevant files
+    /// first.
+    pub fn definition(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<SymbolLocation>, LspError> {
+        self.goto("textDocument/definition", path, content, line, col)
+    }
+
+    /// [`Client::definition`] for the TYPE of the symbol at the position —
+    /// what resolves a variable or field reference to the declaration of its
+    /// type rather than to the variable itself. Same outcome discipline.
+    pub fn type_definition(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<SymbolLocation>, LspError> {
+        self.goto("textDocument/typeDefinition", path, content, line, col)
+    }
+
+    /// Resolves the symbol at the zero-based (line, UTF-16 col) position in
+    /// `path` into call-hierarchy targets, the handle
+    /// [`Client::outgoing_calls`] needs.
+    ///
+    /// This is the entry point when the caller has a CONTAINING function but
+    /// not the position of each call site inside it — the case a plain
+    /// `definition` cannot serve. An empty vec means the position names no
+    /// call-hierarchy symbol; the error taxonomy is that of
+    /// [`Client::definition`].
+    pub fn prepare_call_hierarchy(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<CallTarget>, LspError> {
+        const METHOD: &str = "textDocument/prepareCallHierarchy";
+        self.did_open(path, content)?;
+        let params = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": col},
+        });
+        let v = self.query_with_retry(METHOD, path, params)?;
+        let items =
+            serde_json::from_value::<Option<Vec<lt::CallHierarchyItem>>>(v).map_err(|e| {
+                LspError::Rpc {
+                    method: METHOD.to_string(),
+                    message: format!("decode response: {e}"),
+                }
+            })?;
+        items
+            .unwrap_or_default()
+            .iter()
+            .map(to_call_target)
+            .collect()
+    }
+
+    /// Lists what `target` calls: every callee with the spans in `target`'s own
+    /// file where the call appears, which is exactly one code-graph edge each.
+    ///
+    /// `target` must come from [`Client::prepare_call_hierarchy`] against this
+    /// server — its opaque item is echoed back unmodified. An empty vec means
+    /// the symbol calls nothing.
+    pub fn outgoing_calls(&mut self, target: &CallTarget) -> Result<Vec<OutgoingCall>, LspError> {
+        const METHOD: &str = "callHierarchy/outgoingCalls";
+        let params = json!({"item": target.item});
+        let v = self.query_with_retry(METHOD, &target.location.path, params)?;
+        let calls = serde_json::from_value::<Option<Vec<lt::CallHierarchyOutgoingCall>>>(v)
+            .map_err(|e| LspError::Rpc {
+                method: METHOD.to_string(),
+                message: format!("decode response: {e}"),
+            })?;
+        calls
+            .unwrap_or_default()
+            .iter()
+            .map(|c| {
+                Ok(OutgoingCall {
+                    to: to_call_target(&c.to)?,
+                    // `fromRanges` are spans in the CALLER's file, so they take
+                    // the caller's path — the callee's would misattribute them.
+                    call_sites: c
+                        .from_ranges
+                        .iter()
+                        .map(|r| SymbolLocation {
+                            path: target.location.path.clone(),
+                            start_line: r.start.line,
+                            start_char: r.start.character,
+                            end_line: r.end.line,
+                            end_char: r.end.character,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     /// Requests an orderly LSP shutdown (shutdown + exit) and reaps the
@@ -4606,6 +4964,449 @@ mod tests {
             pool.readiness(Path::new("/work"), "rust"),
             Some(Readiness::Ready),
             "the healed respawn is installed Ready and mapped"
+        );
+    }
+
+    // ---- code-navigation query surface ----
+
+    /// A scripted server for the query methods: `on_request` answers a
+    /// (method, params) pair with `Some(Ok(result))` / `Some(Err(message))`, or
+    /// `None` to fall through to the built-in lifecycle replies. Requests are
+    /// recorded so a test can assert HOW MANY attempts a query made — the
+    /// evidence that a no-result answer is taken at face value instead of
+    /// retried as not-ready.
+    fn spawn_query_server(
+        server_conn: (PipeReader, PipeWriter),
+        mut on_request: impl FnMut(&str, &Value) -> Option<Result<Value, String>> + Send + 'static,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&log);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                lock(&sink).push(method.to_string());
+                match on_request(method, &params) {
+                    Some(Ok(result)) => reply_ok(&mut w, &id, result),
+                    Some(Err(message)) => reply_err(&mut w, &id, &message),
+                    None => match method {
+                        "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                        "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                        "exit" => break,
+                        _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                        _ => {}
+                    },
+                }
+            }
+        });
+        log
+    }
+
+    fn query_client(conn: (PipeReader, PipeWriter)) -> Client {
+        let mut c = test_client(conn);
+        c.query_retry = Duration::from_millis(5);
+        c.query_deadline = Duration::from_millis(200);
+        c
+    }
+
+    fn count(log: &Arc<Mutex<Vec<String>>>, method: &str) -> usize {
+        lock(log).iter().filter(|m| m.as_str() == method).count()
+    }
+
+    #[test]
+    fn position_at_inverts_byte_offset() {
+        // (name, src, byte, want line, want character)
+        let cases: &[(&str, &str, usize, u32, u32)] = &[
+            ("line start", "abc\ndef\n", 4, 1, 0),
+            ("mid line", "abc\ndef\n", 6, 1, 2),
+            ("line end", "abc\ndef\n", 3, 0, 3),
+            ("eof", "abc\ndef\n", 8, 2, 0),
+            ("past eof clamps", "abc\n", 99, 1, 0),
+            ("astral pair counts two", "a😀b", 5, 0, 3),
+            ("before astral", "a😀b", 1, 0, 1),
+            ("inside astral rounds down", "a😀b", 3, 0, 1),
+            ("bmp multibyte", "aéb", 3, 0, 2),
+        ];
+        for (name, src, byte, want_line, want_ch) in cases {
+            let got = position_at(src.as_bytes(), *byte).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(got, (*want_line, *want_ch), "{name}");
+        }
+    }
+
+    #[test]
+    fn position_at_round_trips_through_byte_offset() {
+        let src = "fn main() {\n    let 😀 = héllo;\n}\n";
+        for byte in 0..=src.len() {
+            if !src.is_char_boundary(byte) {
+                continue;
+            }
+            let (line, ch) = position_at(src.as_bytes(), byte).unwrap();
+            assert_eq!(
+                byte_offset(src.as_bytes(), line, ch).unwrap(),
+                byte,
+                "byte {byte} → ({line},{ch}) → back"
+            );
+        }
+    }
+
+    #[test]
+    fn definition_returns_array_locations() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([{
+                "uri": "file:///work/other%20dir/dep.rs",
+                "range": {
+                    "start": {"line": 4, "character": 3},
+                    "end": {"line": 4, "character": 9},
+                },
+            }]))),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![SymbolLocation {
+                path: "/work/other dir/dep.rs".to_string(),
+                start_line: 4,
+                start_char: 3,
+                end_line: 4,
+                end_char: 9,
+            }],
+            "percent-decoded path plus the UTF-16 range verbatim"
+        );
+    }
+
+    #[test]
+    fn definition_scalar_location_response() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!({
+                "uri": "file:///work/dep.rs",
+                "range": {
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 1, "character": 4},
+                },
+            }))),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/work/dep.rs");
+        assert_eq!(got[0].start_line, 1);
+    }
+
+    #[test]
+    fn definition_link_response_uses_selection_range() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([{
+                "targetUri": "file:///work/dep.rs",
+                "targetRange": {
+                    "start": {"line": 9, "character": 0},
+                    "end": {"line": 20, "character": 1},
+                },
+                "targetSelectionRange": {
+                    "start": {"line": 9, "character": 7},
+                    "end": {"line": 9, "character": 11},
+                },
+            }]))),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![SymbolLocation {
+                path: "/work/dep.rs".to_string(),
+                start_line: 9,
+                start_char: 7,
+                end_line: 9,
+                end_char: 11,
+            }],
+            "a link resolves to the NAME span, not the whole body range"
+        );
+    }
+
+    #[test]
+    fn definition_null_is_empty_result_not_retried() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(Value::Null)),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "a null answer is 'no definition', got {got:?}"
+        );
+        assert_eq!(
+            count(&log, "textDocument/definition"),
+            1,
+            "a successful no-result answer is final: never retried as not-ready"
+        );
+    }
+
+    #[test]
+    fn definition_empty_array_is_empty_result() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        assert!(
+            c.definition("/work/main.rs", "fn main() {}\n", 0, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(count(&log, "textDocument/definition"), 1);
+    }
+
+    #[test]
+    fn definition_retries_while_server_not_ready() {
+        let (client_conn, server_conn) = conn_pair();
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = Arc::clone(&calls);
+        spawn_query_server(server_conn, move |method, _| match method {
+            "textDocument/definition" => {
+                if server_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Some(Err("waiting for cargo metadata".to_string()))
+                } else {
+                    Some(Ok(json!([{
+                        "uri": "file:///work/dep.rs",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 2},
+                        },
+                    }])))
+                }
+            }
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two not-ready then ready");
+    }
+
+    #[test]
+    fn definition_deadline_when_server_never_ready() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Err("still indexing".to_string())),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let err = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap_err();
+        match err {
+            LspError::QueryDeadline {
+                ref method,
+                ref path,
+                ref last,
+                ..
+            } => {
+                assert_eq!(method, "textDocument/definition");
+                assert_eq!(path, "/work/main.rs");
+                assert!(last.contains("still indexing"), "last: {last}");
+            }
+            other => panic!("want QueryDeadline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn definition_fatal_transport_is_not_retried_to_deadline() {
+        let (client_conn, server_conn) = conn_pair();
+        // Server answers the handshake then hangs up: the read loop hits EOF, so
+        // the query must fail FATAL at once (the pool invalidates + respawns)
+        // rather than burn the whole not-ready deadline.
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(Value::Null)),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        c.query_deadline = Duration::from_secs(30);
+        let _ = c.notify("exit", Value::Null);
+        let start = Instant::now();
+        let err = c
+            .definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap_err();
+        assert!(
+            is_fatal_transport(&err),
+            "want a fatal transport error the pool respawns on, got {err:?}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5), "failed fast");
+    }
+
+    #[test]
+    fn type_definition_returns_locations() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/typeDefinition" => Some(Ok(json!([{
+                "uri": "file:///work/types.rs",
+                "range": {
+                    "start": {"line": 2, "character": 11},
+                    "end": {"line": 2, "character": 14},
+                },
+            }]))),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let got = c
+            .type_definition("/work/main.rs", "let x = Foo;\n", 0, 8)
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/work/types.rs");
+        assert_eq!(count(&log, "textDocument/typeDefinition"), 1);
+    }
+
+    #[test]
+    fn prepare_call_hierarchy_then_outgoing_calls() {
+        let (client_conn, server_conn) = conn_pair();
+        let seen_item = Arc::new(Mutex::new(Value::Null));
+        let sink = Arc::clone(&seen_item);
+        spawn_query_server(server_conn, move |method, params| match method {
+            "textDocument/prepareCallHierarchy" => Some(Ok(json!([{
+                "name": "main",
+                "kind": 12,
+                "detail": "fn main()",
+                "uri": "file:///work/main.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 3, "character": 1},
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 7},
+                },
+                "data": {"opaque": 42},
+            }]))),
+            "callHierarchy/outgoingCalls" => {
+                *lock(&sink) = params.get("item").cloned().unwrap_or(Value::Null);
+                Some(Ok(json!([{
+                    "to": {
+                        "name": "helper",
+                        "kind": 12,
+                        "uri": "file:///work/dep.rs",
+                        "range": {
+                            "start": {"line": 10, "character": 0},
+                            "end": {"line": 12, "character": 1},
+                        },
+                        "selectionRange": {
+                            "start": {"line": 10, "character": 3},
+                            "end": {"line": 10, "character": 9},
+                        },
+                    },
+                    "fromRanges": [{
+                        "start": {"line": 1, "character": 4},
+                        "end": {"line": 1, "character": 10},
+                    }],
+                }])))
+            }
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        let targets = c
+            .prepare_call_hierarchy("/work/main.rs", "fn main() {\n  helper();\n}\n", 0, 3)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "main");
+        assert_eq!(targets[0].detail, "fn main()");
+        assert_eq!(targets[0].location.path, "/work/main.rs");
+        assert_eq!(targets[0].location.start_char, 3, "the NAME span");
+
+        let calls = c.outgoing_calls(&targets[0]).unwrap();
+        assert_eq!(
+            lock(&seen_item).get("data"),
+            Some(&json!({"opaque": 42})),
+            "the server's opaque item round-trips verbatim"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to.name, "helper");
+        assert_eq!(calls[0].to.location.path, "/work/dep.rs");
+        assert_eq!(
+            calls[0].call_sites,
+            vec![SymbolLocation {
+                path: "/work/main.rs".to_string(),
+                start_line: 1,
+                start_char: 4,
+                end_line: 1,
+                end_char: 10,
+            }],
+            "call sites are spans in the CALLER's file"
+        );
+    }
+
+    #[test]
+    fn prepare_call_hierarchy_null_is_empty_result() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/prepareCallHierarchy" => Some(Ok(Value::Null)),
+            _ => None,
+        });
+        let mut c = query_client(client_conn);
+        assert!(
+            c.prepare_call_hierarchy("/work/main.rs", "fn main() {}\n", 0, 3)
+                .unwrap()
+                .is_empty(),
+            "no call-hierarchy symbol here is an answer, not a failure"
+        );
+        assert_eq!(count(&log, "textDocument/prepareCallHierarchy"), 1);
+    }
+
+    #[test]
+    fn initialize_advertises_query_capabilities() {
+        let (client_conn, server_conn) = conn_pair();
+        let seen = Arc::new(Mutex::new(Value::Null));
+        let sink = Arc::clone(&seen);
+        spawn_query_server(server_conn, move |method, params| {
+            if method == "initialize" {
+                *lock(&sink) = params.clone();
+                return Some(Ok(json!({"capabilities": {}})));
+            }
+            None
+        });
+        let mut c = query_client(client_conn);
+        c.initialize("file:///work").unwrap();
+        let params = lock(&seen).clone();
+        let td = params
+            .pointer("/capabilities/textDocument")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            td.pointer("/definition/linkSupport"),
+            Some(&json!(true)),
+            "link support unlocks the target NAME span; params: {params}"
+        );
+        assert!(
+            td.get("typeDefinition").is_some() && td.get("callHierarchy").is_some(),
+            "servers gate these on the client advertising them; got {td}"
+        );
+        assert!(
+            params
+                .pointer("/capabilities/general/positionEncoding")
+                .is_none(),
+            "no negotiation: the UTF-16 default is what byte_offset/position_at assume"
         );
     }
 }
