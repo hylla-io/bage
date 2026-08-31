@@ -977,22 +977,15 @@ fn collect_lsp_diagnostics(file: &str, lsp_cmd: &str) -> Result<Vec<lsp::Diagnos
     let abs_str = abs.to_string_lossy().into_owned();
     let content = std::fs::read_to_string(&abs).map_err(|e| format!("read {abs_str:?}: {e}"))?;
 
-    let mut client =
-        lsp::Client::new_stdio(&command).map_err(|e| format!("start lsp {:?}: {e}", command[0]))?;
-    let root = abs
-        .parent()
-        .map(|d| d.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string());
-    let outcome = (|| {
-        client
-            .initialize(&lsp::file_uri(&root).to_string())
-            .map_err(|e| format!("initialize: {e}"))?;
-        client
-            .diagnostics(&abs_str, &content, std::time::Duration::from_secs(10))
-            .map_err(|e| format!("collect diagnostics: {e}"))
-    })();
-    let _ = client.close();
-    outcome
+    // A short-lived pool: it spawns+initializes the server for this file's
+    // (root, language), runs the request, and reaps the child on Drop —
+    // behaviorally the old spawn/init/close cycle, now on the pool primitive
+    // (and warm-reusable once a caller hoists the pool across invocations).
+    let pool = lsp::LspPool::new(command);
+    pool.with_client_for_file(abs.as_path(), |client| {
+        client.diagnostics(&abs_str, &content, std::time::Duration::from_secs(10))
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Args)]

@@ -141,7 +141,7 @@ fn compile_commands_generation_covers_fixture() {
         let p = dir.path().join(rel);
         fs::write(&p, content).expect("fixture file");
     }
-    let created = lsp::ensure_compile_commands(dir.path())
+    let (created, _hash) = lsp::ensure_compile_commands(dir.path())
         .expect("generate")
         .expect("created");
     let body = fs::read_to_string(&created).expect("read db");
