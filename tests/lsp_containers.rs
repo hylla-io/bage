@@ -2,14 +2,18 @@
 //! spoken to over stdio via `docker run -i --rm` (Content-Length framing
 //! flows straight through the docker CLI, so no TCP bridge is needed).
 //!
-//! Skipped unless `BAGE_DOCKER_LSP=1`. Each case mounts a temp fixture into
+//! The container cases are `#[ignore]`d so a default run REPORTS them as
+//! ignored rather than passed: a case that returns early still scores `ok`,
+//! which is indistinguishable from a real cross-file rename having succeeded.
+//! Each case mounts a temp fixture into
 //! the container AT THE SAME ABSOLUTE PATH as on the host, so `file://` URIs,
 //! workspace priming's filesystem walk, and the generated
 //! compile_commands.json all resolve identically on both sides. Images are
 //! pinned; servers not baked into an image are installed at container start,
 //! hence the generous timeouts.
 //!
-//! Run: `BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --nocapture`
+//! Run: `BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored
+//! --nocapture`
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -53,10 +57,14 @@ struct Case {
 /// clangd, generates compile_commands.json), and asserts every expected file
 /// received an edit.
 fn run_case(case: &Case) {
-    if !docker_enabled() {
-        eprintln!("{}: skipped (set BAGE_DOCKER_LSP=1 to run)", case.name);
-        return;
-    }
+    // Reaching here means the operator selected an `#[ignore]`d case on
+    // purpose, so a missing gate is their mistake to see, not one to swallow
+    // into a green result.
+    assert!(
+        docker_enabled(),
+        "{}: needs BAGE_DOCKER_LSP=1 (and a running docker daemon)",
+        case.name
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     // Canonicalize so the path docker mounts is the real one (macOS /var ->
@@ -187,6 +195,7 @@ const C_FILES: &[(&str, &str)] = &[
 /// (reference). gopls does full-workspace rename natively; this case anchors
 /// the baseline the pyright/clangd fixes are measured against.
 #[test]
+#[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn gopls_cross_file_rename() {
     run_case(&Case {
         name: "gopls",
@@ -209,6 +218,7 @@ fn gopls_cross_file_rename() {
 /// because `Client::rename` primes the workspace (didOpens main.py) first —
 /// the issue #23 fix under test.
 #[test]
+#[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn pyright_cross_file_rename_with_priming() {
     run_case(&Case {
         name: "pyright",
@@ -231,6 +241,7 @@ fn pyright_cross_file_rename_with_priming() {
 /// the rename stays single-file; the bage-generated compile_commands.json
 /// plus priming must carry it into main.c — the issue #23 fix under test.
 #[test]
+#[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn clangd_cross_tu_rename_with_generated_compile_commands() {
     run_case(&Case {
         name: "clangd",

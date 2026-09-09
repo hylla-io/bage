@@ -2,7 +2,7 @@
 
 > **Båge** (Swedish for *bow / arc*) — a bidirectional code-graph round-trip file editor.
 
-Status: v0.7.0 — **Rust implementation** (the original Go implementation is archived on the
+Status: v0.8.6 — **Rust implementation** (the original Go implementation is archived on the
 [`go-legacy`](https://github.com/hylla-io/bage/tree/go-legacy) branch; Go module consumers
 keep resolving the existing `v0.4.x`/`v0.5.x` tags). Agent-IDE polyglot lib: surgical edits +
 whole-file replace + insertion primitives, cut / copy / paste over a file clipboard,
@@ -44,14 +44,14 @@ cargo build --release        # → target/release/bage
 **Install the CLI** from the repo at a released tag:
 
 ```sh
-cargo install --git https://github.com/hylla-io/bage --tag v0.7.0
+cargo install --git https://github.com/hylla-io/bage --tag v0.8.6
 ```
 
 **Use as a library** — add the crate as a git dependency pinned to a tag:
 
 ```toml
 [dependencies]
-bage = { git = "https://github.com/hylla-io/bage", tag = "v0.7.0" }
+bage = { git = "https://github.com/hylla-io/bage", tag = "v0.8.6" }
 ```
 
 Prebuilt per-OS binaries (linux x64/arm64, macOS arm/intel, windows msvc) are also attached to
