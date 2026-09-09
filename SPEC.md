@@ -4,7 +4,7 @@
 > files + LSP; in integrated mode, Hylla links Båge as a library so one agent-facing edit
 > lands in both the graph and the files with no possible drift. This SPEC is the buildable
 > contract; design rationale lives in `docs/adr/` and `CONTEXT.md`. Crate: `bage` (Rust,
-> edition 2024). Status: v0.7.0 (shipped) — cut / copy / paste over a file clipboard,
+> edition 2024). Status: v0.8.6 (shipped) — cut / copy / paste over a file clipboard,
 > insertion + whole-file-replace primitives, data-format key outline (§12). The Go
 > implementation is archived on `go-legacy` and remains the byte-contract reference for
 > normalize/hash parity; every hash digest below is byte-identical across both. Date:
