@@ -346,10 +346,17 @@ each with name extraction. Code grammars keep the substring `is_decl_kind` path.
 
 ### §12.5 LSP cross-file rename completeness (#23)
 `Client::rename` primes the workspace — `didOpen`ing same-language siblings under the root
-(capped, `BAGE_LSP_NO_PRIME=1` to disable) — so servers that only see open files (pyright) rename
-across files. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
-on close) so a rename crosses translation units. Container-verified for gopls, pyright, and clangd
-(`BAGE_DOCKER_LSP=1`).
+(capped, `BAGE_LSP_NO_PRIME=1` to disable) — for servers that only see open files. `initialize`
+declares the root both as `rootUri` and as the single entry of `workspaceFolders`; pyright ignores
+`rootUri` and renames across files only with the folder declared. The dynamic
+`workspace.workspaceFolders` capability is not claimed. `processId` is declared per client
+(`ClientConfig::process_id`, default this process's id, `None` = `null`); a server in another pid
+namespace needs `None`, or it exits when it cannot see the pid. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
+on close) so a rename crosses translation units. A server still indexing may answer with a
+non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
+distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
+at a position inside a referencing file first. Container-verified for gopls, pyright, and clangd
+(`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
 ### §12.6 Declared LSP session
 A consumer declares every time bound of a session; none is fixed at compile time.

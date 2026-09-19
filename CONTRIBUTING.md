@@ -42,15 +42,17 @@ advisory and does not gate a merge.
 ### Docker-gated LSP suite
 
 `tests/lsp_containers.rs` drives real language servers (gopls, pyright, clangd)
-in containers over stdio. It is skipped unless you opt in, because it needs
-Docker and pulls images:
+in containers over stdio. The container cases are `#[ignore]`d because they
+need a running Docker daemon and pull images, so run them explicitly:
 
 ```sh
-BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --nocapture
+BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored --nocapture
 ```
 
-Run it if you touched the LSP path. Without the variable the cases print a skip
-line and pass — that is a reported skip, not evidence.
+Run it if you touched the LSP path. A plain `cargo test` reports these cases
+as `ignored`, never as passed — an ignored case is not evidence. Selecting them
+with `--ignored` but without `BAGE_DOCKER_LSP=1` fails them loudly rather than
+skipping.
 
 ## Commits and PRs
 
@@ -87,7 +89,9 @@ returns an empty result or a typed `Unsupported`, never an error. See
 ### Adding an LSP rename case
 
 Add one `Case` row in `tests/lsp_containers.rs`: image, server argv, fixture
-files, rename position, and the files the resulting `WorkspaceEdit` must touch.
+files, rename position, the files the resulting `WorkspaceEdit` must touch, and
+— for a server that answers a cold rename with a partial edit — a readiness
+reference inside a referencing file, passed to `Client::await_ready` first.
 The container is spoken to over stdio through `docker run -i --rm`, so no
 bridge or driver change is needed.
 

@@ -153,9 +153,13 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
 - **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
   rust-analyzer do full cross-file rename natively; clangd is carried across translation
-  units by a generated `compile_commands.json`, and pyright across files by workspace
-  priming (opening same-language siblings before the rename). Cross-file rename is
-  container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
+  units by a generated `compile_commands.json`, and pyright across files because the
+  handshake declares the root as a workspace folder (pyright ignores the deprecated
+  `rootUri`). A rename also primes the workspace by opening same-language siblings
+  first, for servers that only see open files. A server still indexing can answer with
+  a partial edit (a cold clangd renames the target TU alone), so a caller needing every
+  reference passes `Client::await_ready` inside a referencing file first. Cross-file
+  rename is container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
 
 ## Build gates
 

@@ -43,6 +43,7 @@ fn default_config_is_the_documented_defaults() {
     assert_eq!(d.shutdown_timeout, Duration::from_secs(2));
     assert_eq!(d.exit_deadline, Duration::from_secs(3));
     assert_eq!(d.exit_poll, Duration::from_millis(50));
+    assert_eq!(d.process_id, Some(std::process::id()));
 }
 
 #[test]
@@ -59,6 +60,7 @@ fn configure_round_trips_every_bound() {
         shutdown_timeout: Duration::from_millis(9),
         exit_deadline: Duration::from_millis(10),
         exit_poll: Duration::from_millis(11),
+        process_id: None,
     };
     let mut c = Client::new_stdio(&silent_server()).expect("spawn sleep");
     c.configure(cfg);
