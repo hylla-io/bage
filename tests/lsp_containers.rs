@@ -98,6 +98,7 @@ fn run_case(case: &Case) {
 
     let mut client = Client::new_stdio(&command).expect("spawn docker run");
     // Generous bounds: first runs pull images and install servers.
+    client.initialize_timeout = Duration::from_secs(300);
     client.call_timeout = Duration::from_secs(300);
     client.rename_deadline = Duration::from_secs(300);
     client.rename_retry = Duration::from_secs(2);

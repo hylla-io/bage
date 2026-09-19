@@ -350,3 +350,38 @@ each with name extraction. Code grammars keep the substring `is_decl_kind` path.
 across files. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
 on close) so a rename crosses translation units. Container-verified for gopls, pyright, and clangd
 (`BAGE_DOCKER_LSP=1`).
+
+### §12.6 Declared LSP session
+A consumer declares every time bound of a session; none is fixed at compile time.
+`lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
+query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
+exit_poll }` is applied by `Client::configure` BEFORE `initialize` (read back with
+`Client::config`), or carried by `LspPool::with_client_config`, which configures each server
+between spawn and handshake — the only point a pooled handshake can be bounded.
+`initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
+`shutdown_timeout + exit_deadline` before killing the child. `ClientConfig::default()` holds
+bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms).
+The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
+time rather than defaulting silently, and ships as a minor bump.
+Document sync is public: `Client::did_open(path, text)` (close-then-open on a re-open, per the
+spec's balanced open/close rule) and `Client::did_close(path) -> Result<bool>` (`false`, nothing
+sent, when the document is not open). Real-server proof: `tests/lsp_session.rs`
+(`BAGE_LSP_REAL_TEST=1`, rust-analyzer + gopls resolve a definition only present in the opened
+buffer).
+
+### §12.7 Implementation + type hierarchy
+`Client::implementation(path, content, line, col) -> Vec<SymbolLocation>` issues
+`textDocument/implementation` (a trait/interface method to each implementing method; a
+`LocationLink` resolves to its target NAME span). `Client::prepare_type_hierarchy(..) ->
+Vec<TypeTarget>` then `Client::supertypes(&TypeTarget)` / `Client::subtypes(&TypeTarget)`
+walk `textDocument/prepareTypeHierarchy`, `typeHierarchy/supertypes`, `typeHierarchy/subtypes`
+(LSP 3.17). A `TypeTarget` carries the server's verbatim item, `data` included, so only a server
+mints one. `initialize` advertises `implementation.linkSupport` and `typeHierarchy` (no dynamic
+registration) and keeps the server's `capabilities`; a method whose provider is absent, `null` or
+`false` fails with `LspError::Unsupported { method, capability }` and sends nothing — never an
+empty answer. Before a handshake nothing is known, so the request goes out. All four run under the
+declared `call_timeout`, `query_deadline` and `query_retry` (§12.6); an empty result still carries
+no readiness, so gate with `await_ready` first. Measured on the local servers: rust-analyzer
+advertises implementation but NOT type hierarchy; gopls and clangd advertise both; pyright advertises
+neither. Real-server proof: `tests/lsp_hierarchy.rs` (`BAGE_LSP_REAL_TEST=1`); a server that starts
+advertising a capability fails its `Unsupported` row loudly so it moves to the positive rows.

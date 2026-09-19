@@ -86,6 +86,33 @@ The hash primitives a host mirrors for cross-system agreement are exported:
 `bage::normalize::normalize`, `bage::hashing::{raw_hash, norm_hash}`,
 `bage::region::hash_region`, `bage::parser::Lang::for_path`.
 
+An LSP session is declared, not assumed. Every time bound the client observes — the
+`initialize` handshake, each request, rename/query/readiness retries, and the `shutdown` +
+exit waits on close — lives in `bage::lsp::ClientConfig` and is set before `initialize`,
+directly or through a pool that initializes on spawn. `ClientConfig::default()` carries
+bage's own values (30 s initialize and per-request, 2 s shutdown, 3 s exit wait); write the
+full struct literal to declare every bound yourself. Document sync is the caller's too:
+`did_open(path, text)` and `did_close(path)` (which returns `false` and sends nothing for a
+document this client never opened).
+
+```rust
+use bage::lsp::{Client, ClientConfig, LspPool};
+
+let cfg = ClientConfig { initialize_timeout: Duration::from_secs(120), ..ClientConfig::default() };
+let mut c = Client::new_stdio(&["rust-analyzer".into()])?;
+c.configure(cfg);                          // before initialize
+c.initialize(&root_uri)?;
+c.did_open("/abs/src/util.rs", &text)?;    // the server now resolves against `text`
+let pool = LspPool::with_client_config(command, idle_ttl, max_servers, cfg); // same, pooled
+```
+
+Beyond definition and call hierarchy, the client resolves implementations and the type hierarchy:
+`implementation(path, text, line, col)`, then `prepare_type_hierarchy(..)` → `supertypes(&t)` /
+`subtypes(&t)`. A server that does not advertise the capability yields
+`LspError::Unsupported { method, capability }` with nothing sent — never an empty answer, which
+would read as "nothing implements this". rust-analyzer advertises no type hierarchy; gopls and
+clangd do (SPEC §12.7).
+
 Errors carry a machine-branchable kind so a wrapper never parses English:
 `SessionError::kind()` → `conflict | drift | exists | not-found | usage | io`, and
 `session::envelope(&err)` → `ErrorEnvelope { kind, path, message }` (JSON/TOON-serializable).
@@ -138,6 +165,7 @@ All via cargo:
 cargo fmt --check                          # formatting
 cargo clippy --all-targets -- -D warnings  # lints
 cargo test                                 # unit + property + concurrency + TOON goldens
+BAGE_LSP_REAL_TEST=1 cargo test            # + real-server tier (rust-analyzer, gopls, clangd, pyright on PATH)
 ```
 
 ## Dogfooding
