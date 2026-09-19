@@ -95,6 +95,79 @@ const DEFAULT_READY_DEADLINE: Duration = Duration::from_secs(120);
 /// Pause between readiness probes.
 const DEFAULT_READY_RETRY: Duration = Duration::from_millis(500);
 
+/// Bounds the `shutdown` request in [`Client::close`]; short because close is
+/// best-effort and the child is killed regardless.
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bounds how long [`Client::close`] waits for the child to exit after `exit`
+/// before killing it.
+const DEFAULT_EXIT_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Pause between child-exit checks inside the exit deadline.
+const DEFAULT_EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// Every time bound a [`Client`] observes, declared as one value so a consumer
+/// can fix all of them BEFORE [`Client::initialize`] — including through an
+/// [`LspPool`], which initializes right after spawning and never hands the
+/// client out first.
+///
+/// [`Default`] carries bage's own values, stated per field. Fields are public
+/// and the struct is deliberately NOT `#[non_exhaustive]`: a consumer that
+/// must declare every bound writes the full struct literal, and a bound added
+/// later then fails that consumer's build instead of silently taking a default
+/// (such an addition ships as a minor-version bump while bage is pre-1.0).
+///
+/// No value is validated. A zero bound is legal and fails at once, loudly, as
+/// the typed timeout of whatever it bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientConfig {
+    /// Bounds the `initialize` request. Default 30 s. Separate from
+    /// `call_timeout` because a cold server's handshake can legitimately take
+    /// far longer than any later request should.
+    pub initialize_timeout: Duration,
+    /// Bounds every other request's wait for its response. Default 30 s.
+    pub call_timeout: Duration,
+    /// Bounds [`Client::rename`]'s retries against a not-ready server.
+    /// Default 30 s.
+    pub rename_deadline: Duration,
+    /// Pause between rename attempts. Default 300 ms.
+    pub rename_retry: Duration,
+    /// Bounds a code-navigation query's retries against a refusing server.
+    /// Default 30 s.
+    pub query_deadline: Duration,
+    /// Pause between query attempts. Default 300 ms.
+    pub query_retry: Duration,
+    /// Bounds [`Client::await_ready`]. Default 120 s.
+    pub ready_deadline: Duration,
+    /// Pause between readiness probes. Default 500 ms.
+    pub ready_retry: Duration,
+    /// Bounds the `shutdown` request in [`Client::close`]. Default 2 s.
+    pub shutdown_timeout: Duration,
+    /// How long [`Client::close`] waits for the child to exit after `exit`
+    /// before killing it. Default 3 s.
+    pub exit_deadline: Duration,
+    /// Pause between child-exit checks within `exit_deadline`. Default 50 ms.
+    pub exit_poll: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        ClientConfig {
+            initialize_timeout: DEFAULT_CALL_TIMEOUT,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            rename_deadline: DEFAULT_RENAME_DEADLINE,
+            rename_retry: DEFAULT_RENAME_RETRY,
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            query_retry: DEFAULT_QUERY_RETRY,
+            ready_deadline: DEFAULT_READY_DEADLINE,
+            ready_retry: DEFAULT_READY_RETRY,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            exit_deadline: DEFAULT_EXIT_DEADLINE,
+            exit_poll: DEFAULT_EXIT_POLL,
+        }
+    }
+}
+
 /// Errors surfaced by the LSP boundary.
 #[derive(Debug, Error)]
 pub enum LspError {
@@ -189,6 +262,17 @@ pub enum LspError {
         after: Duration,
         /// The last outcome observed (an empty result, or a refusal message).
         last: String,
+    },
+    /// The server's `initialize` answer did not advertise the capability a
+    /// request needs, so the request was never sent. Distinct from an empty
+    /// result: a server that cannot answer must not be read as one that looked
+    /// and found nothing.
+    #[error("lsp: {method}: server does not advertise {capability}")]
+    Unsupported {
+        /// The request that was refused.
+        method: String,
+        /// The `ServerCapabilities` member that is absent, `null` or `false`.
+        capability: String,
     },
     /// The server never published diagnostics within the timeout.
     #[error("lsp: awaiting diagnostics for {path:?}: no publish after {after:?}")]
@@ -748,6 +832,61 @@ pub struct OutgoingCall {
     pub call_sites: Vec<SymbolLocation>,
 }
 
+/// A type the server admits to a type hierarchy, as returned by
+/// [`Client::prepare_type_hierarchy`], [`Client::supertypes`] and
+/// [`Client::subtypes`], and required, unmodified, by the latter two.
+///
+/// Like [`CallTarget`], the server's own item — including its opaque `data` —
+/// is retained privately and echoed back verbatim, so only a server can mint
+/// one.
+#[derive(Debug, Clone)]
+pub struct TypeTarget {
+    /// The type's name.
+    pub name: String,
+    /// Server-supplied extra detail; empty when omitted.
+    pub detail: String,
+    /// The type's NAME span (the item's `selectionRange`).
+    pub location: SymbolLocation,
+    /// The server's verbatim `TypeHierarchyItem`, echoed back on follow-up
+    /// requests.
+    item: Value,
+}
+
+/// The `TypeHierarchyItem` members bage reads. Decoded here rather than via
+/// `lsp_types::TypeHierarchyItem`, which types `tags` as a single tag where the
+/// 3.17 spec sends an array, so a server's tagged item would fail to decode.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireTypeItem {
+    name: String,
+    #[serde(default)]
+    detail: Option<String>,
+    uri: lt::Uri,
+    selection_range: lt::Range,
+}
+
+/// Decodes a `TypeHierarchyItem[] | null` response, keeping each raw item.
+fn decode_type_items(method: &str, v: Value) -> Result<Vec<TypeTarget>, LspError> {
+    let decode_err = |e: serde_json::Error| LspError::Rpc {
+        method: method.to_string(),
+        message: format!("decode response: {e}"),
+    };
+    let items = serde_json::from_value::<Option<Vec<Value>>>(v).map_err(decode_err)?;
+    items
+        .unwrap_or_default()
+        .into_iter()
+        .map(|raw| {
+            let w = serde_json::from_value::<WireTypeItem>(raw.clone()).map_err(decode_err)?;
+            Ok(TypeTarget {
+                name: w.name,
+                detail: w.detail.unwrap_or_default(),
+                location: to_symbol_location(&w.uri, &w.selection_range),
+                item: raw,
+            })
+        })
+        .collect()
+}
+
 /// Flattens a server URI + range into [`SymbolLocation`].
 fn to_symbol_location(uri: &lt::Uri, range: &lt::Range) -> SymbolLocation {
     SymbolLocation {
@@ -944,6 +1083,10 @@ pub struct Client {
     /// still matches — never clobber a caller's replacement. `None` when the
     /// database pre-existed or was never needed.
     created_compile_commands: Option<(PathBuf, u64)>,
+    /// The `capabilities` member of the server's `initialize` answer; `None`
+    /// until a handshake succeeds. Bage advertises no dynamic registration for
+    /// the gated methods, so this static set is authoritative.
+    server_capabilities: Option<Value>,
     /// Bounds how long `rename` retries a still-indexing server (overridable
     /// in tests).
     pub rename_deadline: Duration,
@@ -960,6 +1103,14 @@ pub struct Client {
     pub ready_deadline: Duration,
     /// Pause between readiness probes (overridable in tests).
     pub ready_retry: Duration,
+    /// Bounds the `initialize` request; see [`ClientConfig::initialize_timeout`].
+    pub initialize_timeout: Duration,
+    /// Bounds the `shutdown` request in [`Client::close`].
+    pub shutdown_timeout: Duration,
+    /// How long [`Client::close`] waits for the child to exit before killing it.
+    pub exit_deadline: Duration,
+    /// Pause between child-exit checks within `exit_deadline`.
+    pub exit_poll: Duration,
 }
 
 impl Client {
@@ -1037,6 +1188,7 @@ impl Client {
             root: None,
             open_docs: HashSet::new(),
             created_compile_commands: None,
+            server_capabilities: None,
             rename_deadline: DEFAULT_RENAME_DEADLINE,
             rename_retry: DEFAULT_RENAME_RETRY,
             call_timeout: DEFAULT_CALL_TIMEOUT,
@@ -1044,6 +1196,56 @@ impl Client {
             query_retry: DEFAULT_QUERY_RETRY,
             ready_deadline: DEFAULT_READY_DEADLINE,
             ready_retry: DEFAULT_READY_RETRY,
+            initialize_timeout: DEFAULT_CALL_TIMEOUT,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            exit_deadline: DEFAULT_EXIT_DEADLINE,
+            exit_poll: DEFAULT_EXIT_POLL,
+        }
+    }
+
+    /// Applies every bound in `cfg`. Call before [`Client::initialize`] so the
+    /// handshake itself runs under the declared `initialize_timeout`.
+    pub fn configure(&mut self, cfg: ClientConfig) {
+        let ClientConfig {
+            initialize_timeout,
+            call_timeout,
+            rename_deadline,
+            rename_retry,
+            query_deadline,
+            query_retry,
+            ready_deadline,
+            ready_retry,
+            shutdown_timeout,
+            exit_deadline,
+            exit_poll,
+        } = cfg;
+        self.initialize_timeout = initialize_timeout;
+        self.call_timeout = call_timeout;
+        self.rename_deadline = rename_deadline;
+        self.rename_retry = rename_retry;
+        self.query_deadline = query_deadline;
+        self.query_retry = query_retry;
+        self.ready_deadline = ready_deadline;
+        self.ready_retry = ready_retry;
+        self.shutdown_timeout = shutdown_timeout;
+        self.exit_deadline = exit_deadline;
+        self.exit_poll = exit_poll;
+    }
+
+    /// The bounds currently in force, including any set field by field.
+    pub fn config(&self) -> ClientConfig {
+        ClientConfig {
+            initialize_timeout: self.initialize_timeout,
+            call_timeout: self.call_timeout,
+            rename_deadline: self.rename_deadline,
+            rename_retry: self.rename_retry,
+            query_deadline: self.query_deadline,
+            query_retry: self.query_retry,
+            ready_deadline: self.ready_deadline,
+            ready_retry: self.ready_retry,
+            shutdown_timeout: self.shutdown_timeout,
+            exit_deadline: self.exit_deadline,
+            exit_poll: self.exit_poll,
         }
     }
 
@@ -1138,18 +1340,49 @@ impl Client {
                     "definition": {"linkSupport": true},
                     "typeDefinition": {"linkSupport": true},
                     "callHierarchy": {"dynamicRegistration": false},
+                    "implementation": {"linkSupport": true},
+                    "typeHierarchy": {"dynamicRegistration": false},
                 },
             },
         });
-        self.call("initialize", params, self.call_timeout)?;
+        let result = self.call("initialize", params, self.initialize_timeout)?;
+        self.server_capabilities = Some(
+            result
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        );
         self.notify("initialized", json!({}))
+    }
+
+    /// Refuses `method` with [`LspError::Unsupported`] when the handshake's
+    /// capabilities leave `capability` absent, `null` or `false` — every other
+    /// spec shape (`true`, an options or registration-options object) admits
+    /// it. Before a handshake nothing is known, so the request goes out and
+    /// the server answers for itself.
+    fn require_capability(&self, method: &str, capability: &str) -> Result<(), LspError> {
+        let Some(caps) = &self.server_capabilities else {
+            return Ok(());
+        };
+        match caps.get(capability) {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => Err(LspError::Unsupported {
+                method: method.to_string(),
+                capability: capability.to_string(),
+            }),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Opens `path` in the server via `textDocument/didOpen` with the given
     /// authoritative content. On a warm server that already holds this doc
     /// open (pooled reuse), a `textDocument/didClose` is sent first: the LSP
     /// spec forbids a duplicate `didOpen`, so re-open = close-then-open.
-    fn did_open(&mut self, path: &str, content: &str) -> Result<(), LspError> {
+    ///
+    /// Public so a consumer drives document sync itself — e.g. opening the
+    /// files a server only considers once open, or serving content that is not
+    /// on disk. The query methods call this for their own file, so a document
+    /// opened here and then queried is re-opened with the query's content.
+    pub fn did_open(&mut self, path: &str, content: &str) -> Result<(), LspError> {
         let uri = file_uri(path).to_string();
         if self.open_docs.contains(&uri) {
             self.did_close_uri(&uri)?;
@@ -1168,6 +1401,20 @@ impl Client {
         )?;
         self.open_docs.insert(uri);
         Ok(())
+    }
+
+    /// Closes `path` via `textDocument/didClose`, handing the document's truth
+    /// back to the file on disk. Returns `Ok(false)` and sends NOTHING when
+    /// this client does not hold `path` open: the spec requires a close to
+    /// follow an open, so a stray close would be a protocol violation, and the
+    /// `false` tells the caller its own bookkeeping disagreed.
+    pub fn did_close(&mut self, path: &str) -> Result<bool, LspError> {
+        let uri = file_uri(path).to_string();
+        if !self.open_docs.contains(&uri) {
+            return Ok(false);
+        }
+        self.did_close_uri(&uri)?;
+        Ok(true)
     }
 
     /// Sends `textDocument/didClose` for an already-open `uri` and forgets it,
@@ -1650,24 +1897,99 @@ impl Client {
             .collect()
     }
 
+    /// Resolves the IMPLEMENTATIONS of the symbol at the zero-based (line,
+    /// UTF-16 col) position in `path` — a trait/interface method to each
+    /// implementing method, a trait/interface to each implementing type.
+    ///
+    /// Refused with [`LspError::Unsupported`], nothing sent, when the server
+    /// did not advertise `implementationProvider`. Otherwise the outcome
+    /// discipline is that of [`Client::definition`]: an empty vec does NOT
+    /// distinguish "nothing implements this" from "not ready", so gate with
+    /// [`Client::await_ready`] first.
+    pub fn implementation(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<SymbolLocation>, LspError> {
+        const METHOD: &str = "textDocument/implementation";
+        self.require_capability(METHOD, "implementationProvider")?;
+        self.goto(METHOD, path, content, line, col)
+    }
+
+    /// Resolves the type at the zero-based (line, UTF-16 col) position in
+    /// `path` into type-hierarchy targets, the handle [`Client::supertypes`]
+    /// and [`Client::subtypes`] need.
+    ///
+    /// Refused with [`LspError::Unsupported`], nothing sent, when the server
+    /// did not advertise `typeHierarchyProvider`. An empty vec does NOT
+    /// distinguish "no type here" from "not ready"; gate with
+    /// [`Client::await_ready`] first.
+    pub fn prepare_type_hierarchy(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        col: u32,
+    ) -> Result<Vec<TypeTarget>, LspError> {
+        const METHOD: &str = "textDocument/prepareTypeHierarchy";
+        self.require_capability(METHOD, "typeHierarchyProvider")?;
+        self.did_open(path, content)?;
+        let params = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": col},
+        });
+        let v = self.query_with_retry(METHOD, path, params)?;
+        decode_type_items(METHOD, v)
+    }
+
+    /// The direct supertypes of `target` — what it extends or implements.
+    /// `target` must come from this server; its opaque item is echoed back
+    /// unmodified. Same refusal and readiness discipline as
+    /// [`Client::prepare_type_hierarchy`].
+    pub fn supertypes(&mut self, target: &TypeTarget) -> Result<Vec<TypeTarget>, LspError> {
+        self.type_hierarchy_step("typeHierarchy/supertypes", target)
+    }
+
+    /// The direct subtypes of `target` — what extends or implements it. See
+    /// [`Client::supertypes`].
+    pub fn subtypes(&mut self, target: &TypeTarget) -> Result<Vec<TypeTarget>, LspError> {
+        self.type_hierarchy_step("typeHierarchy/subtypes", target)
+    }
+
+    fn type_hierarchy_step(
+        &mut self,
+        method: &str,
+        target: &TypeTarget,
+    ) -> Result<Vec<TypeTarget>, LspError> {
+        self.require_capability(method, "typeHierarchyProvider")?;
+        let params = json!({"item": target.item});
+        let v = self.query_with_retry(method, &target.location.path, params)?;
+        decode_type_items(method, v)
+    }
+
     /// Requests an orderly LSP shutdown (shutdown + exit) and reaps the
     /// subprocess, killing it if it does not exit promptly. Removes a
     /// compile_commands.json bage generated for clangd — but only while it
     /// still matches what bage wrote (a pre-existing OR caller-replaced
     /// database is never touched). Best-effort: a failed shutdown still
     /// proceeds to exit and reaping, and the first error encountered is
-    /// returned.
+    /// returned. Worst case blocks `shutdown_timeout + exit_deadline`.
     pub fn close(&mut self) -> Result<(), LspError> {
         remove_generated_compile_commands(self.created_compile_commands.take());
-        let shutdown = self.call("shutdown", Value::Null, Duration::from_secs(2));
+        let shutdown = self.call("shutdown", Value::Null, self.shutdown_timeout);
         let exit = self.notify("exit", Value::Null);
         if let Some(mut child) = self.child.take() {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + self.exit_deadline;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(50));
+                        thread::sleep(
+                            self.exit_poll
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
                     }
                     _ => {
                         let _ = child.kill();
@@ -1872,9 +2194,28 @@ impl LspPool {
         LspPool::with_config(command, DEFAULT_POOL_IDLE_TTL, DEFAULT_POOL_MAX_SERVERS)
     }
 
-    /// Production pool with an explicit idle window and server cap.
+    /// Production pool with an explicit idle window and server cap; every
+    /// server takes [`ClientConfig::default`].
     pub fn with_config(command: Vec<String>, idle_ttl: Duration, max_servers: usize) -> LspPool {
-        let spawn = move || Client::new_stdio(&command);
+        LspPool::with_client_config(command, idle_ttl, max_servers, ClientConfig::default())
+    }
+
+    /// Production pool whose every server runs under `client` from spawn on.
+    /// The pool initializes a server immediately after spawning it, so this is
+    /// the only way a pooled server's handshake honours a declared
+    /// `initialize_timeout`; the same bounds govern its requests and its close
+    /// on eviction or shutdown.
+    pub fn with_client_config(
+        command: Vec<String>,
+        idle_ttl: Duration,
+        max_servers: usize,
+        client: ClientConfig,
+    ) -> LspPool {
+        let spawn = move || {
+            let mut c = Client::new_stdio(&command)?;
+            c.configure(client);
+            Ok(c)
+        };
         LspPool::from_spawn(Box::new(spawn), idle_ttl, max_servers)
     }
 
@@ -2048,7 +2389,8 @@ impl LspPool {
     pub fn evict_idle(&self) -> usize {
         let now = Instant::now();
         // Drain the stale entries UNDER the map lock, then release it before
-        // closing: `close_server` blocks up to ~5s (shutdown RPC + child reap)
+        // closing: `close_server` blocks up to `shutdown_timeout + exit_deadline`
+        // (shutdown RPC + child reap)
         // and holding the global map lock across it stalled every other key's
         // acquire (MIN-3).
         let drained: Vec<Arc<PooledServer>> = {
@@ -2090,7 +2432,7 @@ impl LspPool {
     pub fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
         // Drain under the lock, close AFTER releasing it (MIN-3): a
-        // ~5s-per-server teardown must not hold the global map lock and stall a
+        // per-server teardown (up to `shutdown_timeout + exit_deadline`) must not hold the global map lock and stall a
         // concurrent `readiness`/`acquire`.
         let drained: Vec<Arc<PooledServer>> = {
             let mut map = lock(&self.servers);
@@ -2153,12 +2495,13 @@ impl LspPool {
             *lock(&cell.leases) += 1;
             (cell, evicted)
         };
-        // Close LRU victims AFTER releasing the map lock (MIN-3): a ~5s teardown
-        // each must not block every other key spawning here.
+        // Close LRU victims AFTER releasing the map lock (MIN-3): each teardown
+        // must not block every other key spawning here.
         //
         // RECLAIM-LATENCY (DL-64 #6, honest note): the close is SERIAL, so a
         // loop-evict of several victims charges the sum of their teardowns to
-        // THIS acquire — up to ~5s per UNRESPONSIVE victim (`close_server` waits
+        // THIS acquire — up to `shutdown_timeout + exit_deadline` per
+        // UNRESPONSIVE victim (`close_server` waits
         // out the shutdown RPC + child reap). Acceptable for the MVP (eviction is
         // rare and off the warm-hit path); deferring the teardown to a background
         // reaper + surfacing reclaim latency is B2 observability work.
@@ -4471,6 +4814,33 @@ mod tests {
         });
     }
 
+    #[test]
+    fn did_close_sends_only_for_an_open_document() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        spawn_open_close_recorder(server_conn, Arc::clone(&log));
+        let mut c = test_client(client_conn);
+        assert!(
+            !c.did_close("/work/a.rs").unwrap(),
+            "never opened: nothing to close"
+        );
+        c.did_open("/work/a.rs", "fn a() {}").unwrap();
+        assert!(c.did_close("/work/a.rs").unwrap());
+        assert!(!c.did_close("/work/a.rs").unwrap(), "already closed");
+        // The shutdown round-trip orders after every notification above, so the
+        // recorder has seen them all once it returns.
+        c.close().unwrap();
+        let uri = file_uri("/work/a.rs").to_string();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                ("didOpen".to_string(), uri.clone()),
+                ("didClose".to_string(), uri)
+            ],
+            "exactly one balanced open/close pair on the wire"
+        );
+    }
+
     /// Whether `program` resolves on `PATH` (real-server test gating).
     fn command_on_path(program: &str) -> bool {
         std::process::Command::new(program)
@@ -5634,6 +6004,249 @@ mod tests {
         assert_eq!(count(&log, "textDocument/prepareCallHierarchy"), 1);
     }
 
+    /// A query server whose `initialize` advertises `caps`, then answers the
+    /// query methods through `on_request`.
+    fn spawn_capable_server(
+        server_conn: (PipeReader, PipeWriter),
+        caps: Value,
+        mut on_request: impl FnMut(&str, &Value) -> Option<Result<Value, String>> + Send + 'static,
+    ) -> Arc<Mutex<Vec<String>>> {
+        spawn_query_server(server_conn, move |method, params| {
+            if method == "initialize" {
+                return Some(Ok(json!({"capabilities": caps.clone()})));
+            }
+            on_request(method, params)
+        })
+    }
+
+    fn capable_client(conn: (PipeReader, PipeWriter)) -> Client {
+        let mut c = query_client(conn);
+        c.initialize("file:///work").unwrap();
+        c
+    }
+
+    fn type_item(name: &str, uri: &str, line: u32, data: Value) -> Value {
+        json!({
+            "name": name,
+            "kind": 23,
+            "tags": [1],
+            "uri": uri,
+            "range": {
+                "start": {"line": line, "character": 0},
+                "end": {"line": line + 2, "character": 1},
+            },
+            "selectionRange": {
+                "start": {"line": line, "character": 7},
+                "end": {"line": line, "character": 13},
+            },
+            "data": data,
+        })
+    }
+
+    #[test]
+    fn implementation_returns_locations_when_advertised() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_capable_server(
+            server_conn,
+            json!({"implementationProvider": true}),
+            |method, _| match method {
+                "textDocument/implementation" => Some(Ok(json!([{
+                    "targetUri": "file:///work/square.rs",
+                    "targetRange": {
+                        "start": {"line": 3, "character": 4},
+                        "end": {"line": 5, "character": 5},
+                    },
+                    "targetSelectionRange": {
+                        "start": {"line": 3, "character": 7},
+                        "end": {"line": 3, "character": 11},
+                    },
+                }]))),
+                _ => None,
+            },
+        );
+        let mut c = capable_client(client_conn);
+        let got = c
+            .implementation("/work/shape.rs", "trait S { fn area(&self); }\n", 0, 13)
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![SymbolLocation {
+                path: "/work/square.rs".to_string(),
+                start_line: 3,
+                start_char: 7,
+                end_line: 3,
+                end_char: 11,
+            }],
+            "a link resolves to the implementing NAME span"
+        );
+        assert_eq!(count(&log, "textDocument/implementation"), 1);
+    }
+
+    #[test]
+    fn capability_gate_reads_every_spec_shape() {
+        // (name, advertised value or None for absent, whether the request goes out)
+        let cases: &[(&str, Option<Value>, bool)] = &[
+            ("absent", None, false),
+            ("null", Some(Value::Null), false),
+            ("false", Some(json!(false)), false),
+            ("true", Some(json!(true)), true),
+            (
+                "options object",
+                Some(json!({"workDoneProgress": true})),
+                true,
+            ),
+            (
+                "registration options",
+                Some(json!({"id": "impl", "documentSelector": null})),
+                true,
+            ),
+        ];
+        for (name, advertised, sent) in cases {
+            let mut caps = json!({});
+            if let Some(v) = advertised {
+                caps["implementationProvider"] = v.clone();
+            }
+            let (client_conn, server_conn) = conn_pair();
+            let log = spawn_capable_server(server_conn, caps, |method, _| match method {
+                "textDocument/implementation" => Some(Ok(json!([]))),
+                _ => None,
+            });
+            let mut c = capable_client(client_conn);
+            let got = c.implementation("/work/a.rs", "fn a() {}\n", 0, 3);
+            if *sent {
+                assert!(got.unwrap().is_empty(), "{name}: the server's answer");
+                assert_eq!(count(&log, "textDocument/implementation"), 1, "{name}");
+            } else {
+                match got {
+                    Err(LspError::Unsupported {
+                        ref method,
+                        ref capability,
+                    }) => {
+                        assert_eq!(method, "textDocument/implementation", "{name}");
+                        assert_eq!(capability, "implementationProvider", "{name}");
+                    }
+                    other => panic!("{name}: want Unsupported, got {other:?}"),
+                }
+                assert_eq!(
+                    count(&log, "textDocument/implementation"),
+                    0,
+                    "{name}: an unsupported request never reaches the wire"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_prepare_then_supertypes_and_subtypes() {
+        let (client_conn, server_conn) = conn_pair();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let sink = Arc::clone(&seen);
+        spawn_capable_server(
+            server_conn,
+            json!({"typeHierarchyProvider": {}}),
+            move |method, params| match method {
+                "textDocument/prepareTypeHierarchy" => Some(Ok(json!([type_item(
+                    "Square",
+                    "file:///work/square.rs",
+                    1,
+                    json!({"opaque": 7}),
+                )]))),
+                "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => {
+                    let item = params.get("item").cloned().unwrap_or(Value::Null);
+                    lock(&sink).push((method.to_string(), item));
+                    if method == "typeHierarchy/supertypes" {
+                        Some(Ok(json!([type_item(
+                            "Shape",
+                            "file:///work/shape.rs",
+                            0,
+                            Value::Null
+                        )])))
+                    } else {
+                        Some(Ok(Value::Null))
+                    }
+                }
+                _ => None,
+            },
+        );
+        let mut c = capable_client(client_conn);
+        let targets = c
+            .prepare_type_hierarchy("/work/square.rs", "struct Square;\n", 1, 8)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "Square");
+        assert_eq!(targets[0].location.path, "/work/square.rs");
+        assert_eq!(targets[0].location.start_char, 7, "the NAME span");
+
+        let supers = c.supertypes(&targets[0]).unwrap();
+        assert_eq!(supers.len(), 1);
+        assert_eq!(supers[0].name, "Shape");
+        assert_eq!(supers[0].location.path, "/work/shape.rs");
+        assert!(
+            c.subtypes(&targets[0]).unwrap().is_empty(),
+            "null subtypes is an answer, not a failure"
+        );
+        let seen = lock(&seen).clone();
+        assert_eq!(seen.len(), 2);
+        for (method, item) in &seen {
+            assert_eq!(
+                item.get("data"),
+                Some(&json!({"opaque": 7})),
+                "{method}: the server's opaque item round-trips verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_unsupported_is_typed_and_never_sent() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_capable_server(
+            server_conn,
+            json!({"typeHierarchyProvider": false}),
+            |_, _| None,
+        );
+        let mut c = capable_client(client_conn);
+        let target = TypeTarget {
+            name: "Square".to_string(),
+            detail: String::new(),
+            location: SymbolLocation {
+                path: "/work/square.rs".to_string(),
+                start_line: 1,
+                start_char: 7,
+                end_line: 1,
+                end_char: 13,
+            },
+            item: type_item("Square", "file:///work/square.rs", 1, Value::Null),
+        };
+        let outcomes = [
+            (
+                "textDocument/prepareTypeHierarchy",
+                c.prepare_type_hierarchy("/work/square.rs", "struct Square;\n", 1, 8)
+                    .map(|v| v.len()),
+            ),
+            (
+                "typeHierarchy/supertypes",
+                c.supertypes(&target).map(|v| v.len()),
+            ),
+            (
+                "typeHierarchy/subtypes",
+                c.subtypes(&target).map(|v| v.len()),
+            ),
+        ];
+        for (want, got) in outcomes {
+            match got {
+                Err(LspError::Unsupported {
+                    ref method,
+                    ref capability,
+                }) => {
+                    assert_eq!(method, want);
+                    assert_eq!(capability, "typeHierarchyProvider");
+                }
+                other => panic!("{want}: want Unsupported, got {other:?}"),
+            }
+            assert_eq!(count(&log, want), 0, "{want} never reaches the wire");
+        }
+    }
+
     #[test]
     fn initialize_advertises_query_capabilities() {
         let (client_conn, server_conn) = conn_pair();
@@ -5661,6 +6274,15 @@ mod tests {
         assert!(
             td.get("typeDefinition").is_some() && td.get("callHierarchy").is_some(),
             "servers gate these on the client advertising them; got {td}"
+        );
+        assert_eq!(
+            td.pointer("/implementation/linkSupport"),
+            Some(&json!(true)),
+            "link support unlocks the implementing NAME span; got {td}"
+        );
+        assert!(
+            td.get("typeHierarchy").is_some(),
+            "servers gate type hierarchy on the client advertising it; got {td}"
         );
         assert!(
             params
