@@ -216,7 +216,7 @@ fn query_nodes<'t>(
     let mut out = Vec::new();
     let mut it = cursor.matches(&query, root, src);
     while let Some(m) = it.next() {
-        for cap in m.captures {
+        for cap in m.captures() {
             out.push(cap.node);
         }
     }
