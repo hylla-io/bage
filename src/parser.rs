@@ -506,7 +506,7 @@ fn convert(root: ts::Node<'_>) -> Node {
         let idx = arena.len();
         arena.push((new_node(&n), parent));
         for i in (0..n.child_count()).rev() {
-            if let Some(c) = n.child(i as u32) {
+            if let Some(c) = n.child(i) {
                 stack.push((c, Some(idx)));
             }
         }
