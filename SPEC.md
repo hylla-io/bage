@@ -359,10 +359,12 @@ at a position inside a referencing file first. Container-verified for gopls, pyr
 (`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
 ### §12.6 Declared LSP session
-A consumer declares every time bound of a session; none is fixed at compile time.
+A consumer declares every time bound of a session, and what the handshake says; none is fixed
+at compile time.
 `lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
 query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
-exit_poll }` is applied by `Client::configure` BEFORE `initialize` (read back with
+exit_poll, process_id, initialization_options }` is applied by `Client::configure` BEFORE
+`initialize` (read back with
 `Client::config`), or carried by `LspPool::with_client_config`, which configures each server
 between spawn and handshake — the only point a pooled handshake can be bounded.
 `initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
@@ -370,6 +372,14 @@ between spawn and handshake — the only point a pooled handshake can be bounded
 bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms).
 The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
 time rather than defaulting silently, and ships as a minor bump.
+`initialization_options` reaches the server VERBATIM as `initializationOptions`, and an unset
+one omits the member — an omitted member and a declared `null` are different requests, and
+bage invents neither. bage defines no shape for it and encodes no policy: server behaviour the
+protocol exposes nowhere else is the caller's to declare. A TypeScript server's automatic type
+acquisition is the worked case — undeclared, it runs `npm install --ignore-scripts
+types-registry@latest`, reaching the network and a user cache, and only
+`initializationOptions.disableAutomaticTypingAcquisition` stops it. Accept-vs-control proof
+against the real server: `tests/lsp_typing_acquisition.rs`.
 Document sync is public: `Client::did_open(path, text)` (close-then-open on a re-open, per the
 spec's balanced open/close rule) and `Client::did_close(path) -> Result<bool>` (`false`, nothing
 sent, when the document is not open). Real-server proof: `tests/lsp_session.rs`

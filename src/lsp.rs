@@ -106,8 +106,8 @@ const DEFAULT_EXIT_DEADLINE: Duration = Duration::from_secs(3);
 /// Pause between child-exit checks inside the exit deadline.
 const DEFAULT_EXIT_POLL: Duration = Duration::from_millis(50);
 
-/// Every time bound a [`Client`] observes, plus the `processId` it declares in
-/// the handshake, as one value so a consumer can fix all of them BEFORE
+/// Every time bound a [`Client`] observes, plus what it declares in the
+/// handshake, as one value so a consumer can fix all of them BEFORE
 /// [`Client::initialize`] — including through an [`LspPool`], which
 /// initializes right after spawning and never hands the client out first.
 ///
@@ -119,7 +119,7 @@ const DEFAULT_EXIT_POLL: Duration = Duration::from_millis(50);
 ///
 /// No value is validated. A zero bound is legal and fails at once, loudly, as
 /// the typed timeout of whatever it bounds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClientConfig {
     /// Bounds the `initialize` request. Default 30 s. Separate from
     /// `call_timeout` because a cold server's handshake can legitimately take
@@ -153,6 +153,16 @@ pub struct ClientConfig {
     /// being alive, and a server in another pid namespace (a container) sees
     /// the host's pid as dead from the start — such a server needs `None`.
     pub process_id: Option<u32>,
+    /// The `initializationOptions` member of `initialize`, passed through
+    /// VERBATIM; `None` omits the member entirely (a declared [`Value::Null`]
+    /// still sends `null`). Default: `None`.
+    ///
+    /// Server behaviour bage cannot reach any other way is declared here — a
+    /// TypeScript server's automatic type acquisition, which otherwise runs a
+    /// package manager and reaches the network, is one. The shape is the
+    /// SERVER's, so bage defines none of it and encodes no policy: the caller
+    /// owns what its servers do.
+    pub initialization_options: Option<Value>,
 }
 
 impl Default for ClientConfig {
@@ -170,6 +180,7 @@ impl Default for ClientConfig {
             exit_deadline: DEFAULT_EXIT_DEADLINE,
             exit_poll: DEFAULT_EXIT_POLL,
             process_id: Some(std::process::id()),
+            initialization_options: None,
         }
     }
 }
@@ -1119,6 +1130,9 @@ pub struct Client {
     pub exit_poll: Duration,
     /// The `processId` sent in `initialize`; see [`ClientConfig::process_id`].
     pub process_id: Option<u32>,
+    /// The `initializationOptions` sent in `initialize`; see
+    /// [`ClientConfig::initialization_options`].
+    pub initialization_options: Option<Value>,
 }
 
 impl Client {
@@ -1209,6 +1223,7 @@ impl Client {
             exit_deadline: DEFAULT_EXIT_DEADLINE,
             exit_poll: DEFAULT_EXIT_POLL,
             process_id: Some(std::process::id()),
+            initialization_options: None,
         }
     }
 
@@ -1228,6 +1243,7 @@ impl Client {
             exit_deadline,
             exit_poll,
             process_id,
+            initialization_options,
         } = cfg;
         self.initialize_timeout = initialize_timeout;
         self.call_timeout = call_timeout;
@@ -1241,6 +1257,7 @@ impl Client {
         self.exit_deadline = exit_deadline;
         self.exit_poll = exit_poll;
         self.process_id = process_id;
+        self.initialization_options = initialization_options;
     }
 
     /// The bounds currently in force, including any set field by field.
@@ -1258,6 +1275,7 @@ impl Client {
             exit_deadline: self.exit_deadline,
             exit_poll: self.exit_poll,
             process_id: self.process_id,
+            initialization_options: self.initialization_options.clone(),
         }
     }
 
@@ -1328,7 +1346,8 @@ impl Client {
     /// as the base for workspace priming, and when the server command runs
     /// clangd a missing compile_commands.json is generated at the root first
     /// (see [`ensure_compile_commands`]; a generation failure is swallowed —
-    /// clangd then just stays single-TU, exactly as before).
+    /// clangd then just stays single-TU, exactly as before). A declared
+    /// [`Client::initialization_options`] rides along verbatim.
     pub fn initialize(&mut self, root_uri: &str) -> Result<(), LspError> {
         let root = PathBuf::from(uri_str_to_path(root_uri));
         if command_is_clangd(&self.command)
@@ -1341,7 +1360,7 @@ impl Client {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
         self.root = Some(root);
-        let params = json!({
+        let mut params = json!({
             "processId": self.process_id,
             // `rootUri` is deprecated in favour of `workspaceFolders`, and
             // pyright ignores it outright: with only `rootUri` it analyses a
@@ -1368,6 +1387,11 @@ impl Client {
                 },
             },
         });
+        // Verbatim, and only when declared: an omitted member and a declared
+        // `null` are different requests to a server, and bage invents neither.
+        if let Some(options) = &self.initialization_options {
+            params["initializationOptions"] = options.clone();
+        }
         let result = self.call("initialize", params, self.initialize_timeout)?;
         self.server_capabilities = Some(
             result
@@ -2234,8 +2258,8 @@ impl LspPool {
     /// Production pool whose every server runs under `client` from spawn on.
     /// The pool initializes a server immediately after spawning it, so this is
     /// the only way a pooled server's handshake honours a declared
-    /// `initialize_timeout`; the same bounds govern its requests and its close
-    /// on eviction or shutdown.
+    /// `initialize_timeout` or carries declared `initialization_options`; the
+    /// same bounds govern its requests and its close on eviction or shutdown.
     pub fn with_client_config(
         command: Vec<String>,
         idle_ttl: Duration,
@@ -2244,7 +2268,7 @@ impl LspPool {
     ) -> LspPool {
         let spawn = move || {
             let mut c = Client::new_stdio(&command)?;
-            c.configure(client);
+            c.configure(client.clone());
             Ok(c)
         };
         LspPool::from_spawn(Box::new(spawn), idle_ttl, max_servers)
@@ -3461,8 +3485,9 @@ mod tests {
     }
 
     /// Runs one handshake against a fake server and returns the params it
-    /// received with `initialize`.
-    fn captured_initialize_params(process_id: Option<Option<u32>>) -> Value {
+    /// received with `initialize`. `declare` stands in for the caller's
+    /// pre-handshake declaration.
+    fn captured_initialize_params(declare: impl FnOnce(&mut Client)) -> Value {
         let (client_conn, (reader, mut w)) = conn_pair();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -3478,9 +3503,7 @@ mod tests {
             }
         });
         let mut c = test_client(client_conn);
-        if let Some(declared) = process_id {
-            c.process_id = declared;
-        }
+        declare(&mut c);
         c.initialize("file:///work/proj").unwrap();
         rx.recv_timeout(Duration::from_secs(2))
             .expect("initialize params")
@@ -3488,21 +3511,58 @@ mod tests {
 
     #[test]
     fn initialize_sends_the_declared_process_id() {
-        let default = captured_initialize_params(None);
+        let default = captured_initialize_params(|_| {});
         assert_eq!(default["processId"], json!(std::process::id()));
-        let null = captured_initialize_params(Some(None));
+        let null = captured_initialize_params(|c| c.process_id = None);
         assert_eq!(null["processId"], Value::Null);
         assert!(
             null.as_object().unwrap().contains_key("processId"),
             "processId is a required member: null, never absent"
         );
-        let other = captured_initialize_params(Some(Some(4242)));
+        let other = captured_initialize_params(|c| c.process_id = Some(4242));
         assert_eq!(other["processId"], json!(4242));
     }
 
     #[test]
+    fn initialize_sends_the_caller_declared_initialization_options() {
+        let undeclared = captured_initialize_params(|_| {});
+        assert!(
+            undeclared
+                .as_object()
+                .unwrap()
+                .get("initializationOptions")
+                .is_none(),
+            "an undeclared member must be ABSENT, never an invented default"
+        );
+
+        let declared = json!({
+            "preferences": {"disableAutomaticTypingAcquisition": true},
+            "tsserver": {"logVerbosity": "off"},
+        });
+        let sent = captured_initialize_params({
+            let declared = declared.clone();
+            move |c| c.initialization_options = Some(declared)
+        });
+        assert_eq!(
+            sent["initializationOptions"], declared,
+            "the declaration must reach the server byte for byte"
+        );
+
+        let explicit_null =
+            captured_initialize_params(|c| c.initialization_options = Some(Value::Null));
+        assert_eq!(explicit_null["initializationOptions"], Value::Null);
+        assert!(
+            explicit_null
+                .as_object()
+                .unwrap()
+                .contains_key("initializationOptions"),
+            "a declared null is a declaration, not an absence"
+        );
+    }
+
+    #[test]
     fn initialize_declares_the_root_as_a_workspace_folder() {
-        let p = captured_initialize_params(None);
+        let p = captured_initialize_params(|_| {});
         assert_eq!(p["rootUri"], json!("file:///work/proj"));
         assert_eq!(
             p["workspaceFolders"],
