@@ -10,7 +10,9 @@
 //! workspace priming's filesystem walk, and the generated
 //! compile_commands.json all resolve identically on both sides. Images are
 //! pinned; servers not baked into an image are installed at container start,
-//! hence the generous timeouts.
+//! hence the generous timeouts. Wrappers use plain `sh -c`, never a login
+//! shell: `/etc/profile` resets `PATH` and drops the image's toolchain
+//! directories (golang's `/usr/local/go/bin` and `/go/bin`).
 //!
 //! Run: `BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored
 //! --nocapture`
@@ -49,11 +51,16 @@ struct Case {
     new_name: &'static str,
     /// Relative paths that MUST receive at least one edit.
     expect_in: &'static [&'static str],
+    /// A (relative path, line, UTF-16 col) reference that must resolve before
+    /// the rename is asked — the `Client::await_ready` gate for a server that
+    /// otherwise answers a cold rename with a partial edit.
+    ready: Option<(&'static str, u32, u32)>,
 }
 
 /// Runs one case end-to-end: builds the fixture, spawns the server container
-/// over stdio, initializes at the fixture root, requests the rename through
-/// the production `Client::rename` path (which primes the workspace and, for
+/// over stdio, initializes at the fixture root, passes the case's declared
+/// readiness gate, requests the rename through the production
+/// `Client::rename` path (which primes the workspace and, for
 /// clangd, generates compile_commands.json), and asserts every expected file
 /// received an edit.
 fn run_case(case: &Case) {
@@ -102,10 +109,24 @@ fn run_case(case: &Case) {
     client.call_timeout = Duration::from_secs(300);
     client.rename_deadline = Duration::from_secs(300);
     client.rename_retry = Duration::from_secs(2);
+    client.ready_deadline = Duration::from_secs(300);
+    // The server runs in the container's pid namespace, where this process's
+    // pid does not exist; declared, it reads as a dead parent and the server
+    // exits mid-session.
+    client.process_id = None;
 
     client
         .initialize(&lsp::file_uri(root_str).to_string())
         .unwrap_or_else(|e| panic!("{}: initialize: {e}", case.name));
+
+    if let Some((rel, line, col)) = case.ready {
+        let probe = root.join(rel);
+        let probe_str = probe.to_str().expect("utf-8 probe path");
+        let text = fs::read_to_string(&probe).expect("read probe file");
+        client
+            .await_ready(probe_str, &text, line, col)
+            .unwrap_or_else(|e| panic!("{}: await_ready: {e}", case.name));
+    }
 
     let target = root.join(case.target);
     let target_str = target.to_str().expect("utf-8 target path");
@@ -203,7 +224,7 @@ fn gopls_cross_file_rename() {
         image: "golang:1.24-bookworm",
         server: &[
             "sh",
-            "-lc",
+            "-c",
             "go install golang.org/x/tools/gopls@v0.18.1 1>&2 && exec gopls",
         ],
         files: GO_FILES,
@@ -212,12 +233,13 @@ fn gopls_cross_file_rename() {
         col: 5,
         new_name: "Howdy",
         expect_in: &["a.go", "b.go"],
+        ready: None,
     });
 }
 
-/// pyright: only considers OPEN files, so this cross-file rename passes only
-/// because `Client::rename` primes the workspace (didOpens main.py) first —
-/// the issue #23 fix under test.
+/// pyright: ignores the deprecated `rootUri`, so this cross-file rename
+/// passes only because `Client::initialize` also declares the root as a
+/// workspace folder.
 #[test]
 #[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn pyright_cross_file_rename_with_priming() {
@@ -226,7 +248,7 @@ fn pyright_cross_file_rename_with_priming() {
         image: "node:20-bookworm-slim",
         server: &[
             "sh",
-            "-lc",
+            "-c",
             "npm install -g pyright@1.1.402 1>&2 && exec pyright-langserver --stdio",
         ],
         files: PY_FILES,
@@ -235,12 +257,15 @@ fn pyright_cross_file_rename_with_priming() {
         col: 4,
         new_name: "hello",
         expect_in: &["lib.py", "main.py"],
+        ready: None,
     });
 }
 
 /// clangd: without a compilation database each file is an isolated TU and
 /// the rename stays single-file; the bage-generated compile_commands.json
 /// plus priming must carry it into main.c — the issue #23 fix under test.
+/// Every run starts cold: clangd persists its index under the root, and a
+/// fresh tempdir holds none.
 #[test]
 #[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn clangd_cross_tu_rename_with_generated_compile_commands() {
@@ -249,7 +274,7 @@ fn clangd_cross_tu_rename_with_generated_compile_commands() {
         image: "debian:bookworm-slim",
         server: &[
             "sh",
-            "-lc",
+            "-c",
             "apt-get update 1>&2 && apt-get install -y --no-install-recommends clangd 1>&2 && exec clangd",
         ],
         files: C_FILES,
@@ -258,5 +283,9 @@ fn clangd_cross_tu_rename_with_generated_compile_commands() {
         col: 4,
         new_name: "sum",
         expect_in: &["util.c", "main.c"],
+        // The `add` call in main.c: resolving it means clangd has parsed and
+        // indexed the referencing TU. Without the gate a cold clangd answers
+        // with util.c's edits alone.
+        ready: Some(("main.c", 2, 24)),
     });
 }

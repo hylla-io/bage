@@ -91,16 +91,24 @@ An LSP session is declared, not assumed. Every time bound the client observes �
 exit waits on close — lives in `bage::lsp::ClientConfig` and is set before `initialize`,
 directly or through a pool that initializes on spawn. `ClientConfig::default()` carries
 bage's own values (30 s initialize and per-request, 2 s shutdown, 3 s exit wait); write the
-full struct literal to declare every bound yourself. Document sync is the caller's too:
+full struct literal to declare every bound yourself. What the handshake SAYS is declared
+there too: `initialization_options` is passed through VERBATIM and omitted when unset, so
+server behaviour reachable no other way — a TypeScript server's automatic type acquisition,
+which otherwise runs a package manager and reaches the network — is the caller's to switch.
+bage defines none of that shape and encodes no policy. Document sync is the caller's too:
 `did_open(path, text)` and `did_close(path)` (which returns `false` and sends nothing for a
 document this client never opened).
 
 ```rust
 use bage::lsp::{Client, ClientConfig, LspPool};
 
-let cfg = ClientConfig { initialize_timeout: Duration::from_secs(120), ..ClientConfig::default() };
+let cfg = ClientConfig {
+    initialize_timeout: Duration::from_secs(120),
+    initialization_options: Some(json!({"disableAutomaticTypingAcquisition": true})),
+    ..ClientConfig::default()
+};
 let mut c = Client::new_stdio(&["rust-analyzer".into()])?;
-c.configure(cfg);                          // before initialize
+c.configure(cfg.clone());                  // before initialize
 c.initialize(&root_uri)?;
 c.did_open("/abs/src/util.rs", &text)?;    // the server now resolves against `text`
 let pool = LspPool::with_client_config(command, idle_ttl, max_servers, cfg); // same, pooled
@@ -153,9 +161,13 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
 - **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
   rust-analyzer do full cross-file rename natively; clangd is carried across translation
-  units by a generated `compile_commands.json`, and pyright across files by workspace
-  priming (opening same-language siblings before the rename). Cross-file rename is
-  container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
+  units by a generated `compile_commands.json`, and pyright across files because the
+  handshake declares the root as a workspace folder (pyright ignores the deprecated
+  `rootUri`). A rename also primes the workspace by opening same-language siblings
+  first, for servers that only see open files. A server still indexing can answer with
+  a partial edit (a cold clangd renames the target TU alone), so a caller needing every
+  reference passes `Client::await_ready` inside a referencing file first. Cross-file
+  rename is container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
 
 ## Build gates
 
