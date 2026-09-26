@@ -137,21 +137,37 @@ Dependency direction: Hylla → Båge only. Båge imports nothing from Hylla.
 - **Success**: the op's bytes; its intent cleared.
 - **Clear fails after `landed`**: `SessionError::LandedWalNotCleared`. The bytes DID land; the intent
   stays marked landed and `recover` keeps the bytes and removes it.
-- **Marker fails** (commit, create, delete, batch): the op is undone now and the error is
-  `SessionError::Wal`. A single-op move converges forward, so there it is `LandedWalNotCleared`.
+- **Marker fails** (commit, create, delete, batch): the op is undone now, as for any other failure
+  below, with the WAL error as the cause: `SessionError::Wal` when fully undone, else `LeftBehind`.
+  A single-op move converges forward, so there it is `LandedWalNotCleared`.
 - **Any other failure**: the op is undone now — every path put back only while it still holds this
   op's bytes. Fully undone: the intent is cleared and the error is the cause. Otherwise the error is
-  `SessionError::LeftBehind { cause, residue }`: `Residue::NotUndone { path }` (path still holds the
-  op's bytes; intent kept, `recover` finishes the undo) or `Residue::IntentNotCleared { id }` (disk
-  as found; the stray intent is harmless). Its `kind()` is the cause's when only intents were left,
-  else `io`.
+  `SessionError::LeftBehind { cause, residue }`, one entry per path or intent:
+  - `Residue::NotUndone { path }` — the put-back failed; the path still holds the op's bytes. The
+    intent is kept and `recover` finishes the undo.
+  - `Residue::ChangedSince { path }` — another writer changed the path after this op wrote it. It
+    is kept as found and may still carry this op's change. Nothing more can be undone, so the
+    intent is cleared.
+  - `Residue::IntentNotCleared { id }` — the disk is as found; the stray intent is harmless.
+
+  `kind()` is the cause's when only intents were left, else `io`.
 - **Crash**: the intent and whatever bytes landed. `Session::recover(dir) -> RecoverReport` keeps
   `Landed` intents; undoes each `Pending` intent path by path, touching a path only while it holds
   exactly that intent's after-image (commit: `applying`; lifecycle ops: `after`); converges a
-  single-op move forward; removes `Torn` files. A prepared plan that never wrote needs nothing.
-  Steps repeat until none can act, so several unfinished writes to one path undo in any replay
-  order. A path holding anything else is left as found and listed in `RecoverReport.left`. Residual:
-  a later write leaving byte-identical content is indistinguishable from this op's.
+  single-op move forward, removing the source only once the destination holds its bytes; removes
+  `Torn` files. A prepared plan that never wrote needs nothing. Steps repeat until none can act, so
+  several unfinished writes to one path undo in any replay order. When those writes form a cycle
+  (content went A→B→A) the log cannot order them: the path is not touched. A path holding anything
+  else, or with such a cycle, is left as found and listed in `RecoverReport.left`. Residual: a
+  later write leaving byte-identical content is indistinguishable from this op's.
+- **Crash before the intent exists**: create and move act on the target BEFORE the WAL append, so
+  a pre-existing path is refused before any record names it. A crash in that window leaves, with no
+  intent and nothing for `recover` to see: create — an empty file at the claimed path; move — a
+  full copy at the destination, the source intact.
+- **Durability**: file contents and their directories are fsynced before an op reports landed:
+  `atomicwrite` syncs the directory after its rename, a create or move destination syncs its
+  directory after its write, and `wal::clear` syncs the WAL directory. Unlinks of a delete or a
+  move source are not directory-synced: after power loss the removed file can reappear.
 - `recover` must run with no op in flight on `dir`. A failed write stops it with the WAL intact;
   running it again finishes the job.
 

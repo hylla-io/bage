@@ -14,6 +14,10 @@ pub(crate) fn hit(point: &'static str) -> io::Result<()> {
         None => Ok(()),
         Some(Fault::Fail) => Err(io::Error::other(format!("injected fault at {point}"))),
         Some(Fault::Crash) => panic!("injected crash at {point}"),
+        Some(Fault::Run(f)) => {
+            f();
+            Ok(())
+        }
     }
 }
 
@@ -28,13 +32,16 @@ mod armed {
     use std::cell::RefCell;
 
     /// What an armed point does when execution reaches it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy)]
     pub enum Fault {
         /// The point returns an I/O error, as a real failing syscall would.
         Fail,
         /// The point panics: the op stops mid-flight with no cleanup, which
         /// is what a killed process leaves on disk.
         Crash,
+        /// The point runs `f` and carries on: another writer acting at
+        /// exactly that moment.
+        Run(fn()),
     }
 
     /// An armed point: how many hits to let pass first, and what to do.

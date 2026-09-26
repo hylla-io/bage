@@ -601,11 +601,18 @@ fn replay_file(path: &Path, id: String) -> Result<Replayed, WalError> {
 }
 
 /// Removes intent `id`'s file, if present, leaving every other intent in
-/// `dir` untouched.
+/// `dir` untouched. The directory is synced after, so a cleared intent does
+/// not reappear after power loss.
 pub fn clear(dir: &Path, id: &str) -> Result<(), WalError> {
     let path = intent_file(dir, id);
     fault::hit("wal.clear").map_err(|e| io_err("remove", &path, e))?;
-    remove(&path)
+    remove(&path)?;
+    match crate::atomicwrite::sync_dir(dir, "wal.clear.syncdir") {
+        Ok(()) => Ok(()),
+        // No directory: nothing was recorded, so nothing can reappear.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err("sync dir", dir, e)),
+    }
 }
 
 /// Removes the legacy shared log, if present. Only recovery, which has
@@ -674,6 +681,18 @@ mod tests {
         append(dir.path(), &a).unwrap();
         append(dir.path(), &b).unwrap();
         assert_eq!(replay(dir.path()).unwrap(), vec![pending(a), pending(b)]);
+    }
+
+    #[test]
+    fn clear_syncs_the_directory_after_the_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &sample("i1")).unwrap();
+        fault::disarm();
+        fault::arm("wal.clear.syncdir", fault::Fault::Fail);
+        let e = clear(dir.path(), "i1").unwrap_err();
+        assert!(fault::unfired().is_empty(), "no directory sync ran");
+        assert!(matches!(e, WalError::Io { op: "sync dir", .. }), "{e}");
+        assert!(replay(dir.path()).unwrap().is_empty(), "after the unlink");
     }
 
     #[test]

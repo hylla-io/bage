@@ -258,6 +258,15 @@ pub enum Residue {
         /// Why the undo failed.
         source: Box<SessionError>,
     },
+    /// `path` was left as found: another writer changed it after this op
+    /// wrote it, so its bytes may still carry this op's change. Undoing
+    /// would discard the other write, and recover could do no more, so the
+    /// intent is cleared and the path is named here instead.
+    #[error("{path:?} kept: changed since this op wrote it")]
+    ChangedSince {
+        /// The path.
+        path: String,
+    },
     /// The undo finished but the op's intent stayed in the WAL. Harmless:
     /// recover acts on a path only while it holds what the op wrote, and
     /// the undo already put it back.
@@ -294,8 +303,9 @@ fn with_residue(cause: SessionError, residue: Vec<Residue>) -> SessionError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RecoverReport {
     /// Paths an unfinished op touched that now hold bytes it neither
-    /// started from nor wrote: someone changed them since, or the op
-    /// stopped mid-write. Each is left exactly as found.
+    /// started from nor wrote (someone changed them since, or the op
+    /// stopped mid-write), or whose unfinished writes the log cannot order.
+    /// Each is left exactly as found.
     pub left: Vec<LeftPath>,
 }
 
@@ -332,6 +342,43 @@ enum Converged {
 /// destination goes and the bytes always exist somewhere.
 fn restores_first(steps: &mut [Converge]) {
     steps.sort_by_key(|s| s.target.is_none());
+}
+
+/// One step as `(expect, target)` raw hashes; `None` = absent.
+type Edge = (Option<String>, Option<String>);
+
+/// Whether one path's steps, as `expect → target` edges, form a cycle. A
+/// cycle means the content went A→B→A, so the log cannot tell which write
+/// came last and no undo order is provably right. A step whose `expect` is
+/// its `target` changes nothing and is no edge.
+fn has_cycle(edges: &[Edge]) -> bool {
+    let edges: Vec<_> = edges.iter().filter(|(from, to)| from != to).collect();
+    let mut indegree: HashMap<&Option<String>, usize> = HashMap::new();
+    for (from, to) in &edges {
+        indegree.entry(from).or_insert(0);
+        *indegree.entry(to).or_insert(0) += 1;
+    }
+    let mut free: Vec<&Option<String>> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut removed = 0;
+    while let Some(node) = free.pop() {
+        for (from, to) in &edges {
+            if from != node {
+                continue;
+            }
+            removed += 1;
+            if let Some(d) = indegree.get_mut(to) {
+                *d -= 1;
+                if *d == 0 {
+                    free.push(to);
+                }
+            }
+        }
+    }
+    removed < edges.len()
 }
 
 /// The machine- and human-renderable projection of a session error: its
@@ -625,8 +672,8 @@ fn open_exclusive(path: &str) -> Result<fs::File, SessionError> {
 }
 
 /// Writes `data` into the already-open, exclusively-created `f` and fsyncs
-/// so the content is durable. On failure the file is left for the caller to
-/// remove.
+/// it and its directory, so both the content and the new name are durable.
+/// On failure the file is left for the caller to remove.
 fn write_and_sync(f: &mut fs::File, path: &str, data: &[u8]) -> Result<(), SessionError> {
     let io_err = |op: &'static str, e: io::Error| SessionError::Io {
         op,
@@ -635,6 +682,8 @@ fn write_and_sync(f: &mut fs::File, path: &str, data: &[u8]) -> Result<(), Sessi
     };
     f.write_all(data).map_err(|e| io_err("create write", e))?;
     f.sync_all().map_err(|e| io_err("create fsync", e))?;
+    atomicwrite::sync_dir(atomicwrite::parent_dir(Path::new(path)), "create.syncdir")
+        .map_err(|e| io_err("create fsync dir", e))?;
     Ok(())
 }
 
@@ -817,9 +866,11 @@ impl Session {
     /// write an `applying` record names the bytes it leaves, so a crash
     /// mid-commit is undone path by path. A failure on any file aborts the
     /// commit: every file this commit wrote is put back to what the write
-    /// replaced (only while it still holds this commit's bytes), and the
-    /// intent is cleared — or, when the undo could not finish, kept for
-    /// [`Session::recover`] and named in [`SessionError::LeftBehind`]. On
+    /// replaced, and the intent is cleared. A file changed by someone else
+    /// since this commit wrote it is kept and named
+    /// ([`Residue::ChangedSince`]); a put-back that fails keeps the intent
+    /// for [`Session::recover`] ([`Residue::NotUndone`]). Either way the
+    /// error is [`SessionError::LeftBehind`]. On
     /// full success a landed marker is made durable and then the intent is
     /// cleared; a clear failure after the marker is
     /// [`SessionError::LandedWalNotCleared`] and the new bytes stay. A plan
@@ -859,13 +910,14 @@ impl Session {
         wal::clear(&self.wal_dir, id).map_err(|source| SessionError::LandedWalNotCleared { source })
     }
 
-    /// Finishes a failed op whose intent is recorded. With nothing left
-    /// behind the intent is cleared; otherwise it is kept, so recover can
-    /// finish the undo.
+    /// Finishes a failed op whose intent is recorded. While an undo is
+    /// unfinished the intent is kept, so recover can finish it; otherwise
+    /// it is cleared.
     fn abandon(&self, id: &str, cause: SessionError, mut residue: Vec<Residue>) -> SessionError {
-        if residue.is_empty()
-            && let Err(source) = wal::clear(&self.wal_dir, id)
-        {
+        let unfinished = residue
+            .iter()
+            .any(|r| matches!(r, Residue::NotUndone { .. }));
+        if !unfinished && let Err(source) = wal::clear(&self.wal_dir, id) {
             residue.push(Residue::IntentNotCleared {
                 id: id.to_string(),
                 source,
@@ -1087,18 +1139,22 @@ impl Session {
 
     /// Undoes `steps` (latest first, restores before removals) with the
     /// caller already holding every path's lock. A path that no longer
-    /// holds what this op left is someone else's now and is left alone;
-    /// only a failed undo is residue.
+    /// holds what this op left is someone else's now: it is left alone and
+    /// named, since it may still carry this op's change.
     fn undo_held(&self, mut steps: Vec<Converge>) -> Vec<Residue> {
         steps.reverse();
         restores_first(&mut steps);
         steps
             .iter()
-            .filter_map(|s| {
-                self.converge(s).err().map(|source| Residue::NotUndone {
+            .filter_map(|s| match self.converge(s) {
+                Ok(Converged::Done | Converged::AlreadyThere) => None,
+                Ok(Converged::Foreign) => Some(Residue::ChangedSince {
+                    path: s.path.clone(),
+                }),
+                Err(source) => Some(Residue::NotUndone {
                     path: s.path.clone(),
                     source: Box::new(source),
-                })
+                }),
             })
             .collect()
     }
@@ -1162,6 +1218,8 @@ impl Session {
     ///   fully-before.
     /// - Where several unfinished intents touched one path, steps repeat
     ///   until none can act, so undo order never depends on replay order.
+    ///   When their writes form a cycle (content went A→B→A) the log cannot
+    ///   order them: the path is left as found and named in the report.
     /// - An intent from the legacy shared log carries no after-images and
     ///   is recovered by the older unconditional rules.
     ///
@@ -1245,11 +1303,28 @@ impl Session {
             }
         }
 
+        let mut edges: HashMap<&str, Vec<Edge>> = HashMap::new();
+        for (_, step, _) in &steps {
+            let target = step
+                .target
+                .as_deref()
+                .map(|b| raw_hash(self.hasher.as_ref(), b));
+            edges
+                .entry(step.path.as_str())
+                .or_default()
+                .push((step.expect.clone(), target));
+        }
+        let ambiguous: HashSet<&str> = edges
+            .into_iter()
+            .filter(|(_, e)| has_cycle(e))
+            .map(|(path, _)| path)
+            .collect();
+
         let mut done = vec![false; steps.len()];
         loop {
             let mut progress = false;
             for i in 0..steps.len() {
-                if done[i] {
+                if done[i] || ambiguous.contains(steps[i].1.path.as_str()) {
                     continue;
                 }
                 let step = &steps[i].1;
@@ -3004,9 +3079,236 @@ mod tests {
                 .iter()
                 .map(|r| match r {
                     Residue::NotUndone { path, .. } => ("not-undone", path.clone()),
+                    Residue::ChangedSince { path } => ("changed-since", path.clone()),
                     Residue::IntentNotCleared { id, .. } => ("not-cleared", id.clone()),
                 })
                 .collect()
+        }
+
+        thread_local! {
+            /// (path, bytes) the [`other_writer`] hook writes.
+            static OTHER_WRITE: std::cell::RefCell<Vec<(String, String)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+
+        /// Another writer landing mid-op: writes every staged
+        /// [`OTHER_WRITE`] entry.
+        fn other_writer() {
+            OTHER_WRITE.with(|w| {
+                for (path, bytes) in w.borrow_mut().drain(..) {
+                    fs::write(path, bytes).unwrap();
+                }
+            });
+        }
+
+        fn stage_other_write(path: &str, bytes: &str) {
+            OTHER_WRITE.with(|w| w.borrow_mut().push((path.to_string(), bytes.to_string())));
+        }
+
+        /// Records an unfinished commit write on `path`, `before` → `after`,
+        /// as a crash after the write leaves it.
+        fn unfinished_write(wal_dir: &Path, id: &str, path: &str, before: &str, after: &str) {
+            wal::append(
+                wal_dir,
+                &Intent {
+                    id: id.into(),
+                    originals: HashMap::from([(path.to_string(), before.as_bytes().to_vec())]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            wal::record_applying(
+                wal_dir,
+                id,
+                &Applying {
+                    path: path.to_string(),
+                    after: raw_of(after),
+                    before: None,
+                },
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn failed_commit_names_a_written_path_another_writer_changed() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let c = write_file(dir.path(), "c.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s
+                .prepare(
+                    &[edit_a(&a, GO_SRC), edit_a(&b, GO_SRC), edit_a(&c, GO_SRC)],
+                    &[],
+                )
+                .unwrap();
+
+            // After a.go is written: another writer lands on a.go, keeping
+            // this commit's edit, and c.go drifts so the commit fails.
+            let others = edited().replace("func b() {}", B_EDITED);
+            stage_other_write(&a, &others);
+            stage_other_write(
+                &c,
+                &GO_SRC.replace("func a() {}", "func a() { x := 9; _ = x }"),
+            );
+            fault::disarm();
+            fault::arm_nth("wal.applying", 2, fault::Fault::Run(other_writer));
+            let err = s.commit(&plan).unwrap_err();
+            assert!(fault::unfired().is_empty(), "{:?}", fault::unfired());
+
+            assert_eq!(residue(&err), vec![("changed-since", a.clone())]);
+            assert_eq!(err.kind(), Kind::Io, "the commit's edit is still on disk");
+            assert!(err.to_string().contains("changed since"), "{err}");
+            assert_eq!(read_str(&a), others, "the other write is kept");
+            assert_eq!(read_str(&b), GO_SRC, "b.go is undone");
+            assert!(
+                wal::replay(wal_dir.path()).unwrap().is_empty(),
+                "recover could do no more"
+            );
+        }
+
+        #[test]
+        fn marker_failure_names_a_path_another_writer_changed() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s
+                .prepare(&[edit_a(&a, GO_SRC), edit_a(&b, GO_SRC)], &[])
+                .unwrap();
+
+            let others = edited().replace("func b() {}", B_EDITED);
+            stage_other_write(&a, &others);
+            fault::disarm();
+            fault::arm_nth("wal.applying", 2, fault::Fault::Run(other_writer));
+            fault::arm("wal.mark", fault::Fault::Fail);
+            let err = s.commit(&plan).unwrap_err();
+            assert!(fault::unfired().is_empty(), "{:?}", fault::unfired());
+
+            let SessionError::LeftBehind { cause, .. } = &err else {
+                panic!("want LeftBehind, got {err}");
+            };
+            assert!(matches!(**cause, SessionError::Wal(_)), "{cause}");
+            assert_eq!(residue(&err), vec![("changed-since", a.clone())]);
+            assert_eq!(read_str(&a), others);
+            assert_eq!(read_str(&b), GO_SRC);
+        }
+
+        #[test]
+        fn unfinished_writes_that_revert_each_other_are_reported_not_guessed() {
+            let first = edited();
+            // (disk, what it means): both wrote, or only the first did.
+            for disk in [GO_SRC.to_string(), first.clone()] {
+                // Either replay order.
+                for (p1, p2) in [("a", "b"), ("b", "a")] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let wal_dir = tempfile::tempdir().unwrap();
+                    let path = write_file(dir.path(), "main.go", GO_SRC);
+                    unfinished_write(wal_dir.path(), p1, &path, GO_SRC, &first);
+                    unfinished_write(wal_dir.path(), p2, &path, &first, GO_SRC);
+                    fs::write(&path, &disk).unwrap();
+
+                    let report = restart_and_recover(wal_dir.path());
+                    assert_eq!(read_str(&path), disk, "left as found");
+                    let mut named = left(&report);
+                    named.dedup();
+                    assert_eq!(named, vec![path.as_str()], "{report:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_pending_move_keeps_its_source_while_the_destination_is_foreign() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let from = write_file(dir.path(), "from.go", GO_SRC);
+            let to = write_file(dir.path(), "to.go", "package other\n");
+            // A crash between the move's record and its source unlink, and
+            // then another writer replaced the destination.
+            wal::append(
+                wal_dir.path(),
+                &Intent {
+                    id: "m".into(),
+                    moves: vec![Move {
+                        from: from.clone(),
+                        to: to.clone(),
+                    }],
+                    originals: HashMap::from([(from.clone(), GO_SRC.as_bytes().to_vec())]),
+                    after: AfterImages::from([
+                        (from.clone(), None),
+                        (to.clone(), Some(raw_of(GO_SRC))),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&from), GO_SRC, "the only copy of the bytes");
+            assert_eq!(read_str(&to), "package other\n");
+            assert_eq!(left(&report), vec![to.as_str(), from.as_str()]);
+        }
+
+        #[test]
+        fn a_failed_append_clears_only_on_an_io_error() {
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let io = || WalError::Io {
+                op: "write",
+                path: String::new(),
+                source: io::Error::other("x"),
+            };
+            for id in ["dup", "gone"] {
+                wal::append(
+                    wal_dir.path(),
+                    &Intent {
+                        id: id.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+
+            // Another op's intent: a refused id is not this op's to clear.
+            let err = s.abandon_append("dup", WalError::DuplicateId { id: "dup".into() }, vec![]);
+            assert!(
+                matches!(err, SessionError::Wal(WalError::DuplicateId { .. })),
+                "{err}"
+            );
+            let err = s.abandon_append("gone", io(), vec![]);
+            assert!(
+                matches!(err, SessionError::Wal(WalError::Io { .. })),
+                "{err}"
+            );
+            assert_eq!(ids(wal_dir.path()), vec!["dup".to_string()]);
+        }
+
+        #[test]
+        fn a_created_file_has_its_directory_synced() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let path = dir.path().join("new.go").to_string_lossy().into_owned();
+
+            let err = failing(
+                || s.create_file(&path, "package n\n", None),
+                "create.syncdir",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SessionError::Io {
+                        op: "create fsync dir",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            assert!(!Path::new(&path).exists(), "an undurable create is undone");
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
         }
 
         // ---- commit ----
