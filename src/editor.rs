@@ -16,7 +16,9 @@ use crate::inspect::{self, ReadOptions, ReadResult};
 use crate::lsp;
 use crate::parser::{Adapter, Lang, ParserPort};
 use crate::region::{Edit, EditResult, FileAnchor, LineIndex, Region};
-use crate::session::{BatchResult, DeleteResult, MoveResult, Op, Plan, Session, SessionError};
+use crate::session::{
+    BatchResult, DeleteResult, MoveResult, Op, Plan, RecoverReport, Session, SessionError,
+};
 
 /// Configures an [`Editor`]. `wal_dir` is required; the hasher defaults to
 /// [`XxHasher`]. `formatter` and `linter` are optional pipeline steps run
@@ -136,10 +138,11 @@ impl Editor {
     }
 
     /// The crash path: replays any WAL intent left in the editor's WAL dir,
-    /// restoring affected files to their pre-prepare state, then clears the
-    /// WAL. A clean commit leaves nothing to replay, so recover is then a
-    /// no-op.
-    pub fn recover(&self) -> Result<(), EditorError> {
+    /// keeping landed changes and undoing unfinished ones, then clears the
+    /// WAL. The report names every path it left as found because the path
+    /// no longer held what the unfinished op wrote. A clean commit leaves
+    /// nothing to replay, so recover is then a no-op.
+    pub fn recover(&self) -> Result<RecoverReport, EditorError> {
         Ok(self.sess.recover(&self.wal_dir)?)
     }
 
@@ -156,7 +159,8 @@ impl Editor {
     /// Brings a new file into being. Its anchor is NON-EXISTENCE: an
     /// existing path hard-rejects and is never clobbered. The staged content
     /// clears the same format/lint/parse floor edits clear, and the create
-    /// is WAL-logged so a crash unlinks the half-created file.
+    /// is WAL-logged so a crash after the write unlinks the file; a file
+    /// left mid-write is kept and named in recover's report.
     pub fn create(
         &self,
         path: &str,

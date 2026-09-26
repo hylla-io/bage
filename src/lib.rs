@@ -11,6 +11,7 @@ pub mod clipboard;
 pub mod edit;
 pub mod editor;
 pub mod facts;
+mod fault;
 pub mod format;
 pub mod hashing;
 pub mod inspect;
