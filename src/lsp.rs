@@ -106,6 +106,157 @@ const DEFAULT_EXIT_DEADLINE: Duration = Duration::from_secs(3);
 /// Pause between child-exit checks inside the exit deadline.
 const DEFAULT_EXIT_POLL: Duration = Duration::from_millis(50);
 
+/// Server stderr kept for error reports. A server that fails often says why
+/// only there, and the tail — not the head — holds the failure.
+const DEFAULT_STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+/// A server status notification that means "not functional and done trying":
+/// [`Client::await_ready`] stops at once with [`LspError::ServerReported`]
+/// while the LATEST such notification matches, instead of probing a server
+/// that has already said it will never answer.
+///
+/// Status notifications are server extensions with no common shape, so the
+/// caller declares the method, the members that mark failure, and where the
+/// message lives; bage knows no server. rust-analyzer, once the caller also
+/// declares `{"serverStatusNotification": true}` in
+/// [`ClientConfig::experimental_capabilities`], is
+/// `method: "experimental/serverStatus"`,
+/// `when: {"health": "error", "quiescent": true}`,
+/// `message_pointer: Some("/message")`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadyFailure {
+    /// The notification method to watch.
+    pub method: String,
+    /// Members the notification's params must carry, compared recursively: an
+    /// object matches when every member named here matches; any other value
+    /// must be equal.
+    pub when: Value,
+    /// RFC 6901 pointer into the params to the server's human-readable
+    /// message; `None`, or a pointer that finds no string, reports the whole
+    /// params instead.
+    pub message_pointer: Option<String>,
+}
+
+/// The last bytes a server wrote to stderr. Readiness errors carry it; after
+/// any other failure — a handshake that timed out, say — read it with
+/// [`Client::stderr_tail`], which leaves those errors' shape untouched. Holds
+/// at most [`ClientConfig::stderr_tail_bytes`]; `dropped_bytes` says how much
+/// older output was discarded, so a cut is never silent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StderrTail {
+    /// The kept bytes, lossily decoded (a cut may split a character).
+    pub text: String,
+    /// Older bytes discarded to stay within the bound.
+    pub dropped_bytes: u64,
+    /// False when the transport has no stderr (a [`Client::from_conn`] client).
+    pub captured: bool,
+}
+
+impl std::fmt::Display for StderrTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.captured || (self.text.is_empty() && self.dropped_bytes == 0) {
+            return Ok(());
+        }
+        write!(f, "\nserver stderr")?;
+        if self.dropped_bytes > 0 {
+            write!(
+                f,
+                " (last {} bytes; {} earlier bytes dropped)",
+                self.text.len(),
+                self.dropped_bytes
+            )?;
+        }
+        write!(f, ":\n{}", self.text.trim_end())
+    }
+}
+
+/// Bounded FIFO of a server's stderr bytes, fed by a drain thread for the
+/// child's whole life — an undrained pipe would block the server on write.
+#[derive(Default)]
+struct StderrRing {
+    buf: std::collections::VecDeque<u8>,
+    cap: usize,
+    dropped: u64,
+    captured: bool,
+}
+
+impl StderrRing {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend(bytes);
+        self.trim();
+    }
+
+    fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        let excess = self.buf.len().saturating_sub(self.cap);
+        if excess > 0 {
+            self.buf.drain(..excess);
+            self.dropped += excess as u64;
+        }
+    }
+
+    fn snapshot(&self) -> StderrTail {
+        let bytes: Vec<u8> = self.buf.iter().copied().collect();
+        StderrTail {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            dropped_bytes: self.dropped,
+            captured: self.captured,
+        }
+    }
+}
+
+/// The declared [`ReadyFailure`]s plus the latest params each watched method
+/// carried, shared with the read loop. Only watched methods are stored, so it
+/// is bounded by the declaration, never by what a server chooses to send.
+#[derive(Default)]
+struct StatusWatch {
+    rules: Vec<ReadyFailure>,
+    latest: HashMap<String, Value>,
+}
+
+impl StatusWatch {
+    /// Forgets the status of any method no longer watched: notifications for
+    /// it are dropped from here on, so a value kept now would be stale if the
+    /// method were watched again.
+    fn set_rules(&mut self, rules: Vec<ReadyFailure>) {
+        self.latest
+            .retain(|method, _| rules.iter().any(|rule| &rule.method == method));
+        self.rules = rules;
+    }
+
+    /// The first declared rule the latest status matches, as (method, message).
+    fn failure(&self) -> Option<(String, String)> {
+        self.rules.iter().find_map(|rule| {
+            let params = self.latest.get(&rule.method)?;
+            if !value_contains(params, &rule.when) {
+                return None;
+            }
+            let message = rule
+                .message_pointer
+                .as_deref()
+                .and_then(|p| params.pointer(p))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| params.to_string());
+            Some((rule.method.clone(), message))
+        })
+    }
+}
+
+/// Recursive subset match: every member `want` names must match in `have`.
+fn value_contains(have: &Value, want: &Value) -> bool {
+    match (have, want) {
+        (Value::Object(h), Value::Object(w)) => w
+            .iter()
+            .all(|(k, wv)| h.get(k).is_some_and(|hv| value_contains(hv, wv))),
+        _ => have == want,
+    }
+}
+
 /// Every time bound a [`Client`] observes, plus what it declares in the
 /// handshake, as one value so a consumer can fix all of them BEFORE
 /// [`Client::initialize`] — including through an [`LspPool`], which
@@ -163,6 +314,18 @@ pub struct ClientConfig {
     /// SERVER's, so bage defines none of it and encodes no policy: the caller
     /// owns what its servers do.
     pub initialization_options: Option<Value>,
+    /// The `capabilities.experimental` member of `initialize`, passed through
+    /// VERBATIM; `None` omits it. Default: `None`. Server extensions a client
+    /// must opt into — rust-analyzer's `serverStatusNotification` is one — are
+    /// declared here; see [`ReadyFailure`].
+    pub experimental_capabilities: Option<Value>,
+    /// Server status notifications that end [`Client::await_ready`] at once
+    /// with [`LspError::ServerReported`]. Default: none, so readiness is
+    /// decided by probing alone.
+    pub ready_failures: Vec<ReadyFailure>,
+    /// Bytes of server stderr kept for [`StderrTail`]. Default 16 KiB. Zero
+    /// keeps nothing but still counts what was dropped.
+    pub stderr_tail_bytes: usize,
 }
 
 impl Default for ClientConfig {
@@ -181,6 +344,9 @@ impl Default for ClientConfig {
             exit_poll: DEFAULT_EXIT_POLL,
             process_id: Some(std::process::id()),
             initialization_options: None,
+            experimental_capabilities: None,
+            ready_failures: Vec::new(),
+            stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
         }
     }
 }
@@ -267,7 +433,9 @@ pub enum LspError {
     /// queried. THIS is the outcome that carries readiness information: a
     /// caller that gets it must not proceed to query, because every answer it
     /// would receive is an empty result it cannot interpret.
-    #[error("lsp: not ready: {path:?}:{line}:{character} still empty after {after:?}: {last}")]
+    #[error(
+        "lsp: not ready: {path:?}:{line}:{character} still empty after {after:?}: {last}{stderr}"
+    )]
     ReadyDeadline {
         /// The file the probe targeted.
         path: String,
@@ -279,6 +447,21 @@ pub enum LspError {
         after: Duration,
         /// The last outcome observed (an empty result, or a refusal message).
         last: String,
+        /// The server's recent stderr.
+        stderr: StderrTail,
+    },
+    /// [`Client::await_ready`] stopped because the server's latest status
+    /// notification matched a declared [`ReadyFailure`]: the server has said
+    /// it is not functional and has no work left that could change that, so
+    /// probing on would only wait out the deadline.
+    #[error("lsp: not ready: server reported failure via {method}: {message}{stderr}")]
+    ServerReported {
+        /// The status notification method that matched.
+        method: String,
+        /// The server's message.
+        message: String,
+        /// The server's recent stderr.
+        stderr: StderrTail,
     },
     /// The server's `initialize` answer did not advertise the capability a
     /// request needs, so the request was never sent. Distinct from an empty
@@ -1133,6 +1316,14 @@ pub struct Client {
     /// The `initializationOptions` sent in `initialize`; see
     /// [`ClientConfig::initialization_options`].
     pub initialization_options: Option<Value>,
+    /// The `capabilities.experimental` sent in `initialize`; see
+    /// [`ClientConfig::experimental_capabilities`].
+    pub experimental_capabilities: Option<Value>,
+    /// Declared [`ReadyFailure`]s and the latest watched status, shared with
+    /// the read loop.
+    status: Arc<Mutex<StatusWatch>>,
+    /// Server stderr tail, fed by the drain thread `new_stdio` starts.
+    stderr: Arc<Mutex<StderrRing>>,
 }
 
 impl Client {
@@ -1147,7 +1338,7 @@ impl Client {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| LspError::Spawn {
                 command: program.clone(),
@@ -1155,7 +1346,23 @@ impl Client {
             })?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
         let mut client = Client::from_conn(stdout, stdin);
+        lock(&client.stderr).captured = true;
+        let ring = Arc::clone(&client.stderr);
+        // Drains for the child's whole life: a full, unread pipe would block
+        // the server on its next stderr write. Ends at EOF when the child exits.
+        thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => lock(&ring).push(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
         client.child = Some(child);
         client.command = command.to_vec();
         Ok(client)
@@ -1178,12 +1385,14 @@ impl Client {
         let diag_publishes = Arc::new(AtomicUsize::new(0));
         let dead = Arc::new(AtomicBool::new(false));
         let barrier_arm = Arc::new(AtomicU64::new(0));
+        let status = Arc::new(Mutex::new(StatusWatch::default()));
         {
             let writer = Arc::clone(&writer);
             let pending = Arc::clone(&pending);
             let dead = Arc::clone(&dead);
             let barrier_arm = Arc::clone(&barrier_arm);
             let diag_publishes = Arc::clone(&diag_publishes);
+            let status = Arc::clone(&status);
             thread::spawn(move || {
                 read_loop(
                     Box::new(reader),
@@ -1193,6 +1402,7 @@ impl Client {
                     diag_publishes,
                     dead,
                     barrier_arm,
+                    status,
                 )
             });
         }
@@ -1224,6 +1434,12 @@ impl Client {
             exit_poll: DEFAULT_EXIT_POLL,
             process_id: Some(std::process::id()),
             initialization_options: None,
+            experimental_capabilities: None,
+            status,
+            stderr: Arc::new(Mutex::new(StderrRing {
+                cap: DEFAULT_STDERR_TAIL_BYTES,
+                ..StderrRing::default()
+            })),
         }
     }
 
@@ -1244,6 +1460,9 @@ impl Client {
             exit_poll,
             process_id,
             initialization_options,
+            experimental_capabilities,
+            ready_failures,
+            stderr_tail_bytes,
         } = cfg;
         self.initialize_timeout = initialize_timeout;
         self.call_timeout = call_timeout;
@@ -1258,6 +1477,15 @@ impl Client {
         self.exit_poll = exit_poll;
         self.process_id = process_id;
         self.initialization_options = initialization_options;
+        self.experimental_capabilities = experimental_capabilities;
+        lock(&self.status).set_rules(ready_failures);
+        lock(&self.stderr).set_cap(stderr_tail_bytes);
+    }
+
+    /// The server's recent stderr; empty and uncaptured for a
+    /// [`Client::from_conn`] client.
+    pub fn stderr_tail(&self) -> StderrTail {
+        lock(&self.stderr).snapshot()
     }
 
     /// The bounds currently in force, including any set field by field.
@@ -1276,6 +1504,9 @@ impl Client {
             exit_poll: self.exit_poll,
             process_id: self.process_id,
             initialization_options: self.initialization_options.clone(),
+            experimental_capabilities: self.experimental_capabilities.clone(),
+            ready_failures: lock(&self.status).rules.clone(),
+            stderr_tail_bytes: lock(&self.stderr).cap,
         }
     }
 
@@ -1391,6 +1622,9 @@ impl Client {
         // `null` are different requests to a server, and bage invents neither.
         if let Some(options) = &self.initialization_options {
             params["initializationOptions"] = options.clone();
+        }
+        if let Some(experimental) = &self.experimental_capabilities {
+            params["capabilities"]["experimental"] = experimental.clone();
         }
         let result = self.call("initialize", params, self.initialize_timeout)?;
         self.server_capabilities = Some(
@@ -1790,6 +2024,12 @@ impl Client {
     /// than probing a dead process for the full deadline. Readiness is a
     /// property of the SERVER, not of the probe position, so one successful
     /// gate covers the queries that follow on that server.
+    ///
+    /// A server that SAYS it has failed stops the wait at once: when its
+    /// latest status notification matches a declared
+    /// [`ClientConfig::ready_failures`] rule, this returns
+    /// [`LspError::ServerReported`] carrying the server's message rather than
+    /// probing a server that will never answer until the deadline.
     pub fn await_ready(
         &mut self,
         path: &str,
@@ -1806,6 +2046,7 @@ impl Client {
         let deadline = Instant::now() + self.ready_deadline;
         let mut last;
         loop {
+            self.check_reported_failure()?;
             match self.call(METHOD, params.clone(), self.call_timeout) {
                 Ok(v) => {
                     if !decode_goto(METHOD, v)?.is_empty() {
@@ -1816,6 +2057,7 @@ impl Client {
                 Err(e) if is_fatal_transport(&e) => return Err(e),
                 Err(e) => last = e.to_string(),
             }
+            self.check_reported_failure()?;
             if Instant::now() > deadline {
                 return Err(LspError::ReadyDeadline {
                     path: path.to_string(),
@@ -1823,9 +2065,24 @@ impl Client {
                     character: col,
                     after: self.ready_deadline,
                     last,
+                    stderr: self.stderr_tail(),
                 });
             }
             thread::sleep(self.ready_retry);
+        }
+    }
+
+    /// [`LspError::ServerReported`] when the latest watched status matches a
+    /// declared [`ReadyFailure`].
+    fn check_reported_failure(&self) -> Result<(), LspError> {
+        let failure = lock(&self.status).failure();
+        match failure {
+            Some((method, message)) => Err(LspError::ServerReported {
+                method,
+                message,
+                stderr: self.stderr_tail(),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -2723,6 +2980,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// `dead` flag is set so a LATER request (issued when the pending map is empty,
 /// so nothing would disconnect its channel) fails fast in `call`/`diagnostics`
 /// instead of blocking the full deadline against a corpse.
+// Each argument is a separate handle the client shares with this thread; a
+// bundling struct would only be unpacked again on the first line.
+#[allow(clippy::too_many_arguments)]
 fn read_loop(
     reader: Box<dyn Read + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -2731,6 +2991,7 @@ fn read_loop(
     diag_publishes: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
     barrier_arm: Arc<AtomicU64>,
+    status: Arc<Mutex<StatusWatch>>,
 ) {
     let mut r = BufReader::new(reader);
     // Run until EOF or a transport error: the connection is gone.
@@ -2761,7 +3022,7 @@ fn read_loop(
                 continue;
             }
             // A server→client REQUEST (has an id) gets method-not-found; a
-            // notification is silently acknowledged.
+            // notification is dropped unless a declared `ReadyFailure` watches it.
             if let Some(id) = obj.get("id") {
                 let resp = json!({
                     "jsonrpc": "2.0",
@@ -2769,6 +3030,12 @@ fn read_loop(
                     "error": {"code": -32601, "message": format!("method not found: {method}")},
                 });
                 let _ = write_frame(lock(&writer).as_mut(), &resp);
+            } else {
+                let mut watch = lock(&status);
+                if watch.rules.iter().any(|rule| rule.method == method) {
+                    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+                    watch.latest.insert(method.to_string(), params);
+                }
             }
             continue;
         }
@@ -3716,6 +3983,7 @@ mod tests {
             diag_publishes,
             dead,
             barrier_arm,
+            Arc::new(Mutex::new(StatusWatch::default())),
         );
 
         let mut publishes = 0;
@@ -6034,6 +6302,230 @@ mod tests {
             }
             other => panic!("want ReadyDeadline, got {other:?}"),
         }
+    }
+
+    /// A server that pushes each of `statuses` as a status notification right
+    /// after the handshake, then answers every definition with `[]` — the
+    /// server that has given up and says so only out of band.
+    fn spawn_status_server(server_conn: (PipeReader, PipeWriter), statuses: Vec<(String, Value)>) {
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "initialized" => {
+                        for (method, params) in &statuses {
+                            write_frame(
+                                &mut w,
+                                &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    "textDocument/definition" => reply_ok(&mut w, &id, json!([])),
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    fn server_status(health: &str, quiescent: bool, message: &str) -> (String, Value) {
+        (
+            "experimental/serverStatus".to_string(),
+            json!({"health": health, "quiescent": quiescent, "message": message}),
+        )
+    }
+
+    fn status_rule() -> ReadyFailure {
+        ReadyFailure {
+            method: "experimental/serverStatus".to_string(),
+            when: json!({"health": "error", "quiescent": true}),
+            message_pointer: Some("/message".to_string()),
+        }
+    }
+
+    /// Handshakes against a status server, then gates. The notification is
+    /// sent on `initialized`, so a probe is what orders it before the check.
+    fn await_ready_under(
+        statuses: Vec<(String, Value)>,
+        rules: Vec<ReadyFailure>,
+        deadline: Duration,
+    ) -> (Result<(), LspError>, Duration) {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(server_conn, statuses);
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.ready_deadline = deadline;
+        let mut cfg = c.config();
+        cfg.ready_failures = rules;
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        let start = Instant::now();
+        let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
+        (got, start.elapsed())
+    }
+
+    #[test]
+    fn await_ready_stops_at_once_on_a_declared_failure_status() {
+        let (got, took) = await_ready_under(
+            vec![server_status("error", true, "Failed to load workspaces.")],
+            vec![status_rule()],
+            Duration::from_secs(10),
+        );
+        match got {
+            Err(LspError::ServerReported {
+                ref method,
+                ref message,
+                ref stderr,
+            }) => {
+                assert_eq!(method, "experimental/serverStatus");
+                assert_eq!(message, "Failed to load workspaces.");
+                assert!(!stderr.captured, "an in-memory transport has no stderr");
+            }
+            other => panic!("want ServerReported, got {other:?}"),
+        }
+        assert!(
+            took < Duration::from_secs(2),
+            "must not wait out the deadline: {took:?}"
+        );
+    }
+
+    #[test]
+    fn await_ready_ignores_a_failure_status_nobody_declared() {
+        let (got, _) = await_ready_under(
+            vec![server_status("error", true, "Failed to load workspaces.")],
+            Vec::new(),
+            Duration::from_millis(150),
+        );
+        assert!(
+            matches!(got, Err(LspError::ReadyDeadline { .. })),
+            "undeclared: probing alone decides, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn await_ready_keeps_probing_while_the_status_does_not_match() {
+        // Still working (not quiescent), and a later recovery supersedes an
+        // earlier failure: only the LATEST status counts.
+        for statuses in [
+            vec![server_status("error", false, "loading")],
+            vec![
+                server_status("error", true, "Failed to load workspaces."),
+                server_status("ok", true, ""),
+            ],
+        ] {
+            let (got, _) = await_ready_under(
+                statuses.clone(),
+                vec![status_rule()],
+                Duration::from_millis(150),
+            );
+            assert!(
+                matches!(got, Err(LspError::ReadyDeadline { .. })),
+                "{statuses:?}: want ReadyDeadline, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_failure_without_a_message_reports_the_whole_status() {
+        let rule = ReadyFailure {
+            message_pointer: None,
+            ..status_rule()
+        };
+        let (got, _) = await_ready_under(
+            vec![server_status("error", true, "boom")],
+            vec![rule],
+            Duration::from_secs(10),
+        );
+        match got {
+            Err(LspError::ServerReported { ref message, .. }) => {
+                assert!(
+                    message.contains("\"health\":\"error\""),
+                    "message: {message}"
+                );
+                assert!(message.contains("boom"), "message: {message}");
+            }
+            other => panic!("want ServerReported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_contains_is_a_recursive_subset_match() {
+        let have = json!({"health": "error", "quiescent": true, "extra": {"a": 1, "b": 2}});
+        assert!(value_contains(&have, &json!({})));
+        assert!(value_contains(&have, &json!({"health": "error"})));
+        assert!(value_contains(&have, &json!({"extra": {"a": 1}})));
+        assert!(!value_contains(&have, &json!({"extra": {"a": 2}})));
+        assert!(!value_contains(&have, &json!({"missing": null})));
+        assert!(!value_contains(&have, &json!({"quiescent": false})));
+        assert!(!value_contains(
+            &json!("error"),
+            &json!({"health": "error"})
+        ));
+    }
+
+    #[test]
+    fn unwatching_a_status_forgets_it() {
+        let mut watch = StatusWatch::default();
+        watch.set_rules(vec![status_rule()]);
+        let (method, failed) = server_status("error", true, "old failure");
+        watch.latest.insert(method, failed);
+        assert!(watch.failure().is_some());
+        // Unwatched, a recovery notification would be dropped; re-watching
+        // must not resurrect the failure it superseded.
+        watch.set_rules(Vec::new());
+        watch.set_rules(vec![status_rule()]);
+        assert_eq!(watch.failure(), None);
+    }
+
+    #[test]
+    fn initialize_sends_the_caller_declared_experimental_capabilities() {
+        let undeclared = captured_initialize_params(|_| {});
+        assert!(
+            undeclared["capabilities"].get("experimental").is_none(),
+            "an undeclared member must be ABSENT"
+        );
+        let declared = json!({"serverStatusNotification": true});
+        let sent = captured_initialize_params({
+            let declared = declared.clone();
+            move |c| c.experimental_capabilities = Some(declared)
+        });
+        assert_eq!(sent["capabilities"]["experimental"], declared);
+        assert_eq!(
+            sent["capabilities"]["textDocument"]["definition"]["linkSupport"],
+            json!(true),
+            "declaring experimental capabilities must not displace bage's own"
+        );
+    }
+
+    #[test]
+    fn stderr_ring_keeps_the_newest_bytes_and_counts_the_rest() {
+        let mut ring = StderrRing {
+            cap: 4,
+            captured: true,
+            ..StderrRing::default()
+        };
+        ring.push(b"abcdef");
+        ring.push(b"gh");
+        let tail = ring.snapshot();
+        assert_eq!(tail.text, "efgh");
+        assert_eq!(tail.dropped_bytes, 4);
+        ring.set_cap(1);
+        assert_eq!(ring.snapshot().text, "h");
+        assert_eq!(ring.snapshot().dropped_bytes, 7);
+        assert_eq!(
+            StderrTail::default().to_string(),
+            "",
+            "no stderr adds nothing to an error message"
+        );
     }
 
     #[test]

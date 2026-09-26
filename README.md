@@ -95,7 +95,13 @@ full struct literal to declare every bound yourself. What the handshake SAYS is 
 there too: `initialization_options` is passed through VERBATIM and omitted when unset, so
 server behaviour reachable no other way — a TypeScript server's automatic type acquisition,
 which otherwise runs a package manager and reaches the network — is the caller's to switch.
-bage defines none of that shape and encodes no policy. Document sync is the caller's too:
+bage defines none of that shape and encodes no policy. So is `experimental_capabilities`, and
+with it `ready_failures`: a declared status notification — rust-analyzer's
+`experimental/serverStatus` with `health: "error"`, `quiescent: true` — ends `await_ready` at
+once with `LspError::ServerReported` and the server's own message, instead of probing a server
+that has given up until the deadline. Readiness errors also carry the last
+`stderr_tail_bytes` (16 KiB) of server stderr, cut reported; `stderr_tail()` reads it after any
+other failure (SPEC §12.6). Document sync is the caller's too:
 `did_open(path, text)` and `did_close(path)` (which returns `false` and sends nothing for a
 document this client never opened).
 
