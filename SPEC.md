@@ -117,8 +117,43 @@ Dependency direction: Hylla → Båge only. Båge imports nothing from Hylla.
 
 ### §4.6 `wal`
 - `pub struct Intent { id, edits: Vec<FileEdit>, originals, expected_raw_hash, expected_norm_hash, … }`
-- `pub fn append(dir: &Path, intent: &Intent)` / `pub fn replay(dir: &Path) -> Result<Vec<Intent>, …>`
-  / `pub fn clear(dir: &Path)` — durable, file-based (one fsynced JSON record per intent). NO SQLite.
+- `pub fn append(dir, &Intent)` / `record_applying(dir, id, &Applying)` / `mark_landed(dir, id)` /
+  `replay(dir) -> Result<Vec<Replayed>, …>` / `clear(dir, id)` / `clear_legacy(dir)` — durable,
+  file-based, fsynced. NO SQLite.
+- **One file per intent**: `<dir>/bage-intent-<hex id>.wal`. `clear(dir, id)` unlinks that file only,
+  so finishing one op never drops another op's in-flight intent. `append` creates the file
+  exclusively (a repeated id is `WalError::DuplicateId`).
+- Line 1 is the intent (no `v` key; Go-compatible fields, plus `after` — the raw hash each lifecycle
+  op leaves at each path, `null` = absent). Later lines are `{"v":2,"applying":{path,after,before?}}`
+  (written before a commit writes `path`; `before` = replaced bytes when they differ from
+  `originals[path]`) and `{"v":2,"landed":true}` (all bytes durable, written before `clear`).
+- `Replayed { intent, applied, status: Torn | Pending | Landed | Legacy }`. A torn LAST line reads as
+  absent (a torn intent line is `Torn`). Loud `WalError`: an unknown `v`, a misshapen record, a record
+  after `landed`, an unparsable line before the end, a file name that disagrees with its intent.
+- `<dir>/wal.log`, the shared log older versions wrote, is replayed as `Legacy` and recovered by the
+  old unconditional rules.
+
+### §4.7 What is on disk after each outcome
+- **Success**: the op's bytes; its intent cleared.
+- **Clear fails after `landed`**: `SessionError::LandedWalNotCleared`. The bytes DID land; the intent
+  stays marked landed and `recover` keeps the bytes and removes it.
+- **Marker fails** (commit, create, delete, batch): the op is undone now and the error is
+  `SessionError::Wal`. A single-op move converges forward, so there it is `LandedWalNotCleared`.
+- **Any other failure**: the op is undone now — every path put back only while it still holds this
+  op's bytes. Fully undone: the intent is cleared and the error is the cause. Otherwise the error is
+  `SessionError::LeftBehind { cause, residue }`: `Residue::NotUndone { path }` (path still holds the
+  op's bytes; intent kept, `recover` finishes the undo) or `Residue::IntentNotCleared { id }` (disk
+  as found; the stray intent is harmless). Its `kind()` is the cause's when only intents were left,
+  else `io`.
+- **Crash**: the intent and whatever bytes landed. `Session::recover(dir) -> RecoverReport` keeps
+  `Landed` intents; undoes each `Pending` intent path by path, touching a path only while it holds
+  exactly that intent's after-image (commit: `applying`; lifecycle ops: `after`); converges a
+  single-op move forward; removes `Torn` files. A prepared plan that never wrote needs nothing.
+  Steps repeat until none can act, so several unfinished writes to one path undo in any replay
+  order. A path holding anything else is left as found and listed in `RecoverReport.left`. Residual:
+  a later write leaving byte-identical content is indistinguishable from this op's.
+- `recover` must run with no op in flight on `dir`. A failed write stops it with the WAL intact;
+  running it again finishes the job.
 
 ## 5. Drift discipline (edit-time)
 
@@ -252,8 +287,8 @@ same anchored two-phase engine — there is no second, weaker write path.
 
 ### §10.3 "Atomic" defined honestly
 POSIX has no multi-file atomic flip. Cross-file all-or-nothing is **WAL-backed, on recovery**:
-the WAL records batch intent + undo bytes; `Session::recover` drives a crashed mid-flip batch to
-fully-before or fully-after, never half. **File-first ordering** keeps the graph leg from leading
+the WAL records batch intent + undo bytes + after-images; `Session::recover` drives a crashed
+mid-flip batch to fully-before (a single-op move to fully-after), never half (§4.7). **File-first ordering** keeps the graph leg from leading
 durable file state.
 
 ### §10.4 Gate boundary (Båge vs caller)

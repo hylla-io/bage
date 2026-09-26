@@ -23,17 +23,18 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde::Serialize;
 
 use crate::atomicwrite::{self, AtomicWriteError};
 use crate::edit::{self, EditError, FileEdit};
+use crate::fault;
 use crate::format::{Formatter, Linter, ToolError};
 use crate::hashing::{Hasher, norm_hash, raw_hash};
 use crate::parser::{Lang, ParseError, ParserPort};
 use crate::region::{self, EditResult, FileAnchor, LineIndex};
-use crate::wal::{self, Intent, Move, WalError};
+use crate::wal::{self, AfterImages, Applying, Intent, Move, Status, WalError};
 
 /// A stable, machine-readable classification of a session error, used by
 /// hosts (CLI exit codes, Hylla) to react to a failure without inspecting
@@ -151,6 +152,32 @@ pub enum SessionError {
     /// A write-ahead-log operation failed.
     #[error("session: WAL: {0}")]
     Wal(#[from] WalError),
+    /// The op's change LANDED and is durable, but removing its WAL intent
+    /// failed. Unlike every other error the disk HAS changed, exactly as the
+    /// op asked: the intent is recorded as landed, so [`Session::recover`]
+    /// keeps the change and only removes the intent.
+    #[error("session: change landed; WAL clear failed (recover keeps the change): {source}")]
+    LandedWalNotCleared {
+        /// The clear (or, for a single-op move, the marker) failure.
+        source: WalError,
+    },
+    /// The op failed with `cause`, and undoing it left `residue` behind.
+    /// Every other failure leaves the disk as the op found it.
+    #[error("session: {cause}; left behind: {}", residue_list(.residue))]
+    LeftBehind {
+        /// Why the op failed.
+        cause: Box<SessionError>,
+        /// What the undo could not finish.
+        residue: Vec<Residue>,
+    },
+    /// A recorded intent cannot be recovered as written.
+    #[error("session: recover intent {id:?}: {reason}")]
+    RecoverUnusable {
+        /// The intent's id.
+        id: String,
+        /// What is missing or inconsistent.
+        reason: String,
+    },
     /// An atomic file write failed.
     #[error("session: write {path:?}: {source}")]
     Write {
@@ -193,6 +220,15 @@ impl SessionError {
             SessionError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 Kind::NotFound
             }
+            // Only a stray WAL record was left: the disk is as the op found
+            // it, so the cause still classifies the failure.
+            SessionError::LeftBehind { cause, residue }
+                if residue
+                    .iter()
+                    .all(|r| matches!(r, Residue::IntentNotCleared { .. })) =>
+            {
+                cause.kind()
+            }
             _ => Kind::Io,
         }
     }
@@ -204,9 +240,98 @@ impl SessionError {
             | SessionError::Drift { path }
             | SessionError::Exists { path }
             | SessionError::NotFound { path } => Some(path),
+            SessionError::LeftBehind { cause, .. } => cause.path(),
             _ => None,
         }
     }
+}
+
+/// Something a failed op's undo could not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum Residue {
+    /// `path` still holds what the failed op left there. The op's intent
+    /// stays in the WAL, so [`Session::recover`] retries the undo.
+    #[error("{path:?} not undone: {source}")]
+    NotUndone {
+        /// The path.
+        path: String,
+        /// Why the undo failed.
+        source: Box<SessionError>,
+    },
+    /// The undo finished but the op's intent stayed in the WAL. Harmless:
+    /// recover acts on a path only while it holds what the op wrote, and
+    /// the undo already put it back.
+    #[error("intent {id:?} not cleared: {source}")]
+    IntentNotCleared {
+        /// The intent's id.
+        id: String,
+        /// Why the clear failed.
+        source: WalError,
+    },
+}
+
+fn residue_list(residue: &[Residue]) -> String {
+    residue
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `cause`, carrying whatever its undo left behind.
+fn with_residue(cause: SessionError, residue: Vec<Residue>) -> SessionError {
+    if residue.is_empty() {
+        cause
+    } else {
+        SessionError::LeftBehind {
+            cause: Box::new(cause),
+            residue,
+        }
+    }
+}
+
+/// What [`Session::recover`] declined to touch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RecoverReport {
+    /// Paths an unfinished op touched that now hold bytes it neither
+    /// started from nor wrote: someone changed them since, or the op
+    /// stopped mid-write. Each is left exactly as found.
+    pub left: Vec<LeftPath>,
+}
+
+/// One path [`Session::recover`] left as found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LeftPath {
+    /// The unfinished intent that touched it.
+    pub intent: String,
+    /// The path.
+    pub path: String,
+}
+
+/// One path's convergence: while `path` holds `expect` (a raw hash; `None`
+/// = absent), make it hold `target` (`None` = absent).
+#[derive(Debug, Clone)]
+struct Converge {
+    path: String,
+    expect: Option<String>,
+    target: Option<Vec<u8>>,
+}
+
+/// What [`Session::converge`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Converged {
+    /// The path held `expect` and now holds `target`.
+    Done,
+    /// The path already held `target`.
+    AlreadyThere,
+    /// The path holds something else, and was left alone.
+    Foreign,
+}
+
+/// Restores before removals, so a move's source is back before its
+/// destination goes and the bytes always exist somewhere.
+fn restores_first(steps: &mut [Converge]) {
+    steps.sort_by_key(|s| s.target.is_none());
 }
 
 /// The machine- and human-renderable projection of a session error: its
@@ -386,11 +511,48 @@ pub struct Session {
 /// so concurrent `prepare` calls never observe the same value.
 static INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Returns a process-unique intent identifier from the PID and a monotonic
-/// counter, so two intents prepared in one process never collide.
+/// A random per-process token. The counter alone restarts at 1 and pids are
+/// reused (containers restart as pid 1), and a landed intent can outlive its
+/// process in an uncleared log: a repeated id would make its marker
+/// ambiguous and wedge every later recover.
+fn process_token() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    static TOKEN: OnceLock<u64> = OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        RandomState::new().hash_one(nanos)
+    })
+}
+
+/// Returns an intent identifier unique across processes and restarts: pid,
+/// a random per-process token, and a monotonic counter.
 fn new_intent_id() -> String {
     let n = INTENT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    format!("intent-{}-{}", std::process::id(), n)
+    format!(
+        "intent-{}-{:016x}-{}",
+        std::process::id(),
+        process_token(),
+        n
+    )
+}
+
+/// The undo of every path in `paths` a lifecycle intent touched: while the
+/// path holds the intent's after-image, put back what it held before —
+/// `originals[path]`, or absence for a path the intent brought into being.
+fn undo_steps<'a>(intent: &Intent, paths: impl IntoIterator<Item = &'a str>) -> Vec<Converge> {
+    paths
+        .into_iter()
+        .filter_map(|p| {
+            let after = intent.after.get(p)?;
+            Some(Converge {
+                path: p.to_string(),
+                expect: after.clone(),
+                target: intent.originals.get(p).cloned(),
+            })
+        })
+        .collect()
 }
 
 /// Buckets edits by their region's path. A `BTreeMap` keeps per-file
@@ -633,7 +795,9 @@ impl Session {
             intent.originals.insert(path.clone(), live);
         }
 
-        wal::append(&self.wal_dir, &intent)?;
+        if let Err(e) = wal::append(&self.wal_dir, &intent) {
+            return Err(self.abandon_append(&intent.id, e, Vec::new()));
+        }
 
         Ok(Plan {
             intent,
@@ -649,44 +813,90 @@ impl Session {
     /// RE-READS the live bytes, RE-RESOLVES every edit against the current
     /// content (resolve-under-lock — a benignly shifted region lands at its
     /// current offset and a same-region conflict is rejected), splices,
-    /// atomic-writes, and computes an [`EditResult`] per edit. A conflict on
-    /// any file aborts the commit: every file already written in this commit
-    /// is restored from its original, and the WAL is preserved for
-    /// [`Session::recover`]. On full success the WAL is cleared.
+    /// atomic-writes, and computes an [`EditResult`] per edit. Before each
+    /// write an `applying` record names the bytes it leaves, so a crash
+    /// mid-commit is undone path by path. A failure on any file aborts the
+    /// commit: every file this commit wrote is put back to what the write
+    /// replaced (only while it still holds this commit's bytes), and the
+    /// intent is cleared — or, when the undo could not finish, kept for
+    /// [`Session::recover`] and named in [`SessionError::LeftBehind`]. On
+    /// full success a landed marker is made durable and then the intent is
+    /// cleared; a clear failure after the marker is
+    /// [`SessionError::LandedWalNotCleared`] and the new bytes stay. A plan
+    /// commits at most once: its intent is gone after either outcome.
     pub fn commit(&self, plan: &Plan) -> Result<Vec<EditResult>, SessionError> {
+        let id = plan.intent.id.as_str();
         let by_file = group_by_file(&plan.edits);
 
         let mut results = Vec::new();
-        let mut written: Vec<&String> = Vec::with_capacity(by_file.len());
+        let mut written: Vec<Converge> = Vec::with_capacity(by_file.len());
 
         for (path, file_edits) in &by_file {
-            match self.commit_file(path, file_edits) {
-                Ok(res) => {
-                    written.push(path);
-                    results.extend(res);
-                }
+            let original = plan.intent.originals.get(path).map(Vec::as_slice);
+            match self.commit_file(id, path, file_edits, original, &mut written) {
+                Ok(res) => results.extend(res),
                 Err(e) => {
-                    // Handled failure: restore every file this commit
-                    // already wrote so the source is left untouched (SPEC
-                    // §1.2, §8.4). The WAL is preserved so recover remains a
-                    // backstop if a restore itself fails.
-                    self.restore(&written, &plan.intent.originals);
-                    return Err(e);
+                    let residue = self.undo_locking(written);
+                    return Err(self.abandon(id, e, residue));
                 }
             }
         }
 
-        wal::clear(&self.wal_dir)?;
+        // Every byte is down; only a durable marker makes it survive a
+        // failed clear. Without one recover would undo it, so undo now and
+        // report nothing landed.
+        if let Err(e) = wal::mark_landed(&self.wal_dir, id) {
+            let residue = self.undo_locking(written);
+            return Err(self.abandon(id, e.into(), residue));
+        }
+        self.clear_landed(id)?;
         Ok(results)
+    }
+
+    /// Clears a landed intent. A failure here is NOT a rolled-back op: the
+    /// change stays and recover keeps it.
+    fn clear_landed(&self, id: &str) -> Result<(), SessionError> {
+        wal::clear(&self.wal_dir, id).map_err(|source| SessionError::LandedWalNotCleared { source })
+    }
+
+    /// Finishes a failed op whose intent is recorded. With nothing left
+    /// behind the intent is cleared; otherwise it is kept, so recover can
+    /// finish the undo.
+    fn abandon(&self, id: &str, cause: SessionError, mut residue: Vec<Residue>) -> SessionError {
+        if residue.is_empty()
+            && let Err(source) = wal::clear(&self.wal_dir, id)
+        {
+            residue.push(Residue::IntentNotCleared {
+                id: id.to_string(),
+                source,
+            });
+        }
+        with_residue(cause, residue)
+    }
+
+    /// [`Session::abandon`] for a failed [`wal::append`]. Only an I/O
+    /// failure can have left a (torn) file of this op's own; a refused id
+    /// names a file that is not this op's to clear.
+    fn abandon_append(&self, id: &str, e: WalError, residue: Vec<Residue>) -> SessionError {
+        if matches!(e, WalError::Io { .. }) {
+            self.abandon(id, e.into(), residue)
+        } else {
+            with_residue(e.into(), residue)
+        }
     }
 
     /// Applies one file's edits under that file's lock — the
     /// resolve-under-lock unit: it re-reads the live bytes inside the lock
-    /// so it sees every prior concurrent commit.
+    /// so it sees every prior concurrent commit. The file's undo joins
+    /// `written` once its `applying` record is durable and before the write,
+    /// so a write that fails after changing the file is still undone.
     fn commit_file(
         &self,
+        id: &str,
         path: &str,
         edits: &[region::Edit],
+        original: Option<&[u8]>,
+        written: &mut Vec<Converge>,
     ) -> Result<Vec<EditResult>, SessionError> {
         let lock = self.file_lock(path);
         let _guard = lock.lock().expect("file lock poisoned");
@@ -703,6 +913,22 @@ impl Session {
             path: path.to_string(),
             source: e,
         })?;
+
+        let after = raw_hash(self.hasher.as_ref(), &out);
+        wal::record_applying(
+            &self.wal_dir,
+            id,
+            &Applying {
+                path: path.to_string(),
+                after: after.clone(),
+                before: (original != Some(live.as_slice())).then(|| live.clone()),
+            },
+        )?;
+        written.push(Converge {
+            path: path.to_string(),
+            expect: Some(after),
+            target: Some(live),
+        });
 
         atomicwrite::write(Path::new(path), &out).map_err(|e| SessionError::Write {
             path: path.to_string(),
@@ -813,98 +1039,300 @@ impl Session {
         results
     }
 
-    /// Writes the originals of every already-written path back to disk on a
-    /// handled commit failure, leaving the source untouched (SPEC §1.2). A
-    /// restore error is swallowed because the WAL is preserved as the
-    /// recovery backstop.
-    fn restore(&self, written: &[&String], originals: &HashMap<String, Vec<u8>>) {
-        for p in written {
-            if let Some(orig) = originals.get(*p) {
-                let _ = atomicwrite::write(Path::new(p), orig);
+    /// The raw hash of what `path` holds now; `None` when absent.
+    fn state(&self, path: &str) -> Result<Option<String>, SessionError> {
+        match fs::read(path) {
+            Ok(b) => Ok(Some(raw_hash(self.hasher.as_ref(), &b))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SessionError::Io {
+                op: "read",
+                path: path.to_string(),
+                source: e,
+            }),
+        }
+    }
+
+    /// Runs one [`Converge`] step: acts only while the path holds exactly
+    /// `expect`, so it never overwrites or removes bytes this op did not
+    /// leave there.
+    fn converge(&self, step: &Converge) -> Result<Converged, SessionError> {
+        let path = step.path.as_str();
+        let now = self.state(path)?;
+        let target = step
+            .target
+            .as_deref()
+            .map(|b| raw_hash(self.hasher.as_ref(), b));
+        if now == target {
+            return Ok(Converged::AlreadyThere);
+        }
+        if now != step.expect {
+            return Ok(Converged::Foreign);
+        }
+        fault::hit("undo").map_err(|e| SessionError::Io {
+            op: "converge",
+            path: path.to_string(),
+            source: e,
+        })?;
+        match &step.target {
+            Some(bytes) => {
+                atomicwrite::write(Path::new(path), bytes).map_err(|e| SessionError::Write {
+                    path: path.to_string(),
+                    source: e,
+                })?
             }
+            None => remove_if_exists(path)?,
+        }
+        Ok(Converged::Done)
+    }
+
+    /// Undoes `steps` (latest first, restores before removals) with the
+    /// caller already holding every path's lock. A path that no longer
+    /// holds what this op left is someone else's now and is left alone;
+    /// only a failed undo is residue.
+    fn undo_held(&self, mut steps: Vec<Converge>) -> Vec<Residue> {
+        steps.reverse();
+        restores_first(&mut steps);
+        steps
+            .iter()
+            .filter_map(|s| {
+                self.converge(s).err().map(|source| Residue::NotUndone {
+                    path: s.path.clone(),
+                    source: Box::new(source),
+                })
+            })
+            .collect()
+    }
+
+    /// [`Session::undo_held`] taking each path's lock in turn.
+    fn undo_locking(&self, mut steps: Vec<Converge>) -> Vec<Residue> {
+        steps.reverse();
+        restores_first(&mut steps);
+        let mut residue = Vec::new();
+        for s in steps {
+            let lock = self.file_lock(&s.path);
+            let _guard = lock.lock().expect("file lock poisoned");
+            residue.extend(self.undo_held(vec![s]));
+        }
+        residue
+    }
+
+    /// Removes a path this op O_EXCL-claimed and still holds the lock on.
+    fn unclaim(&self, path: &str) -> Vec<Residue> {
+        let removed = fault::hit("undo")
+            .map_err(|e| SessionError::Io {
+                op: "unclaim",
+                path: path.to_string(),
+                source: e,
+            })
+            .and_then(|()| remove_if_exists(path));
+        match removed {
+            Ok(()) => Vec::new(),
+            Err(source) => vec![Residue::NotUndone {
+                path: path.to_string(),
+                source: Box::new(source),
+            }],
         }
     }
 
     /// Abandons a prepared plan. Because prepare writes nothing live (only
     /// the WAL record), rollback discards the staged edits and clears the
-    /// WAL; the source files are left untouched.
+    /// plan's own intent; the source files and every other intent are left
+    /// untouched.
     pub fn rollback(&self, plan: &mut Plan) -> Result<(), SessionError> {
         plan.edits.clear();
-        wal::clear(&self.wal_dir)?;
+        wal::clear(&self.wal_dir, &plan.intent.id)?;
         Ok(())
     }
 
-    /// The restart path: replays the WAL in `dir` and converges every
-    /// intent, then clears the WAL.
+    /// The restart path: replays the WAL in `dir`, converges every intent,
+    /// then clears it. Run it when no op is in flight on `dir`: an
+    /// in-flight op's intent reads as unfinished.
     ///
-    /// - Every path in `originals` is restored (this is both the edit undo
-    ///   and the delete undo — a delete captures the FULL prior bytes before
-    ///   the unlink).
-    /// - A SINGLE-OP move intent (`batch == false`) converges FORWARD to
-    ///   fully-moved: the destination is (re)written from
-    ///   `originals[from]` and the source unlinked; its source is SKIPPED by
-    ///   the generic originals restore.
-    /// - A UNIFIED BATCH intent (`batch == true`, ADR-0004 §10.1) converges
-    ///   the WHOLE batch BACKWARD to fully-before: move sources ARE restored
-    ///   in place and move destinations removed, so a crashed batch can
-    ///   never land half-applied.
-    /// - Every `creates` path is unlinked (create's undo is unlink).
-    pub fn recover(&self, dir: &Path) -> Result<(), SessionError> {
-        let intents = wal::replay(dir)?;
-        for intent in &intents {
-            // Collect move sources to skip in the restore loop ONLY for a
-            // single-op forward-converging move.
-            let move_src: HashSet<&str> = if intent.batch {
-                HashSet::new()
-            } else {
-                intent.moves.iter().map(|m| m.from.as_str()).collect()
-            };
+    /// - A LANDED intent is left as it is: its change is on disk and was
+    ///   reported landed.
+    /// - An unfinished intent is undone path by path, and a path is touched
+    ///   only while it holds exactly what this intent left there. A path
+    ///   holding anything else was changed since (or the op stopped
+    ///   mid-write) and is left as found and named in the report. Paths a
+    ///   prepared plan never wrote need nothing: prepare writes no source.
+    /// - A SINGLE-OP move converges FORWARD to fully-moved (ADR-0004): the
+    ///   destination is written from `originals[from]` if absent, and the
+    ///   source removed only once the destination holds its bytes.
+    /// - A UNIFIED BATCH (ADR-0004 §10.1) converges BACKWARD to
+    ///   fully-before.
+    /// - Where several unfinished intents touched one path, steps repeat
+    ///   until none can act, so undo order never depends on replay order.
+    /// - An intent from the legacy shared log carries no after-images and
+    ///   is recovered by the older unconditional rules.
+    ///
+    /// A failed write stops recovery with the WAL intact; it is idempotent,
+    /// so running it again finishes the job.
+    pub fn recover(&self, dir: &Path) -> Result<RecoverReport, SessionError> {
+        let replayed = wal::replay(dir)?;
 
-            for (path, original) in &intent.originals {
-                if move_src.contains(path.as_str()) {
-                    continue;
-                }
-                atomicwrite::write(Path::new(path), original).map_err(|e| SessionError::Write {
-                    path: path.clone(),
-                    source: e,
-                })?;
-            }
+        for r in replayed.iter().filter(|r| r.status == Status::Legacy) {
+            self.recover_legacy(&r.intent)?;
+        }
 
-            if intent.batch {
-                // BATCH: converge every move BACKWARD (undo). The source
-                // bytes were restored in place above; only remove the
-                // destination the crashed apply may have written.
-                for mv in &intent.moves {
-                    remove_if_exists(&mv.to)?;
+        // Each step with the index of a step that must finish first.
+        let mut steps: Vec<(&str, Converge, Option<usize>)> = Vec::new();
+        for r in replayed.iter().filter(|r| r.status == Status::Pending) {
+            let intent = &r.intent;
+            let id = intent.id.as_str();
+            if !r.applied.is_empty() {
+                for a in &r.applied {
+                    let before = match &a.before {
+                        Some(b) => b.clone(),
+                        None => intent.originals.get(&a.path).cloned().ok_or_else(|| {
+                            SessionError::RecoverUnusable {
+                                id: id.to_string(),
+                                reason: format!("no original bytes for {:?}", a.path),
+                            }
+                        })?,
+                    };
+                    steps.push((
+                        id,
+                        Converge {
+                            path: a.path.clone(),
+                            expect: Some(a.after.clone()),
+                            target: Some(before),
+                        },
+                        None,
+                    ));
                 }
-            } else {
-                // SINGLE-OP move converges to FULLY-MOVED (ADR-0004): the
-                // destination must hold the source bytes and the source must
-                // be gone, whichever point the crash stopped at.
+            } else if intent.creates.is_empty()
+                && intent.deletes.is_empty()
+                && intent.moves.is_empty()
+            {
+                // A prepared plan that never wrote: nothing to undo.
+            } else if intent.after.is_empty() {
+                return Err(SessionError::RecoverUnusable {
+                    id: id.to_string(),
+                    reason: "a lifecycle intent without after-images".to_string(),
+                });
+            } else if !intent.batch && !intent.moves.is_empty() {
                 for mv in &intent.moves {
-                    let original = intent.originals.get(&mv.from).ok_or_else(|| {
+                    let bytes = intent.originals.get(&mv.from).ok_or_else(|| {
                         SessionError::RecoverMissingOriginal {
                             from: mv.from.clone(),
                             to: mv.to.clone(),
                         }
                     })?;
-                    atomicwrite::write(Path::new(&mv.to), original).map_err(|e| {
-                        SessionError::Write {
+                    let dest = steps.len();
+                    steps.push((
+                        id,
+                        Converge {
                             path: mv.to.clone(),
-                            source: e,
-                        }
-                    })?;
-                    remove_if_exists(&mv.from)?;
+                            expect: None,
+                            target: Some(bytes.clone()),
+                        },
+                        None,
+                    ));
+                    steps.push((
+                        id,
+                        Converge {
+                            path: mv.from.clone(),
+                            expect: Some(raw_hash(self.hasher.as_ref(), bytes)),
+                            target: None,
+                        },
+                        Some(dest),
+                    ));
                 }
-            }
-
-            // A create intent's undo is UNLINK: converge back to
-            // non-existence; a path already gone is not an error.
-            for path in &intent.creates {
-                remove_if_exists(path)?;
+            } else {
+                let mut undo = undo_steps(intent, intent.after.keys().map(String::as_str));
+                restores_first(&mut undo);
+                steps.extend(undo.into_iter().map(|c| (id, c, None)));
             }
         }
-        wal::clear(dir)?;
+
+        let mut done = vec![false; steps.len()];
+        loop {
+            let mut progress = false;
+            for i in 0..steps.len() {
+                if done[i] {
+                    continue;
+                }
+                let step = &steps[i].1;
+                let outcome = if steps[i].2.is_some_and(|dep| !done[dep]) {
+                    // Blocked from acting, but a path already at its target
+                    // needs nothing.
+                    let target = step
+                        .target
+                        .as_deref()
+                        .map(|b| raw_hash(self.hasher.as_ref(), b));
+                    if self.state(&step.path)? == target {
+                        Converged::AlreadyThere
+                    } else {
+                        Converged::Foreign
+                    }
+                } else {
+                    self.converge(step)?
+                };
+                if outcome != Converged::Foreign {
+                    done[i] = true;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        let mut report = RecoverReport::default();
+        for (i, (id, step, _)) in steps.iter().enumerate() {
+            if !done[i] {
+                report.left.push(LeftPath {
+                    intent: id.to_string(),
+                    path: step.path.clone(),
+                });
+            }
+        }
+
+        for r in replayed.iter().filter(|r| r.status != Status::Legacy) {
+            wal::clear(dir, &r.intent.id)?;
+        }
+        wal::clear_legacy(dir)?;
+        Ok(report)
+    }
+
+    /// Recovers an intent from the legacy shared log, which records no
+    /// after-images: originals are restored, a batch's move destinations
+    /// removed, a single-op move converged forward, and creates unlinked.
+    fn recover_legacy(&self, intent: &Intent) -> Result<(), SessionError> {
+        let move_src: HashSet<&str> = if intent.batch {
+            HashSet::new()
+        } else {
+            intent.moves.iter().map(|m| m.from.as_str()).collect()
+        };
+        let write = |path: &str, bytes: &[u8]| {
+            atomicwrite::write(Path::new(path), bytes).map_err(|e| SessionError::Write {
+                path: path.to_string(),
+                source: e,
+            })
+        };
+
+        for (path, original) in &intent.originals {
+            if !move_src.contains(path.as_str()) {
+                write(path, original)?;
+            }
+        }
+        for mv in &intent.moves {
+            if intent.batch {
+                remove_if_exists(&mv.to)?;
+            } else {
+                let original = intent.originals.get(&mv.from).ok_or_else(|| {
+                    SessionError::RecoverMissingOriginal {
+                        from: mv.from.clone(),
+                        to: mv.to.clone(),
+                    }
+                })?;
+                write(&mv.to, original)?;
+                remove_if_exists(&mv.from)?;
+            }
+        }
+        for path in &intent.creates {
+            remove_if_exists(path)?;
+        }
         Ok(())
     }
 
@@ -916,10 +1344,11 @@ impl Session {
     /// semantics so a pre-existing path (or a concurrent create that won the
     /// race) HARD-REJECTS with [`SessionError::Exists`] — the claim happens
     /// BEFORE the WAL append, so a `creates` record can only ever name a
-    /// file THIS op brought into being and recover's unlink can never delete
-    /// pre-existing content; (4) WAL-logs the create; (5) writes + fsyncs;
-    /// (6) clears the WAL. On any post-claim failure the partial file is
-    /// removed.
+    /// file THIS op brought into being; (4) WAL-logs the create with the
+    /// content's after-image; (5) writes + fsyncs; (6) marks the intent
+    /// landed and clears it. On any post-claim failure the claimed file is
+    /// removed, and a removal that fails is named in
+    /// [`SessionError::LeftBehind`].
     pub fn create_file(
         &self,
         path: &str,
@@ -943,23 +1372,30 @@ impl Session {
         let intent = Intent {
             id: new_intent_id(),
             creates: vec![path.to_string()],
+            after: AfterImages::from([(
+                path.to_string(),
+                Some(raw_hash(self.hasher.as_ref(), staged)),
+            )]),
             ..Default::default()
         };
         if let Err(e) = wal::append(&self.wal_dir, &intent) {
             drop(f);
-            let _ = fs::remove_file(path);
-            return Err(e.into());
+            let residue = self.unclaim(path);
+            return Err(self.abandon_append(&intent.id, e, residue));
         }
 
         if let Err(e) = write_and_sync(&mut f, path, staged) {
             drop(f);
-            let _ = fs::remove_file(path);
-            let _ = wal::clear(&self.wal_dir);
-            return Err(e);
+            let residue = self.unclaim(path);
+            return Err(self.abandon(&intent.id, e, residue));
         }
         drop(f);
 
-        wal::clear(&self.wal_dir)?;
+        if let Err(e) = wal::mark_landed(&self.wal_dir, &intent.id) {
+            let residue = self.unclaim(path);
+            return Err(self.abandon(&intent.id, e.into(), residue));
+        }
+        self.clear_landed(&intent.id)?;
         Ok(self.create_result(path, staged))
     }
 
@@ -971,7 +1407,10 @@ impl Session {
     /// [`SessionError::Drift`] and NOTHING is unlinked (Båge never discards
     /// bytes the caller did not see); (3) WAL-logs the delete with the FULL
     /// prior bytes in `originals` BEFORE the unlink, so a crash in the
-    /// window is recoverable; (4) unlinks; (5) clears the WAL.
+    /// window is recoverable; (4) unlinks; (5) marks the intent landed and
+    /// clears it. A failed unlink changes nothing; a failed marker puts the
+    /// bytes back, and a failed put-back is named in
+    /// [`SessionError::LeftBehind`].
     pub fn delete_file(
         &self,
         path: &str,
@@ -994,19 +1433,29 @@ impl Session {
             id: new_intent_id(),
             deletes: vec![path.to_string()],
             originals: HashMap::from([(path.to_string(), live)]),
+            after: AfterImages::from([(path.to_string(), None)]),
             ..Default::default()
         };
-        wal::append(&self.wal_dir, &intent)?;
+        if let Err(e) = wal::append(&self.wal_dir, &intent) {
+            return Err(self.abandon_append(&intent.id, e, Vec::new()));
+        }
 
-        // If the unlink fails the WAL record is preserved as the recovery
-        // backstop, so it is NOT cleared.
-        fs::remove_file(path).map_err(|e| SessionError::Io {
-            op: "delete unlink",
-            path: path.to_string(),
-            source: e,
-        })?;
+        if let Err(e) = fs::remove_file(path) {
+            let cause = SessionError::Io {
+                op: "delete unlink",
+                path: path.to_string(),
+                source: e,
+            };
+            return Err(self.abandon(&intent.id, cause, Vec::new()));
+        }
 
-        wal::clear(&self.wal_dir)?;
+        // An unmarked delete intent is undone at recover, so put the bytes
+        // back now and report nothing deleted.
+        if let Err(e) = wal::mark_landed(&self.wal_dir, &intent.id) {
+            let residue = self.undo_held(undo_steps(&intent, [path]));
+            return Err(self.abandon(&intent.id, e.into(), residue));
+        }
+        self.clear_landed(&intent.id)?;
         Ok(DeleteResult {
             path: path.to_string(),
             raw_hash: live_raw,
@@ -1022,8 +1471,12 @@ impl Session {
     /// (3) O_EXCL-claims + writes + fsyncs the destination — NEVER
     /// `fs::rename`, which would clobber an existing destination; (4)
     /// WAL-logs the move with the source bytes in `originals` BEFORE the
-    /// source unlink; (5) unlinks the source; (6) clears the WAL. On any
-    /// reject NOTHING moves.
+    /// source unlink; (5) unlinks the source; (6) marks the intent landed
+    /// and clears it. On any reject or failure before (6) NOTHING moves: the
+    /// claimed destination is removed, and a removal that fails is named in
+    /// [`SessionError::LeftBehind`]. A failed marker is
+    /// [`SessionError::LandedWalNotCleared`]: a single-op move recovers
+    /// forward, so the move has landed either way.
     pub fn move_file(
         &self,
         from: &str,
@@ -1058,8 +1511,7 @@ impl Session {
         let mut dst = open_exclusive(to)?;
         if let Err(e) = write_and_sync(&mut dst, to, &live) {
             drop(dst);
-            let _ = fs::remove_file(to);
-            return Err(e);
+            return Err(with_residue(e, self.unclaim(to)));
         }
         drop(dst);
 
@@ -1072,20 +1524,30 @@ impl Session {
                 to: to.to_string(),
             }],
             originals: HashMap::from([(from.to_string(), live.clone())]),
+            after: AfterImages::from([
+                (from.to_string(), None),
+                (to.to_string(), Some(live_raw.clone())),
+            ]),
             ..Default::default()
         };
         if let Err(e) = wal::append(&self.wal_dir, &intent) {
-            let _ = fs::remove_file(to);
-            return Err(e.into());
+            let residue = self.unclaim(to);
+            return Err(self.abandon_append(&intent.id, e, residue));
         }
 
-        fs::remove_file(from).map_err(|e| SessionError::Io {
-            op: "move unlink src",
-            path: from.to_string(),
-            source: e,
-        })?;
+        if let Err(e) = fs::remove_file(from) {
+            let cause = SessionError::Io {
+                op: "move unlink src",
+                path: from.to_string(),
+                source: e,
+            };
+            let residue = self.unclaim(to);
+            return Err(self.abandon(&intent.id, cause, residue));
+        }
 
-        wal::clear(&self.wal_dir)?;
+        wal::mark_landed(&self.wal_dir, &intent.id)
+            .map_err(|source| SessionError::LandedWalNotCleared { source })?;
+        self.clear_landed(&intent.id)?;
         Ok(MoveResult {
             from: from.to_string(),
             dest: self.create_result(to, &live),
@@ -1097,12 +1559,13 @@ impl Session {
     /// move's destination) in sorted order, then runs four phases under that
     /// lock: (A) VALIDATE every anchor, writing nothing — any failure
     /// rejects the whole batch having written NOTHING; (B) append ONE
-    /// unified WAL intent (`batch = true`) capturing every op's undo; (C)
-    /// APPLY every op — on any apply failure ROLL BACK every already-applied
-    /// op from that intent (the WAL is preserved as the recover backstop);
-    /// (D) clear the WAL on full success. Returns one [`BatchResult`] per op
-    /// in input order. An empty batch or a duplicate touched path is a
-    /// usage reject.
+    /// unified WAL intent (`batch = true`) capturing every op's undo and
+    /// after-image; (C) APPLY every op — on any apply failure ROLL BACK every
+    /// op this batch applied, latest first, then clear the intent (or keep
+    /// it for recover and name the rest in [`SessionError::LeftBehind`] when
+    /// the rollback could not finish); (D) on full success mark the intent
+    /// landed and clear it. Returns one [`BatchResult`] per op in input
+    /// order. An empty batch or a duplicate touched path is a usage reject.
     pub fn apply_batch(&self, ops: &[Op]) -> Result<Vec<BatchResult>, SessionError> {
         if ops.is_empty() {
             return Err(SessionError::Usage(
@@ -1119,25 +1582,69 @@ impl Session {
             .collect();
 
         // Phase A — VALIDATE every op's anchor up front, writing nothing.
-        let (prepared, intent) = self.validate_batch(ops)?;
+        let (prepared, mut intent) = self.validate_batch(ops)?;
+        intent.after = self.batch_after(&prepared);
 
         // Phase B — ONE unified intent so a crash anywhere in APPLY
         // converges via recover.
-        wal::append(&self.wal_dir, &intent)?;
+        if let Err(e) = wal::append(&self.wal_dir, &intent) {
+            return Err(self.abandon_append(&intent.id, e, Vec::new()));
+        }
 
-        // Phase C — APPLY every op; roll back from the unified intent on any
-        // failure (WAL preserved as the recover backstop).
-        match self.apply_ops(&prepared) {
+        // Phase C — APPLY every op; roll back what was applied on failure.
+        let mut residue = Vec::new();
+        match self.apply_ops(&prepared, &mut residue) {
             Ok(results) => {
-                // Phase D — full success: clear the WAL.
-                wal::clear(&self.wal_dir)?;
+                // Phase D — mark landed, then clear. An unmarked batch
+                // intent recovers BACKWARD, so a marker failure rolls back.
+                if let Err(e) = wal::mark_landed(&self.wal_dir, &intent.id) {
+                    let residue = self.undo_held(Self::batch_undo(&intent, &prepared));
+                    return Err(self.abandon(&intent.id, e.into(), residue));
+                }
+                self.clear_landed(&intent.id)?;
                 Ok(results)
             }
-            Err(e) => {
-                self.rollback_batch(&intent);
-                Err(e)
+            Err((e, applied)) => {
+                residue.extend(self.undo_held(Self::batch_undo(&intent, &prepared[..applied])));
+                Err(self.abandon(&intent.id, e, residue))
             }
         }
+    }
+
+    /// The undo of `applied`, from the unified intent's after-images and
+    /// originals.
+    fn batch_undo(intent: &Intent, applied: &[Prepared]) -> Vec<Converge> {
+        let paths = applied.iter().flat_map(|p| match p {
+            Prepared::Create { path, .. }
+            | Prepared::Delete { path, .. }
+            | Prepared::Edit { path, .. } => vec![path.as_str()],
+            Prepared::Move { from, to, .. } => vec![from.as_str(), to.as_str()],
+        });
+        undo_steps(intent, paths)
+    }
+
+    /// What an applied batch left at every path it touched.
+    fn batch_after(&self, prepared: &[Prepared]) -> AfterImages {
+        let hash = |b: &[u8]| Some(raw_hash(self.hasher.as_ref(), b));
+        let mut after = AfterImages::new();
+        for p in prepared {
+            match p {
+                Prepared::Create { path, staged } => {
+                    after.insert(path.clone(), hash(staged));
+                }
+                Prepared::Delete { path, .. } => {
+                    after.insert(path.clone(), None);
+                }
+                Prepared::Move { from, to, live } => {
+                    after.insert(from.clone(), None);
+                    after.insert(to.clone(), hash(live));
+                }
+                Prepared::Edit { path, spliced, .. } => {
+                    after.insert(path.clone(), hash(spliced));
+                }
+            }
+        }
+        after
     }
 
     /// The VALIDATE phase: checks every op's anchor against the live
@@ -1240,20 +1747,51 @@ impl Session {
     }
 
     /// The APPLY phase: applies each prepared op in input order. On the
-    /// first failure it returns the error WITHOUT rolling back — the caller
-    /// rolls back from the unified intent, so the rollback uses the full
-    /// undo record.
-    fn apply_ops(&self, prepared: &[Prepared]) -> Result<Vec<BatchResult>, SessionError> {
-        prepared.iter().map(|p| self.apply_op(p)).collect()
+    /// first failure it returns the error and how many leading ops the
+    /// caller must roll back. A failed create or move has already removed
+    /// its own claim (into `residue` if it could not); a failed edit is
+    /// counted, since a write can fail after changing the file and the
+    /// rollback only touches a path still holding this batch's bytes.
+    fn apply_ops(
+        &self,
+        prepared: &[Prepared],
+        residue: &mut Vec<Residue>,
+    ) -> Result<Vec<BatchResult>, (SessionError, usize)> {
+        let mut results = Vec::with_capacity(prepared.len());
+        for (i, p) in prepared.iter().enumerate() {
+            let applied = fault::hit("batch.op")
+                .map_err(|e| SessionError::Io {
+                    op: "batch apply",
+                    path: String::new(),
+                    source: e,
+                })
+                .and_then(|()| self.apply_op(p, residue));
+            match applied {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    let undo = if matches!(p, Prepared::Edit { .. }) {
+                        i + 1
+                    } else {
+                        i
+                    };
+                    return Err((e, undo));
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Performs ONE prepared op's on-disk effect (no anchor re-check —
     /// VALIDATE already proved it under the same held lock).
-    fn apply_op(&self, p: &Prepared) -> Result<BatchResult, SessionError> {
+    fn apply_op(
+        &self,
+        p: &Prepared,
+        residue: &mut Vec<Residue>,
+    ) -> Result<BatchResult, SessionError> {
         match p {
-            Prepared::Create { path, staged } => {
-                Ok(BatchResult::Create(self.apply_create(path, staged)?))
-            }
+            Prepared::Create { path, staged } => Ok(BatchResult::Create(
+                self.apply_create(path, staged, residue)?,
+            )),
             Prepared::Delete { path, live } => {
                 fs::remove_file(path).map_err(|e| SessionError::Io {
                     op: "batch delete unlink",
@@ -1266,7 +1804,7 @@ impl Session {
                 }))
             }
             Prepared::Move { from, to, live } => {
-                Ok(BatchResult::Move(self.apply_move(from, to, live)?))
+                Ok(BatchResult::Move(self.apply_move(from, to, live, residue)?))
             }
             Prepared::Edit {
                 path,
@@ -1287,12 +1825,17 @@ impl Session {
     /// Brings a batch create's file into being with the O_EXCL claim +
     /// fsynced write. The non-existence anchor was proven in VALIDATE, but
     /// O_EXCL re-proves it so nothing can be clobbered.
-    fn apply_create(&self, path: &str, staged: &[u8]) -> Result<EditResult, SessionError> {
+    fn apply_create(
+        &self,
+        path: &str,
+        staged: &[u8],
+        residue: &mut Vec<Residue>,
+    ) -> Result<EditResult, SessionError> {
         mkdir_parents(path)?;
         let mut f = open_exclusive(path)?;
         if let Err(e) = write_and_sync(&mut f, path, staged) {
             drop(f);
-            let _ = fs::remove_file(path);
+            residue.extend(self.unclaim(path));
             return Err(e);
         }
         Ok(self.create_result(path, staged))
@@ -1300,17 +1843,23 @@ impl Session {
 
     /// Relocates the validated source bytes to the destination with the
     /// O_EXCL claim + fsynced write, then unlinks the source.
-    fn apply_move(&self, from: &str, to: &str, live: &[u8]) -> Result<MoveResult, SessionError> {
+    fn apply_move(
+        &self,
+        from: &str,
+        to: &str,
+        live: &[u8],
+        residue: &mut Vec<Residue>,
+    ) -> Result<MoveResult, SessionError> {
         mkdir_parents(to)?;
         let mut dst = open_exclusive(to)?;
         if let Err(e) = write_and_sync(&mut dst, to, live) {
             drop(dst);
-            let _ = fs::remove_file(to);
+            residue.extend(self.unclaim(to));
             return Err(e);
         }
         drop(dst);
         if let Err(e) = fs::remove_file(from) {
-            let _ = fs::remove_file(to);
+            residue.extend(self.unclaim(to));
             return Err(SessionError::Io {
                 op: "batch move unlink src",
                 path: from.to_string(),
@@ -1321,34 +1870,6 @@ impl Session {
             from: from.to_string(),
             dest: self.create_result(to, live),
         })
-    }
-
-    /// Undoes every op recorded in the unified intent on an APPLY-phase
-    /// failure, returning the filesystem to its pre-batch state: restore
-    /// edited/deleted originals in place (move sources skipped — their bytes
-    /// belong to the move reversal), reverse every move, unlink every
-    /// created file. Errors are swallowed because the WAL is preserved as
-    /// the recover backstop.
-    fn rollback_batch(&self, intent: &Intent) {
-        let move_src: HashSet<&str> = intent.moves.iter().map(|m| m.from.as_str()).collect();
-
-        for (path, original) in &intent.originals {
-            if move_src.contains(path.as_str()) {
-                continue;
-            }
-            let _ = atomicwrite::write(Path::new(path), original);
-        }
-
-        for mv in &intent.moves {
-            if let Some(original) = intent.originals.get(&mv.from) {
-                let _ = atomicwrite::write(Path::new(&mv.from), original);
-            }
-            let _ = fs::remove_file(&mv.to);
-        }
-
-        for path in &intent.creates {
-            let _ = fs::remove_file(path);
-        }
     }
 
     /// The whole-file [`EditResult`] for a created (or move-destination)
@@ -1571,8 +2092,9 @@ mod tests {
 
         let intents = wal::replay(wal_dir.path()).unwrap();
         assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].id, plan.intent.id);
-        assert_eq!(intents[0].originals[&path], GO_SRC.as_bytes());
+        assert_eq!(intents[0].status, Status::Pending);
+        assert_eq!(intents[0].intent.id, plan.intent.id);
+        assert_eq!(intents[0].intent.originals[&path], GO_SRC.as_bytes());
 
         s.commit(&plan).unwrap();
         assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
@@ -1601,12 +2123,44 @@ mod tests {
         let s = new_session(wal_dir.path());
 
         let e = region_edit(&path, GO_SRC, "func a() {}", "func a() { return }");
-        s.prepare(&[e], &[]).unwrap();
-        // Simulate a crash: live file corrupted, commit never ran.
-        fs::write(&path, "GARBAGE\n").unwrap();
-        s.recover(wal_dir.path()).unwrap();
+        let plan = s.prepare(&[e], &[]).unwrap();
+        // The commit's write lands; the process dies before the marker.
+        crash(|| s.commit(&plan), "wal.mark");
+        assert_ne!(read_str(&path), GO_SRC);
+
+        let report = new_session(wal_dir.path()).recover(wal_dir.path()).unwrap();
         assert_eq!(read_str(&path), GO_SRC);
+        assert!(report.left.is_empty(), "{report:?}");
         assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+    }
+
+    /// Runs `op` with `point` armed to crash, and requires that it did.
+    fn crash<T>(op: impl FnOnce() -> T, point: &'static str) {
+        crash_nth(op, point, 1);
+    }
+
+    fn crash_nth<T>(op: impl FnOnce() -> T, point: &'static str, nth: usize) {
+        fault::disarm();
+        fault::arm_nth(point, nth, fault::Fault::Crash);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op));
+        fault::disarm();
+        let Err(payload) = r else {
+            panic!("expected an injected crash at {point}");
+        };
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(msg, format!("injected crash at {point}"));
+    }
+
+    /// Runs `op` with `point` armed to fail once.
+    fn failing<T>(op: impl FnOnce() -> T, point: &'static str) -> T {
+        fault::disarm();
+        fault::arm(point, fault::Fault::Fail);
+        let r = op();
+        assert!(fault::unfired().is_empty(), "fault at {point} never fired");
+        r
     }
 
     #[test]
@@ -1615,7 +2169,7 @@ mod tests {
         // B's target region is mutated so B can no longer resolve under
         // lock. Commit must reject with conflict, file A must be restored to
         // its exact original, file B must hold its out-of-band mutation, and
-        // the WAL must be PRESERVED so recover stays a backstop.
+        // the fully-undone intent must be cleared.
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = tempfile::tempdir().unwrap();
         let path_a = write_file(dir.path(), "a.go", GO_SRC);
@@ -1635,7 +2189,7 @@ mod tests {
         assert_eq!(err.kind(), Kind::Conflict);
         assert_eq!(read_str(&path_a), GO_SRC);
         assert_eq!(read_str(&path_b), mutated_b);
-        assert!(!wal::replay(wal_dir.path()).unwrap().is_empty());
+        assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -1750,6 +2304,7 @@ mod tests {
         let intent = Intent {
             id: "crashed-create".into(),
             creates: vec![path.clone()],
+            after: AfterImages::from([(path.clone(), Some(raw_of("package half\n")))]),
             ..Default::default()
         };
         wal::append(wal_dir.path(), &intent).unwrap();
@@ -1810,6 +2365,7 @@ mod tests {
             id: "crashed-delete".into(),
             deletes: vec![path.clone()],
             originals: HashMap::from([(path.clone(), GO_SRC.as_bytes().to_vec())]),
+            after: AfterImages::from([(path.clone(), None)]),
             ..Default::default()
         };
         wal::append(wal_dir.path(), &intent).unwrap();
@@ -1884,6 +2440,7 @@ mod tests {
                 to: to.clone(),
             }],
             originals: HashMap::from([(from.clone(), GO_SRC.as_bytes().to_vec())]),
+            after: AfterImages::from([(from.clone(), None), (to.clone(), Some(raw_of(GO_SRC)))]),
             ..Default::default()
         };
         wal::append(wal_dir.path(), &intent).unwrap();
@@ -1918,6 +2475,12 @@ mod tests {
             originals: HashMap::from([
                 (move_from.clone(), GO_SRC.as_bytes().to_vec()),
                 (edited.clone(), b"package e\n".to_vec()),
+            ]),
+            after: AfterImages::from([
+                (move_from.clone(), None),
+                (move_to.clone(), Some(raw_of(GO_SRC))),
+                (created.clone(), Some(raw_of("package c\n"))),
+                (edited.clone(), Some(raw_of("MUTATED\n"))),
             ]),
             ..Default::default()
         };
@@ -2021,7 +2584,7 @@ mod tests {
         // Op 2 passes VALIDATE (its path does not exist) but fails APPLY
         // (its parent "directory" is a regular file, so mkdir fails) after
         // op 1's edit already landed. The batch must roll back: op 1's file
-        // restored, and the WAL preserved as the recover backstop.
+        // restored, and the fully-undone intent cleared.
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = tempfile::tempdir().unwrap();
         let s = new_session(wal_dir.path());
@@ -2046,7 +2609,7 @@ mod tests {
         assert_eq!(err.kind(), Kind::Io);
         assert_eq!(read_str(&edit_path), GO_SRC);
         assert!(!Path::new(&create_path).exists());
-        assert!(!wal::replay(wal_dir.path()).unwrap().is_empty());
+        assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -2188,7 +2751,7 @@ mod tests {
         let intents = wal::replay(wal_dir.path()).unwrap();
         assert_eq!(intents.len(), N, "torn/interleaved append");
         let mut seen = HashSet::new();
-        for intent in &intents {
+        for intent in intents.iter().map(|r| &r.intent) {
             assert!(!intent.id.is_empty(), "torn write: empty ID");
             assert!(seen.insert(intent.id.clone()), "duplicate ID {}", intent.id);
             assert_eq!(intent.originals.len(), 1, "interleaved record");
@@ -2343,6 +2906,763 @@ mod tests {
             assert_eq!(r2.unwrap_err().kind(), Kind::Exists);
             assert_eq!(read_str(&a), GO_SRC);
             assert_eq!(read_str(&b), "package b\n");
+        }
+    }
+
+    #[test]
+    fn intent_ids_carry_a_per_process_random_token() {
+        let (a, b) = (new_intent_id(), new_intent_id());
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.len(), 4, "{a}");
+        assert_eq!(parts[1], std::process::id().to_string());
+        assert_eq!(parts[2].len(), 16, "{a}");
+        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
+        assert_eq!(
+            parts[2],
+            b.split('-').nth(2).unwrap(),
+            "one token per process"
+        );
+    }
+
+    /// Every failure and crash point of a landing op. Crashes and failures
+    /// are injected at named points; one clear failure is also produced by
+    /// a real permission denial.
+    mod recovery {
+        use super::*;
+
+        const EDITED: &str = "func a() { return }";
+        const B_EDITED: &str = "func b() { b() }";
+
+        fn edited() -> String {
+            GO_SRC.replace("func a() {}", EDITED)
+        }
+
+        fn edit_a(path: &str, src: &str) -> region::Edit {
+            region_edit(path, src, "func a() {}", EDITED)
+        }
+
+        /// A fresh process recovering the same WAL dir.
+        fn restart_and_recover(wal_dir: &Path) -> RecoverReport {
+            let report = new_session(wal_dir).recover(wal_dir).unwrap();
+            assert!(
+                wal::replay(wal_dir).unwrap().is_empty(),
+                "recover empties the WAL"
+            );
+            report
+        }
+
+        fn statuses(wal_dir: &Path) -> Vec<Status> {
+            wal::replay(wal_dir)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.status)
+                .collect()
+        }
+
+        fn ids(wal_dir: &Path) -> Vec<String> {
+            wal::replay(wal_dir)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.intent.id)
+                .collect()
+        }
+
+        fn left(report: &RecoverReport) -> Vec<&str> {
+            report.left.iter().map(|l| l.path.as_str()).collect()
+        }
+
+        fn assert_landed_not_cleared<T: std::fmt::Debug>(r: Result<T, SessionError>) {
+            let err = r.unwrap_err();
+            assert!(
+                matches!(err, SessionError::LandedWalNotCleared { .. }),
+                "want LandedWalNotCleared, got {err}"
+            );
+        }
+
+        /// Runs `op` with every point in `points` armed to fail once.
+        fn failing_all<T>(op: impl FnOnce() -> T, points: &[&'static str]) -> T {
+            fault::disarm();
+            for p in points {
+                fault::arm(p, fault::Fault::Fail);
+            }
+            let r = op();
+            assert!(
+                fault::unfired().is_empty(),
+                "never fired: {:?}",
+                fault::unfired()
+            );
+            r
+        }
+
+        /// The residue of a [`SessionError::LeftBehind`], as (kind, path/id).
+        fn residue(err: &SessionError) -> Vec<(&'static str, String)> {
+            let SessionError::LeftBehind { residue, .. } = err else {
+                panic!("want LeftBehind, got {err}");
+            };
+            residue
+                .iter()
+                .map(|r| match r {
+                    Residue::NotUndone { path, .. } => ("not-undone", path.clone()),
+                    Residue::IntentNotCleared { id, .. } => ("not-cleared", id.clone()),
+                })
+                .collect()
+        }
+
+        // ---- commit ----
+
+        #[test]
+        fn clear_failure_after_commit_keeps_new_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+
+            assert_landed_not_cleared(failing(|| s.commit(&plan), "wal.clear"));
+            assert_eq!(read_str(&path), edited());
+            assert_eq!(statuses(wal_dir.path()), vec![Status::Landed]);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited());
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn clear_denied_by_the_filesystem_keeps_new_bytes() {
+            use std::os::unix::fs::PermissionsExt;
+
+            /// Restores the WAL dir's mode even when an assertion fails.
+            struct Writable<'a>(&'a Path);
+            impl Drop for Writable<'_> {
+                fn drop(&mut self) {
+                    if let Err(e) = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755)) {
+                        eprintln!("restore mode of {:?}: {e}", self.0);
+                    }
+                }
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            {
+                // A read-only dir still lets the intent file take appended
+                // records, but refuses the unlink a clear needs.
+                let _back = Writable(wal_dir.path());
+                fs::set_permissions(wal_dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+                assert_landed_not_cleared(s.commit(&plan));
+            }
+            assert_eq!(read_str(&path), edited());
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited());
+        }
+
+        #[test]
+        fn marker_failure_rolls_the_commit_back_now() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+
+            let err = failing(|| s.commit(&plan), "wal.mark").unwrap_err();
+            assert!(matches!(err, SessionError::Wal(_)), "{err}");
+            assert_eq!(read_str(&path), GO_SRC, "an unmarked commit is undone");
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn crash_mid_multi_file_commit_undoes_only_what_it_wrote() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s
+                .prepare(&[edit_a(&a, GO_SRC), edit_a(&b, GO_SRC)], &[])
+                .unwrap();
+
+            // a.go is written; the process dies before b.go's record.
+            crash_nth(|| s.commit(&plan), "wal.applying", 2);
+            assert_eq!(read_str(&a), edited());
+            assert_eq!(read_str(&b), GO_SRC);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&a), GO_SRC);
+            assert_eq!(read_str(&b), GO_SRC);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn crash_after_a_concurrent_landing_restores_what_the_commit_replaced() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let stale = s
+                .prepare(&[region_edit(&path, GO_SRC, "func b() {}", B_EDITED)], &[])
+                .unwrap();
+            let landed = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            s.commit(&landed).unwrap();
+            // The stale plan re-resolves over the landed bytes, writes, and
+            // dies before its marker.
+            crash(|| s.commit(&stale), "wal.mark");
+            assert_eq!(read_str(&path), edited().replace("func b() {}", B_EDITED));
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited(), "not prepare's originals");
+        }
+
+        #[test]
+        fn finishing_one_op_keeps_another_in_flight() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan_a = s.prepare(&[edit_a(&a, GO_SRC)], &[]).unwrap();
+            let plan_b = s.prepare(&[edit_a(&b, GO_SRC)], &[]).unwrap();
+
+            s.commit(&plan_a).unwrap();
+            let created = dir.path().join("c.go").to_string_lossy().into_owned();
+            s.create_file(&created, "package c\n", None).unwrap();
+            s.delete_file(&created, &raw_of("package c\n")).unwrap();
+            assert_eq!(ids(wal_dir.path()), vec![plan_b.intent.id.clone()]);
+
+            // b's commit dies after its write: its intent must still be
+            // there to undo it.
+            crash(|| s.commit(&plan_b), "wal.mark");
+            assert_eq!(read_str(&b), edited());
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&a), edited());
+            assert_eq!(read_str(&b), GO_SRC);
+        }
+
+        #[test]
+        fn rollback_clears_only_its_own_intent() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let mut plan_a = s.prepare(&[edit_a(&a, GO_SRC)], &[]).unwrap();
+            let plan_b = s.prepare(&[edit_a(&b, GO_SRC)], &[]).unwrap();
+
+            s.rollback(&mut plan_a).unwrap();
+            assert_eq!(ids(wal_dir.path()), vec![plan_b.intent.id]);
+        }
+
+        #[test]
+        fn abandoned_prepare_does_not_revert_a_later_commit() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            s.prepare(&[region_edit(&path, GO_SRC, "func b() {}", B_EDITED)], &[])
+                .unwrap();
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            s.commit(&plan).unwrap();
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited());
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn unfinished_commit_does_not_revert_a_later_change() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            crash(|| s.commit(&plan), "wal.mark");
+            let later = edited().replace("func b() {}", B_EDITED);
+            fs::write(&path, &later).unwrap();
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), later);
+            assert_eq!(left(&report), vec![path.as_str()]);
+        }
+
+        #[test]
+        fn two_unfinished_writes_to_one_path_undo_in_any_order() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let first = edited();
+            let second = first.replace("func b() {}", B_EDITED);
+            // "a" replays before "b", so the first pass meets the earlier
+            // write while the later one still covers it.
+            for (id, before, after) in [("a", GO_SRC, &first), ("b", first.as_str(), &second)] {
+                wal::append(
+                    wal_dir.path(),
+                    &Intent {
+                        id: id.into(),
+                        originals: HashMap::from([(path.clone(), before.as_bytes().to_vec())]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                wal::record_applying(
+                    wal_dir.path(),
+                    id,
+                    &Applying {
+                        path: path.clone(),
+                        after: raw_of(after),
+                        before: None,
+                    },
+                )
+                .unwrap();
+                fs::write(&path, after).unwrap();
+            }
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn failed_undo_is_reported_and_recover_finishes_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s
+                .prepare(&[edit_a(&a, GO_SRC), edit_a(&b, GO_SRC)], &[])
+                .unwrap();
+            let mutated = GO_SRC.replace("func a() {}", "func a() { x := 9; _ = x }");
+            fs::write(&b, &mutated).unwrap();
+
+            let err = failing(|| s.commit(&plan), "undo").unwrap_err();
+            assert_eq!(residue(&err), vec![("not-undone", a.clone())]);
+            assert_eq!(err.kind(), Kind::Io, "the disk changed");
+            assert_eq!(err.path(), Some(b.as_str()), "the cause's path");
+            assert!(err.to_string().contains("not undone"), "{err}");
+            assert_eq!(read_str(&a), edited());
+            assert_eq!(statuses(wal_dir.path()), vec![Status::Pending]);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&a), GO_SRC);
+            assert_eq!(read_str(&b), mutated);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn stray_intent_after_a_full_undo_is_reported_and_harmless() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let a = write_file(dir.path(), "a.go", GO_SRC);
+            let b = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s
+                .prepare(&[edit_a(&a, GO_SRC), edit_a(&b, GO_SRC)], &[])
+                .unwrap();
+            fs::write(
+                &b,
+                GO_SRC.replace("func a() {}", "func a() { x := 9; _ = x }"),
+            )
+            .unwrap();
+
+            let err = failing(|| s.commit(&plan), "wal.clear").unwrap_err();
+            assert_eq!(residue(&err), vec![("not-cleared", plan.intent.id.clone())]);
+            assert_eq!(err.kind(), Kind::Conflict, "the disk is as found");
+            assert_eq!(read_str(&a), GO_SRC);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&a), GO_SRC);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn failed_commit_undo_keeps_a_commit_that_landed_since_prepare() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let first = write_file(dir.path(), "a.go", GO_SRC);
+            let second = write_file(dir.path(), "b.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let stale = s
+                .prepare(
+                    &[
+                        region_edit(&first, GO_SRC, "func b() {}", B_EDITED),
+                        region_edit(&second, GO_SRC, "func c() {}", "func c() { c() }"),
+                    ],
+                    &[],
+                )
+                .unwrap();
+            let landed = s.prepare(&[edit_a(&first, GO_SRC)], &[]).unwrap();
+            s.commit(&landed).unwrap();
+            fs::write(&second, GO_SRC.replace("func c() {}", "func c() { _ = 1 }")).unwrap();
+
+            let err = s.commit(&stale).unwrap_err();
+            assert!(matches!(err, SessionError::Conflict { .. }), "{err}");
+            assert_eq!(read_str(&first), edited());
+        }
+
+        #[test]
+        fn a_torn_intent_file_is_removed_by_recover() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            crash(|| s.prepare(&[edit_a(&path, GO_SRC)], &[]), "wal.append");
+            assert_eq!(statuses(wal_dir.path()), vec![Status::Torn]);
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+        }
+
+        #[test]
+        fn legacy_shared_log_recovers_by_the_old_rules() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", "GARBAGE\n");
+            let intent = Intent {
+                id: "old".into(),
+                originals: HashMap::from([(path.clone(), GO_SRC.as_bytes().to_vec())]),
+                ..Default::default()
+            };
+            let mut line = serde_json::to_vec(&intent).unwrap();
+            line.push(b'\n');
+            fs::write(wal_dir.path().join("wal.log"), line).unwrap();
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+            assert!(!wal_dir.path().join("wal.log").exists());
+        }
+
+        // ---- create ----
+
+        #[test]
+        fn clear_failure_after_create_keeps_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let path = dir.path().join("new.go").to_string_lossy().into_owned();
+
+            assert_landed_not_cleared(failing(
+                || s.create_file(&path, "package n\n", None),
+                "wal.clear",
+            ));
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), "package n\n");
+        }
+
+        #[test]
+        fn crash_after_create_write_recover_unlinks() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let path = dir.path().join("new.go").to_string_lossy().into_owned();
+            crash(|| s.create_file(&path, "package n\n", None), "wal.mark");
+            assert!(Path::new(&path).exists());
+
+            restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&path).exists());
+        }
+
+        #[test]
+        fn create_marker_failure_removes_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let path = dir.path().join("new.go").to_string_lossy().into_owned();
+
+            let err =
+                failing(|| s.create_file(&path, "package n\n", None), "wal.mark").unwrap_err();
+            assert!(matches!(err, SessionError::Wal(_)), "{err}");
+            assert!(!Path::new(&path).exists());
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn create_undo_failure_is_reported_and_recover_finishes_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let path = dir.path().join("new.go").to_string_lossy().into_owned();
+
+            let err = failing_all(
+                || s.create_file(&path, "package n\n", None),
+                &["wal.mark", "undo"],
+            )
+            .unwrap_err();
+            assert_eq!(residue(&err), vec![("not-undone", path.clone())]);
+            assert!(Path::new(&path).exists());
+
+            restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&path).exists());
+        }
+
+        // ---- delete ----
+
+        #[test]
+        fn clear_failure_after_delete_keeps_it_deleted() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "gone.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+
+            assert_landed_not_cleared(failing(
+                || s.delete_file(&path, &raw_of(GO_SRC)),
+                "wal.clear",
+            ));
+
+            restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&path).exists());
+        }
+
+        #[test]
+        fn crash_after_unlink_recover_restores_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "gone.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            crash(|| s.delete_file(&path, &raw_of(GO_SRC)), "wal.mark");
+            assert!(!Path::new(&path).exists());
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+        }
+
+        #[test]
+        fn delete_marker_failure_puts_the_file_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "gone.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+
+            let err = failing(|| s.delete_file(&path, &raw_of(GO_SRC)), "wal.mark").unwrap_err();
+            assert!(matches!(err, SessionError::Wal(_)), "{err}");
+            assert_eq!(read_str(&path), GO_SRC);
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn delete_undo_failure_is_reported_and_recover_finishes_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "gone.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+
+            let err = failing_all(
+                || s.delete_file(&path, &raw_of(GO_SRC)),
+                &["wal.mark", "undo"],
+            )
+            .unwrap_err();
+            assert_eq!(residue(&err), vec![("not-undone", path.clone())]);
+            assert!(!Path::new(&path).exists());
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+        }
+
+        // ---- move ----
+
+        #[test]
+        fn move_marker_failure_reports_landed_and_recover_keeps_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let from = write_file(dir.path(), "from.go", GO_SRC);
+            let to = dir.path().join("to.go").to_string_lossy().into_owned();
+            let s = new_session(wal_dir.path());
+
+            assert_landed_not_cleared(failing(
+                || s.move_file(&from, &to, &raw_of(GO_SRC)),
+                "wal.mark",
+            ));
+
+            let report = restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&from).exists());
+            assert_eq!(read_str(&to), GO_SRC);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn landed_move_is_not_replayed_over_a_later_edit() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let from = write_file(dir.path(), "from.go", GO_SRC);
+            let to = dir.path().join("to.go").to_string_lossy().into_owned();
+            let s = new_session(wal_dir.path());
+
+            assert_landed_not_cleared(failing(
+                || s.move_file(&from, &to, &raw_of(GO_SRC)),
+                "wal.clear",
+            ));
+            let plan = s.prepare(&[edit_a(&to, GO_SRC)], &[]).unwrap();
+            s.commit(&plan).unwrap();
+
+            restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&from).exists());
+            assert_eq!(read_str(&to), edited());
+        }
+
+        // ---- batch ----
+
+        fn batch_ops(dir: &Path) -> (Vec<Op>, [String; 5]) {
+            let edit_path = write_file(dir, "edit.go", GO_SRC);
+            let del_path = write_file(dir, "del.go", GO_SRC);
+            let from = write_file(dir, "from.go", GO_SRC);
+            let to = dir.join("to.go").to_string_lossy().into_owned();
+            let created = dir.join("new.go").to_string_lossy().into_owned();
+            let ops = vec![
+                Op::Edit(edit_a(&edit_path, GO_SRC)),
+                Op::Create {
+                    path: created.clone(),
+                    content: "package c\n".into(),
+                    lang: None,
+                },
+                Op::Delete {
+                    path: del_path.clone(),
+                    expected_raw_hash: raw_of(GO_SRC),
+                },
+                Op::Move {
+                    from: from.clone(),
+                    to: to.clone(),
+                    expected_raw_hash: raw_of(GO_SRC),
+                },
+            ];
+            (ops, [edit_path, created, del_path, from, to])
+        }
+
+        fn assert_batch_before(paths: &[String; 5]) {
+            let [edit_path, created, del_path, from, to] = paths;
+            assert_eq!(read_str(edit_path), GO_SRC);
+            assert!(!Path::new(created).exists());
+            assert_eq!(read_str(del_path), GO_SRC);
+            assert_eq!(read_str(from), GO_SRC);
+            assert!(!Path::new(to).exists());
+        }
+
+        #[test]
+        fn clear_failure_after_batch_keeps_every_op() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let (ops, [edit_path, created, del_path, from, to]) = batch_ops(dir.path());
+
+            assert_landed_not_cleared(failing(|| s.apply_batch(&ops), "wal.clear"));
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&edit_path), edited());
+            assert_eq!(read_str(&created), "package c\n");
+            assert!(!Path::new(&del_path).exists());
+            assert!(!Path::new(&from).exists());
+            assert_eq!(read_str(&to), GO_SRC);
+        }
+
+        #[test]
+        fn crash_mid_batch_recover_converges_backward() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let (ops, paths) = batch_ops(dir.path());
+
+            // Edit and create applied; the process dies before the delete.
+            crash_nth(|| s.apply_batch(&ops), "batch.op", 3);
+            assert_eq!(read_str(&paths[0]), edited());
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_batch_before(&paths);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn batch_marker_failure_rolls_every_op_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let (ops, paths) = batch_ops(dir.path());
+
+            let err = failing(|| s.apply_batch(&ops), "wal.mark").unwrap_err();
+            assert!(matches!(err, SessionError::Wal(_)), "{err}");
+            assert_batch_before(&paths);
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn batch_rollback_failure_is_reported_and_recover_finishes_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let (ops, paths) = batch_ops(dir.path());
+
+            // The delete fails to apply; undoing the edit then fails too.
+            fault::disarm();
+            fault::arm_nth("batch.op", 3, fault::Fault::Fail);
+            fault::arm("undo", fault::Fault::Fail);
+            let err = s.apply_batch(&ops).unwrap_err();
+            assert!(fault::unfired().is_empty(), "{:?}", fault::unfired());
+            assert_eq!(residue(&err), vec![("not-undone", paths[0].clone())]);
+            assert_eq!(read_str(&paths[0]), edited());
+            assert!(!Path::new(&paths[1]).exists(), "the create was undone");
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_batch_before(&paths);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn stale_prepare_does_not_revert_a_landed_commit_whose_clear_failed() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            s.prepare(&[region_edit(&path, GO_SRC, "func b() {}", B_EDITED)], &[])
+                .unwrap();
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            assert_landed_not_cleared(failing(|| s.commit(&plan), "wal.clear"));
+
+            restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited());
+        }
+
+        #[test]
+        fn unfinished_commit_after_a_landing_rolls_back_to_the_landed_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+            assert_landed_not_cleared(failing(|| s.commit(&plan), "wal.clear"));
+            let second = s
+                .prepare(
+                    &[region_edit(&path, &edited(), "func b() {}", B_EDITED)],
+                    &[],
+                )
+                .unwrap();
+            crash(|| s.commit(&second), "wal.mark");
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), edited());
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn marker_failed_move_does_not_replay_over_a_later_edit() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let from = write_file(dir.path(), "from.go", GO_SRC);
+            let to = dir.path().join("to.go").to_string_lossy().into_owned();
+            let s = new_session(wal_dir.path());
+            assert_landed_not_cleared(failing(
+                || s.move_file(&from, &to, &raw_of(GO_SRC)),
+                "wal.mark",
+            ));
+            let plan = s.prepare(&[edit_a(&to, GO_SRC)], &[]).unwrap();
+            s.commit(&plan).unwrap();
+
+            let report = restart_and_recover(wal_dir.path());
+            assert!(!Path::new(&from).exists());
+            assert_eq!(read_str(&to), edited());
+            assert_eq!(left(&report), vec![to.as_str()]);
         }
     }
 }
