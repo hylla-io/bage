@@ -2024,8 +2024,10 @@ impl Client {
     /// A refusal (JSON-RPC error) is also not-ready and keeps polling; a fatal
     /// transport error aborts at once so the pool respawns the corpse rather
     /// than probing a dead process for the full deadline. Readiness is a
-    /// property of the SERVER, not of the probe position, so one successful
-    /// gate covers the queries that follow on that server.
+    /// property of the SERVER, not of the probe position, but it is NOT
+    /// monotonic while the server is still loading its workspace:
+    /// rust-analyzer can resolve the probe, then answer the same query empty
+    /// until its load finishes. A pass here does not cover that window.
     ///
     /// A server that SAYS it has failed stops the wait at once: when its
     /// latest status notification matches a declared
@@ -6378,8 +6380,9 @@ mod tests {
         }
     }
 
-    /// Handshakes against a status server, then gates. The notification is
-    /// sent on `initialized`, so a probe is what orders it before the check.
+    /// Handshakes against a status server, then gates. The statuses are sent
+    /// on `initialized`; the round trip stores ALL of them before the
+    /// pre-probe check, which could otherwise see only a prefix.
     fn await_ready_under(
         statuses: Vec<(String, Value)>,
         rules: Vec<ReadyFailure>,
@@ -6388,6 +6391,7 @@ mod tests {
         let (client_conn, server_conn) = conn_pair();
         spawn_status_server(server_conn, statuses, StatusAt::Initialized);
         let mut c = status_client(client_conn, rules, deadline);
+        round_trip(&mut c);
         let start = Instant::now();
         let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
         (got, start.elapsed())

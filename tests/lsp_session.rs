@@ -126,6 +126,10 @@ fn stderr_tail_is_bounded_and_reports_the_cut() {
         shown.contains("earlier bytes dropped"),
         "cut must be reported: {shown}"
     );
+    assert!(
+        shown.contains("server stderr") && shown.contains("line 199"),
+        "the printed tail must carry the kept bytes: {shown}"
+    );
     let _ = c.close();
 }
 
