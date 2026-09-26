@@ -446,6 +446,22 @@ fn await_orphan_member(cfg: ClientConfig) -> (Result<(), LspError>, Duration) {
     (got, took)
 }
 
+/// The printed error, not only the field, must show the server's stderr: a
+/// caller that logs the error is the reader it exists for.
+fn assert_prints_stderr(err: &LspError, stderr: &lsp::StderrTail) {
+    let shown = err.to_string();
+    let newest = stderr
+        .text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .expect("the server wrote to stderr");
+    assert!(
+        shown.contains("server stderr") && shown.contains(newest.trim_end()),
+        "printed error must carry the stderr tail ending {newest:?}: {shown}"
+    );
+}
+
 #[test]
 fn rust_analyzer_reported_failure_stops_readiness_at_once() {
     if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
@@ -480,6 +496,7 @@ fn rust_analyzer_reported_failure_stops_readiness_at_once() {
                 stderr.text.len() <= declared.stderr_tail_bytes,
                 "stderr bound ignored"
             );
+            assert_prints_stderr(got.as_ref().unwrap_err(), stderr);
             eprintln!("reported in {took:?}: {}", got.as_ref().unwrap_err());
         }
         other => panic!("want ServerReported, got {other:?}"),
@@ -506,6 +523,7 @@ fn rust_analyzer_reported_failure_stops_readiness_at_once() {
                 stderr.text.contains("workspace"),
                 "the server's own explanation must ride on the error: {stderr:?}"
             );
+            assert_prints_stderr(got.as_ref().unwrap_err(), stderr);
         }
         other => panic!("want ReadyDeadline, got {other:?}"),
     }

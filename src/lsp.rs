@@ -1351,7 +1351,9 @@ impl Client {
         lock(&client.stderr).captured = true;
         let ring = Arc::clone(&client.stderr);
         // Drains for the child's whole life: a full, unread pipe would block
-        // the server on its next stderr write. Ends at EOF when the child exits.
+        // the server on its next stderr write. EOF needs every holder of the
+        // pipe gone, so a surviving grandchild (cargo, proc-macro-srv) keeps
+        // this thread parked, never the client.
         thread::spawn(move || {
             let mut chunk = [0u8; 4096];
             loop {
@@ -6304,13 +6306,38 @@ mod tests {
         }
     }
 
-    /// A server that pushes each of `statuses` as a status notification right
-    /// after the handshake, then answers every definition with `[]` — the
-    /// server that has given up and says so only out of band.
-    fn spawn_status_server(server_conn: (PipeReader, PipeWriter), statuses: Vec<(String, Value)>) {
+    /// When a status server pushes its statuses.
+    #[derive(Clone, Copy)]
+    enum StatusAt {
+        /// Right after the handshake.
+        Initialized,
+        /// Inside the first definition probe, ahead of its `[]` answer: the
+        /// failure that lands during a probe.
+        FirstProbe,
+    }
+
+    /// A server that pushes each of `statuses` as a status notification at
+    /// `at`, then answers every definition with `[]` — the server that has
+    /// given up and says so only out of band. Returns the definition count.
+    fn spawn_status_server(
+        server_conn: (PipeReader, PipeWriter),
+        statuses: Vec<(String, Value)>,
+        at: StatusAt,
+    ) -> Arc<AtomicUsize> {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&probes);
         let (reader, mut w) = server_conn;
         thread::spawn(move || {
             let mut r = BufReader::new(reader);
+            let push = |w: &mut PipeWriter| {
+                for (method, params) in &statuses {
+                    write_frame(
+                        w,
+                        &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                    )
+                    .unwrap();
+                }
+            };
             while let Ok(Some(body)) = read_frame(&mut r) {
                 let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
                     continue;
@@ -6318,16 +6345,14 @@ mod tests {
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
                 match msg.get("method").and_then(Value::as_str).unwrap_or("") {
                     "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
-                    "initialized" => {
-                        for (method, params) in &statuses {
-                            write_frame(
-                                &mut w,
-                                &json!({"jsonrpc": "2.0", "method": method, "params": params}),
-                            )
-                            .unwrap();
+                    "initialized" if matches!(at, StatusAt::Initialized) => push(&mut w),
+                    "textDocument/definition" => {
+                        let n = seen.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 && matches!(at, StatusAt::FirstProbe) {
+                            push(&mut w);
                         }
+                        reply_ok(&mut w, &id, json!([]))
                     }
-                    "textDocument/definition" => reply_ok(&mut w, &id, json!([])),
                     "shutdown" => reply_ok(&mut w, &id, Value::Null),
                     "exit" => break,
                     _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
@@ -6335,6 +6360,7 @@ mod tests {
                 }
             }
         });
+        probes
     }
 
     fn server_status(health: &str, quiescent: bool, message: &str) -> (String, Value) {
@@ -6360,17 +6386,117 @@ mod tests {
         deadline: Duration,
     ) -> (Result<(), LspError>, Duration) {
         let (client_conn, server_conn) = conn_pair();
-        spawn_status_server(server_conn, statuses);
-        let mut c = ready_client(client_conn);
+        spawn_status_server(server_conn, statuses, StatusAt::Initialized);
+        let mut c = status_client(client_conn, rules, deadline);
+        let start = Instant::now();
+        let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
+        (got, start.elapsed())
+    }
+
+    fn status_client(
+        conn: (PipeReader, PipeWriter),
+        rules: Vec<ReadyFailure>,
+        deadline: Duration,
+    ) -> Client {
+        let mut c = ready_client(conn);
         c.ready_retry = Duration::from_millis(5);
         c.ready_deadline = deadline;
         let mut cfg = c.config();
         cfg.ready_failures = rules;
         c.configure(cfg);
         c.initialize("file:///work").unwrap();
-        let start = Instant::now();
+        c
+    }
+
+    /// A status the server sent before a round trip's answer is stored before
+    /// that answer is delivered, so after this returns the check sees it.
+    fn round_trip(c: &mut Client) {
+        let _refused = c.call("bage/barrier", json!({}), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_failure_already_reported_sends_no_probe() {
+        let (client_conn, server_conn) = conn_pair();
+        let probes = spawn_status_server(
+            server_conn,
+            vec![server_status("error", true, "Failed to load workspaces.")],
+            StatusAt::Initialized,
+        );
+        let mut c = status_client(client_conn, vec![status_rule()], Duration::from_secs(10));
+        round_trip(&mut c);
         let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
-        (got, start.elapsed())
+        assert!(
+            matches!(got, Err(LspError::ServerReported { .. })),
+            "got {got:?}"
+        );
+        round_trip(&mut c);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "a server that already said it failed must not be probed"
+        );
+    }
+
+    #[test]
+    fn a_failure_reported_during_the_last_probe_is_not_a_deadline() {
+        let (client_conn, server_conn) = conn_pair();
+        let probes = spawn_status_server(
+            server_conn,
+            vec![server_status("error", true, "Failed to load workspaces.")],
+            StatusAt::FirstProbe,
+        );
+        // A zero deadline makes the first probe the last one.
+        let mut c = status_client(client_conn, vec![status_rule()], Duration::ZERO);
+        let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
+        match got {
+            Err(LspError::ServerReported { ref message, .. }) => {
+                assert_eq!(message, "Failed to load workspaces.");
+            }
+            other => panic!("want ServerReported, got {other:?}"),
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn readiness_errors_print_the_server_stderr() {
+        let stderr_of =
+            |c: &Client| lock(&c.stderr).push(b"cargo: failed to find a workspace root\n");
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(
+            server_conn,
+            vec![server_status("error", true, "Failed to load workspaces.")],
+            StatusAt::FirstProbe,
+        );
+        let mut c = status_client(client_conn, vec![status_rule()], Duration::from_secs(10));
+        lock(&c.stderr).captured = true;
+        stderr_of(&c);
+        let reported = c
+            .await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap_err();
+
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(server_conn, Vec::new(), StatusAt::Initialized);
+        let mut c = status_client(client_conn, Vec::new(), Duration::from_millis(20));
+        lock(&c.stderr).captured = true;
+        stderr_of(&c);
+        let deadline = c
+            .await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap_err();
+
+        for err in [reported, deadline] {
+            assert!(
+                matches!(
+                    err,
+                    LspError::ServerReported { .. } | LspError::ReadyDeadline { .. }
+                ),
+                "{err:?}"
+            );
+            let shown = err.to_string();
+            assert!(
+                shown.contains("server stderr:\ncargo: failed to find a workspace root"),
+                "the printed error must carry the server's stderr: {shown}"
+            );
+        }
     }
 
     #[test]
