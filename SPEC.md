@@ -117,8 +117,61 @@ Dependency direction: Hylla → Båge only. Båge imports nothing from Hylla.
 
 ### §4.6 `wal`
 - `pub struct Intent { id, edits: Vec<FileEdit>, originals, expected_raw_hash, expected_norm_hash, … }`
-- `pub fn append(dir: &Path, intent: &Intent)` / `pub fn replay(dir: &Path) -> Result<Vec<Intent>, …>`
-  / `pub fn clear(dir: &Path)` — durable, file-based (one fsynced JSON record per intent). NO SQLite.
+- `pub fn append(dir, &Intent)` / `record_applying(dir, id, &Applying)` / `mark_landed(dir, id)` /
+  `replay(dir) -> Result<Vec<Replayed>, …>` / `clear(dir, id)` / `clear_legacy(dir)` — durable,
+  file-based, fsynced. NO SQLite.
+- **One file per intent**: `<dir>/bage-intent-<hex id>.wal`. `clear(dir, id)` unlinks that file only,
+  so finishing one op never drops another op's in-flight intent. `append` creates the file
+  exclusively (a repeated id is `WalError::DuplicateId`).
+- Line 1 is the intent (no `v` key; Go-compatible fields, plus `after` — the raw hash each lifecycle
+  op leaves at each path, `null` = absent). Later lines are `{"v":2,"applying":{path,after,before?}}`
+  (written before a commit writes `path`; `before` = replaced bytes when they differ from
+  `originals[path]`) and `{"v":2,"landed":true}` (all bytes durable, written before `clear`). A record
+  whose write or fsync fails is truncated back off the file, so a failed marker never reads as
+  `Landed`; if that truncation also fails, the record may survive.
+- `Replayed { intent, applied, status: Torn | Pending | Landed | Legacy }`. A torn LAST line reads as
+  absent (a torn intent line is `Torn`). Loud `WalError`: an unknown `v`, a misshapen record, a record
+  after `landed`, an unparsable line before the end, a file name that disagrees with its intent.
+- `<dir>/wal.log`, the shared log older versions wrote, is replayed as `Legacy` and recovered by the
+  old unconditional rules.
+
+### §4.7 What is on disk after each outcome
+- **Success**: the op's bytes; its intent cleared.
+- **Clear fails after `landed`**: `SessionError::LandedWalNotCleared`. The bytes DID land; the intent
+  stays marked landed and `recover` keeps the bytes and removes it.
+- **Marker fails** (commit, create, delete, batch): the op is undone now, as for any other failure
+  below, with the WAL error as the cause: `SessionError::Wal` when fully undone, else `LeftBehind`.
+  A single-op move converges forward, so there it is `LandedWalNotCleared`.
+- **Any other failure**: the op is undone now — every path put back only while it still holds this
+  op's bytes. Fully undone: the intent is cleared and the error is the cause. Otherwise the error is
+  `SessionError::LeftBehind { cause, residue }`, one entry per path or intent:
+  - `Residue::NotUndone { path }` — the put-back failed; the path still holds the op's bytes. The
+    intent is kept and `recover` finishes the undo.
+  - `Residue::ChangedSince { path }` — another writer changed the path after this op wrote it. It
+    is kept as found and may still carry this op's change. Nothing more can be undone, so the
+    intent is cleared.
+  - `Residue::IntentNotCleared { id }` — the disk is as found; the stray intent is harmless.
+
+  `kind()` is the cause's when only intents were left, else `io`.
+- **Crash**: the intent and whatever bytes landed. `Session::recover(dir) -> RecoverReport` keeps
+  `Landed` intents; undoes each `Pending` intent path by path, touching a path only while it holds
+  exactly that intent's after-image (commit: `applying`; lifecycle ops: `after`); converges a
+  single-op move forward, removing the source only once the destination holds its bytes; removes
+  `Torn` files. A prepared plan that never wrote needs nothing. Steps repeat until none can act, so
+  several unfinished writes to one path undo in any replay order. When those writes form a cycle
+  (content went A→B→A) the log cannot order them: the path is not touched. A path holding anything
+  else, or with such a cycle, is left as found and listed in `RecoverReport.left`. Residual: a
+  later write leaving byte-identical content is indistinguishable from this op's.
+- **Crash before the intent exists**: create and move act on the target BEFORE the WAL append, so
+  a pre-existing path is refused before any record names it. A crash in that window leaves, with no
+  intent and nothing for `recover` to see: create — an empty file at the claimed path; move — a
+  full copy at the destination, the source intact.
+- **Durability**: file contents and their directories are fsynced before an op reports landed:
+  `atomicwrite` syncs the directory after its rename, a create or move destination syncs its
+  directory after its write, and `wal::clear` syncs the WAL directory. Unlinks of a delete or a
+  move source are not directory-synced: after power loss the removed file can reappear.
+- `recover` must run with no op in flight on `dir`. A failed write stops it with the WAL intact;
+  running it again finishes the job.
 
 ## 5. Drift discipline (edit-time)
 
@@ -252,8 +305,8 @@ same anchored two-phase engine — there is no second, weaker write path.
 
 ### §10.3 "Atomic" defined honestly
 POSIX has no multi-file atomic flip. Cross-file all-or-nothing is **WAL-backed, on recovery**:
-the WAL records batch intent + undo bytes; `Session::recover` drives a crashed mid-flip batch to
-fully-before or fully-after, never half. **File-first ordering** keeps the graph leg from leading
+the WAL records batch intent + undo bytes + after-images; `Session::recover` drives a crashed
+mid-flip batch to fully-before (a single-op move to fully-after), never half (§4.7). **File-first ordering** keeps the graph leg from leading
 durable file state.
 
 ### §10.4 Gate boundary (Båge vs caller)
@@ -346,23 +399,65 @@ each with name extraction. Code grammars keep the substring `is_decl_kind` path.
 
 ### §12.5 LSP cross-file rename completeness (#23)
 `Client::rename` primes the workspace — `didOpen`ing same-language siblings under the root
-(capped, `BAGE_LSP_NO_PRIME=1` to disable) — so servers that only see open files (pyright) rename
-across files. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
-on close) so a rename crosses translation units. Container-verified for gopls, pyright, and clangd
-(`BAGE_DOCKER_LSP=1`).
+(capped, `BAGE_LSP_NO_PRIME=1` to disable) — for servers that only see open files. `initialize`
+declares the root both as `rootUri` and as the single entry of `workspaceFolders`; pyright ignores
+`rootUri` and renames across files only with the folder declared. The dynamic
+`workspace.workspaceFolders` capability is not claimed. `processId` is declared per client
+(`ClientConfig::process_id`, default this process's id, `None` = `null`); a server in another pid
+namespace needs `None`, or it exits when it cannot see the pid. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
+on close) so a rename crosses translation units. A server still indexing may answer with a
+non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
+distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
+at a position inside a referencing file first. That gate is necessary, not sufficient: readiness is
+not monotonic while a server loads its workspace — rust-analyzer can pass the probe, then answer
+empty until its load finishes, so an empty result after the gate is still not proof of "none".
+Container-verified for gopls, pyright, and clangd
+(`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
 ### §12.6 Declared LSP session
-A consumer declares every time bound of a session; none is fixed at compile time.
+A consumer declares every time bound of a session, and what the handshake says; none is fixed
+at compile time.
 `lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
 query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
-exit_poll }` is applied by `Client::configure` BEFORE `initialize` (read back with
+exit_poll, process_id, initialization_options, experimental_capabilities, ready_failures,
+stderr_tail_bytes }` is applied by `Client::configure` BEFORE
+`initialize` (read back with
 `Client::config`), or carried by `LspPool::with_client_config`, which configures each server
 between spawn and handshake — the only point a pooled handshake can be bounded.
 `initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
 `shutdown_timeout + exit_deadline` before killing the child. `ClientConfig::default()` holds
-bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms).
+bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms;
+no experimental capabilities, no ready failures, 16 KiB of stderr).
 The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
 time rather than defaulting silently, and ships as a minor bump.
+`initialization_options` reaches the server VERBATIM as `initializationOptions`, and an unset
+one omits the member — an omitted member and a declared `null` are different requests, and
+bage invents neither. bage defines no shape for it and encodes no policy: server behaviour the
+protocol exposes nowhere else is the caller's to declare. A TypeScript server's automatic type
+acquisition is the worked case — undeclared, it runs `npm install --ignore-scripts
+types-registry@latest`, reaching the network and a user cache, and only
+`initializationOptions.disableAutomaticTypingAcquisition` stops it. Accept-vs-control proof
+against the real server: `tests/lsp_typing_acquisition.rs`.
+`experimental_capabilities` reaches the server VERBATIM as `capabilities.experimental`, beside
+bage's own capabilities, and is omitted when unset.
+A server that SAYS it has failed ends `await_ready` at once. Status notifications are server
+extensions with no common shape, so the caller declares each as a `ReadyFailure { method, when,
+message_pointer }`: the method to watch, members its params must carry (recursive subset match),
+and an RFC 6901 pointer to the message (absent or unresolved = the whole params). Only the LATEST
+notification per watched method counts, so a later recovery supersedes a failure; unwatched
+notifications are dropped, and a method no longer declared forgets its last status. When the
+latest status matches, `await_ready` returns `LspError::ServerReported { method, message, stderr }`
+instead of probing to the deadline; with none declared, probing alone decides, as before.
+rust-analyzer is `experimental_capabilities: {"serverStatusNotification": true}` plus
+`method: "experimental/serverStatus"`, `when: {"health": "error", "quiescent": true}`,
+`message_pointer: "/message"` — an orphaned workspace member reports "Failed to load workspaces."
+in under a second where the undeclared gate waits out its whole deadline.
+A stdio server's stderr is drained for the child's whole life into a ring of the last
+`stderr_tail_bytes` (zero keeps nothing); `StderrTail { text, dropped_bytes, captured }` says how
+much older output was discarded, so a cut is never silent. `ReadyDeadline` and `ServerReported`
+carry it and print it; every other error keeps its shape, and `Client::stderr_tail()` reads the
+tail after any failure. A `from_conn` client has no stderr (`captured: false`). Real-server proof:
+`tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, rust-analyzer).
 Document sync is public: `Client::did_open(path, text)` (close-then-open on a re-open, per the
 spec's balanced open/close rule) and `Client::did_close(path) -> Result<bool>` (`false`, nothing
 sent, when the document is not open). Real-server proof: `tests/lsp_session.rs`
@@ -381,7 +476,8 @@ registration) and keeps the server's `capabilities`; a method whose provider is 
 `false` fails with `LspError::Unsupported { method, capability }` and sends nothing — never an
 empty answer. Before a handshake nothing is known, so the request goes out. All four run under the
 declared `call_timeout`, `query_deadline` and `query_retry` (§12.6); an empty result still carries
-no readiness, so gate with `await_ready` first. Measured on the local servers: rust-analyzer
+no readiness, so gate with `await_ready` first — and even past that gate an empty answer is not
+proof of "none" while rust-analyzer is still loading its workspace (§12.5). Measured on the local servers: rust-analyzer
 advertises implementation but NOT type hierarchy; gopls and clangd advertise both; pyright advertises
 neither. Real-server proof: `tests/lsp_hierarchy.rs` (`BAGE_LSP_REAL_TEST=1`); a server that starts
 advertising a capability fails its `Unsupported` row loudly so it moves to the positive rows.

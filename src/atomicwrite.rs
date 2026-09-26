@@ -8,8 +8,9 @@ use std::path::Path;
 #[derive(Debug, thiserror::Error)]
 #[error("atomicwrite: {op} {path:?}: {source}")]
 pub struct AtomicWriteError {
-    /// The step that failed: "create temp", "write temp", "fsync temp", or
-    /// "rename".
+    /// The step that failed: "create temp in", "write temp", "fsync temp",
+    /// "rename over", or "fsync dir". A "fsync dir" failure comes after the
+    /// rename: the new bytes are at the path but may not survive power loss.
     pub op: &'static str,
     /// The path involved in the failing step.
     pub path: String,
@@ -18,7 +19,8 @@ pub struct AtomicWriteError {
 }
 
 /// Atomically writes `data` to `path`: create a temp file in the same
-/// directory, write, fsync the temp file, then rename it over `path`. The
+/// directory, write, fsync the temp file, rename it over `path`, then fsync
+/// the directory so the rename itself is durable. The
 /// temp file is removed on any error (RAII — an unpersisted
 /// `NamedTempFile` deletes itself on drop), so a failed write never leaves
 /// partial state behind.
@@ -29,10 +31,7 @@ pub fn write(path: &Path, data: &[u8]) -> Result<(), AtomicWriteError> {
         source,
     };
 
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
+    let dir = parent_dir(path);
     let base = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -49,7 +48,24 @@ pub fn write(path: &Path, data: &[u8]) -> Result<(), AtomicWriteError> {
         .map_err(|e| err("fsync temp", tmp.path(), e))?;
     tmp.persist(path)
         .map_err(|e| err("rename over", path, e.error))?;
+    sync_dir(dir, "atomicwrite.syncdir").map_err(|e| err("fsync dir", dir, e))?;
     Ok(())
+}
+
+/// Fsyncs directory `dir`. A rename, create or unlink is durable only once
+/// its directory is: without this a power loss can undo a change that was
+/// already reported landed.
+pub(crate) fn sync_dir(dir: &Path, point: &'static str) -> io::Result<()> {
+    crate::fault::hit(point)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// The directory holding `path`, `.` for a bare file name.
+pub(crate) fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +97,17 @@ mod tests {
         let e = write(&target, b"data").unwrap_err();
         assert_eq!(e.op, "create temp in");
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn the_directory_is_synced_after_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        crate::fault::disarm();
+        crate::fault::arm("atomicwrite.syncdir", crate::fault::Fault::Fail);
+        let e = write(&target, b"data").unwrap_err();
+        assert!(crate::fault::unfired().is_empty(), "no directory sync ran");
+        assert_eq!(e.op, "fsync dir");
+        assert_eq!(std::fs::read(&target).unwrap(), b"data", "after the rename");
     }
 }
