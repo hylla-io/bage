@@ -429,9 +429,23 @@ fn append_record(dir: &Path, id: &str, rec: &Record) -> Result<(), WalError> {
             io_err("open", &path, e)
         }
     })?;
-    f.write_all(&line).map_err(|e| io_err("write", &path, e))?;
-    f.sync_all().map_err(|e| io_err("fsync", &path, e))?;
-    Ok(())
+    let before = f.metadata().map_err(|e| io_err("stat", &path, e))?.len();
+    let appended = f
+        .write_all(&line)
+        .map_err(|e| io_err("write", &path, e))
+        .and_then(|()| {
+            fault::hit("wal.record.fsync")
+                .and_then(|()| f.sync_all())
+                .map_err(|e| io_err("fsync", &path, e))
+        });
+    if appended.is_err() {
+        // The caller treats a failed append as absent, so its line must not
+        // be read later: a landed marker left here would make recover keep
+        // bytes the caller is still undoing. If the take-back fails too, the
+        // append's own error is still the one to report.
+        let _ = f.set_len(before).and_then(|()| f.sync_all());
+    }
+    appended
 }
 
 /// Reads every intent in `dir`: the legacy shared log first, then each
@@ -913,6 +927,24 @@ mod tests {
         assert_eq!(intent.id, "g");
         assert_eq!(intent.originals["p"], b"hi");
         assert!(!intent.batch);
+    }
+
+    #[test]
+    fn clear_in_a_missing_directory_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        clear(&dir.path().join("never-made"), "i1").unwrap();
+    }
+
+    #[test]
+    fn a_record_whose_fsync_fails_is_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &sample("i1")).unwrap();
+        fault::disarm();
+        fault::arm("wal.record.fsync", fault::Fault::Fail);
+        let e = mark_landed(dir.path(), "i1").unwrap_err();
+        assert!(fault::unfired().is_empty(), "no record fsync ran");
+        assert!(matches!(e, WalError::Io { op: "fsync", .. }), "{e}");
+        assert_eq!(replay(dir.path()).unwrap(), vec![pending(sample("i1"))]);
     }
 
     #[test]

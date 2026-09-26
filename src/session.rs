@@ -2239,6 +2239,14 @@ mod tests {
     }
 
     #[test]
+    fn has_cycle_ignores_steps_that_change_nothing() {
+        let h = |s: &str| Some(s.to_string());
+        assert!(!has_cycle(&[(h("a"), h("a"))]));
+        assert!(!has_cycle(&[(h("a"), h("b")), (h("b"), h("b"))]));
+        assert!(has_cycle(&[(h("a"), h("b")), (h("b"), h("a"))]));
+    }
+
+    #[test]
     fn multi_file_partial_failure_restores() {
         // Two files prepared in ONE plan; between prepare and commit file
         // B's target region is mutated so B can no longer resolve under
@@ -3378,6 +3386,56 @@ mod tests {
         }
 
         #[test]
+        fn a_write_failing_after_its_rename_is_undone() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+
+            let err = failing(|| s.commit(&plan), "atomicwrite.syncdir").unwrap_err();
+            assert!(matches!(err, SessionError::Write { .. }), "{err}");
+            assert_eq!(read_str(&path), GO_SRC, "the renamed bytes are put back");
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_marker_that_failed_its_fsync_does_not_keep_an_unfinished_undo() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            let s = new_session(wal_dir.path());
+            let plan = s.prepare(&[edit_a(&path, GO_SRC)], &[]).unwrap();
+
+            // The marker's line is written, its fsync fails, and putting the
+            // file back fails too.
+            fault::disarm();
+            fault::arm_nth("wal.record.fsync", 2, fault::Fault::Fail);
+            fault::arm("undo", fault::Fault::Fail);
+            let err = s.commit(&plan).unwrap_err();
+            assert!(fault::unfired().is_empty(), "{:?}", fault::unfired());
+            assert_eq!(residue(&err), vec![("not-undone", path.clone())]);
+            assert_eq!(statuses(wal_dir.path()), vec![Status::Pending]);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC, "recover finishes the undo");
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
+        fn an_unfinished_write_that_changed_nothing_is_not_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let path = write_file(dir.path(), "main.go", GO_SRC);
+            // An edit whose bytes equal the file's: its step is A→A.
+            unfinished_write(wal_dir.path(), "a", &path, GO_SRC, GO_SRC);
+
+            let report = restart_and_recover(wal_dir.path());
+            assert_eq!(read_str(&path), GO_SRC);
+            assert!(report.left.is_empty(), "{report:?}");
+        }
+
+        #[test]
         fn crash_mid_multi_file_commit_undoes_only_what_it_wrote() {
             let dir = tempfile::tempdir().unwrap();
             let wal_dir = tempfile::tempdir().unwrap();
@@ -3885,6 +3943,19 @@ mod tests {
 
             let err = failing(|| s.apply_batch(&ops), "wal.mark").unwrap_err();
             assert!(matches!(err, SessionError::Wal(_)), "{err}");
+            assert_batch_before(&paths);
+            assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_batch_edit_failing_after_its_rename_is_rolled_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = tempfile::tempdir().unwrap();
+            let s = new_session(wal_dir.path());
+            let (ops, paths) = batch_ops(dir.path());
+
+            let err = failing(|| s.apply_batch(&ops), "atomicwrite.syncdir").unwrap_err();
+            assert!(matches!(err, SessionError::Write { .. }), "{err}");
             assert_batch_before(&paths);
             assert!(wal::replay(wal_dir.path()).unwrap().is_empty());
         }

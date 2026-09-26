@@ -126,7 +126,9 @@ Dependency direction: Hylla → Båge only. Båge imports nothing from Hylla.
 - Line 1 is the intent (no `v` key; Go-compatible fields, plus `after` — the raw hash each lifecycle
   op leaves at each path, `null` = absent). Later lines are `{"v":2,"applying":{path,after,before?}}`
   (written before a commit writes `path`; `before` = replaced bytes when they differ from
-  `originals[path]`) and `{"v":2,"landed":true}` (all bytes durable, written before `clear`).
+  `originals[path]`) and `{"v":2,"landed":true}` (all bytes durable, written before `clear`). A record
+  whose write or fsync fails is truncated back off the file, so a failed marker never reads as
+  `Landed`; if that truncation also fails, the record may survive.
 - `Replayed { intent, applied, status: Torn | Pending | Landed | Legacy }`. A torn LAST line reads as
   absent (a torn intent line is `Torn`). Loud `WalError`: an unknown `v`, a misshapen record, a record
   after `landed`, an unparsable line before the end, a file name that disagrees with its intent.
