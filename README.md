@@ -172,7 +172,9 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
   `rootUri`). A rename also primes the workspace by opening same-language siblings
   first, for servers that only see open files. A server still indexing can answer with
   a partial edit (a cold clangd renames the target TU alone), so a caller needing every
-  reference passes `Client::await_ready` inside a referencing file first. Cross-file
+  reference passes `Client::await_ready` inside a referencing file first. That gate is
+  necessary, not sufficient: while rust-analyzer is still loading its workspace it can
+  pass the probe and then answer empty, so an empty result is not proof of "none". Cross-file
   rename is container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
 
 ## Build gates

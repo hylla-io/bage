@@ -355,7 +355,10 @@ namespace needs `None`, or it exits when it cannot see the pid. For clangd, a mi
 on close) so a rename crosses translation units. A server still indexing may answer with a
 non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
 distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
-at a position inside a referencing file first. Container-verified for gopls, pyright, and clangd
+at a position inside a referencing file first. That gate is necessary, not sufficient: readiness is
+not monotonic while a server loads its workspace — rust-analyzer can pass the probe, then answer
+empty until its load finishes, so an empty result after the gate is still not proof of "none".
+Container-verified for gopls, pyright, and clangd
 (`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
 ### §12.6 Declared LSP session
@@ -420,7 +423,8 @@ registration) and keeps the server's `capabilities`; a method whose provider is 
 `false` fails with `LspError::Unsupported { method, capability }` and sends nothing — never an
 empty answer. Before a handshake nothing is known, so the request goes out. All four run under the
 declared `call_timeout`, `query_deadline` and `query_retry` (§12.6); an empty result still carries
-no readiness, so gate with `await_ready` first. Measured on the local servers: rust-analyzer
+no readiness, so gate with `await_ready` first — and even past that gate an empty answer is not
+proof of "none" while rust-analyzer is still loading its workspace (§12.5). Measured on the local servers: rust-analyzer
 advertises implementation but NOT type hierarchy; gopls and clangd advertise both; pyright advertises
 neither. Real-server proof: `tests/lsp_hierarchy.rs` (`BAGE_LSP_REAL_TEST=1`); a server that starts
 advertising a capability fails its `Unsupported` row loudly so it moves to the positive rows.

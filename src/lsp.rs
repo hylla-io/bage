@@ -228,6 +228,14 @@ impl StatusWatch {
         self.rules = rules;
     }
 
+    /// Keeps `params` as `method`'s latest status only when a rule watches it.
+    fn observe(&mut self, method: &str, params: Option<&Value>) {
+        if self.rules.iter().any(|rule| rule.method == method) {
+            let params = params.cloned().unwrap_or(Value::Null);
+            self.latest.insert(method.to_string(), params);
+        }
+    }
+
     /// The first declared rule the latest status matches, as (method, message).
     fn failure(&self) -> Option<(String, String)> {
         self.rules.iter().find_map(|rule| {
@@ -2098,8 +2106,11 @@ impl Client {
     /// its index answers successfully with an empty result, byte-identical to
     /// the answer for a symbol that genuinely has no definition; `null` versus
     /// `[]` does not separate them either, and neither does latency. The
-    /// caller must establish readiness ITSELF — see [`Client::await_ready`] —
-    /// and may only read an empty vec as "no definition" once it has.
+    /// caller must establish readiness ITSELF — see [`Client::await_ready`].
+    /// Passing it is necessary, NOT sufficient: while a server is still
+    /// loading its workspace, readiness is not monotonic — rust-analyzer can
+    /// resolve the probe and then answer this query empty until its load
+    /// finishes. No signal here separates that empty from "no definition".
     ///
     /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
     /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
@@ -3035,11 +3046,7 @@ fn read_loop(
                 });
                 let _ = write_frame(lock(&writer).as_mut(), &resp);
             } else {
-                let mut watch = lock(&status);
-                if watch.rules.iter().any(|rule| rule.method == method) {
-                    let params = obj.get("params").cloned().unwrap_or(Value::Null);
-                    watch.latest.insert(method.to_string(), params);
-                }
+                lock(&status).observe(method, obj.get("params"));
             }
             continue;
         }
@@ -6378,6 +6385,21 @@ mod tests {
             when: json!({"health": "error", "quiescent": true}),
             message_pointer: Some("/message".to_string()),
         }
+    }
+
+    #[test]
+    fn the_read_loop_stores_only_declared_methods() {
+        let mut statuses: Vec<(String, Value)> = (0..50)
+            .map(|i| (format!("$/noise{i}"), json!({"i": i})))
+            .collect();
+        statuses.push(server_status("ok", true, "fine"));
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(server_conn, statuses, StatusAt::Initialized);
+        let mut c = status_client(client_conn, vec![status_rule()], Duration::from_secs(10));
+        round_trip(&mut c);
+        let watch = lock(&c.status);
+        let kept: Vec<&String> = watch.latest.keys().collect();
+        assert_eq!(kept, vec!["experimental/serverStatus"]);
     }
 
     /// Handshakes against a status server, then gates. The statuses are sent
