@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bage::lsp::{self, Client, ClientConfig, LspError, LspPool};
+use bage::lsp::{self, Client, ClientConfig, LspError, LspPool, ReadyFailure};
 
 /// A stdio child that reads nothing and answers nothing for longer than any
 /// bound under test.
@@ -45,6 +45,111 @@ fn default_config_is_the_documented_defaults() {
     assert_eq!(d.exit_poll, Duration::from_millis(50));
     assert_eq!(d.process_id, Some(std::process::id()));
     assert_eq!(d.initialization_options, None);
+    assert_eq!(d.experimental_capabilities, None);
+    assert!(d.ready_failures.is_empty());
+    assert_eq!(d.stderr_tail_bytes, 16 * 1024);
+}
+
+/// rust-analyzer's status extension, as a caller declares it.
+fn rust_analyzer_failed() -> ReadyFailure {
+    ReadyFailure {
+        method: "experimental/serverStatus".to_string(),
+        when: serde_json::json!({"health": "error", "quiescent": true}),
+        message_pointer: Some("/message".to_string()),
+    }
+}
+
+/// A stdio child that writes `count` numbered lines to stderr, then hangs.
+fn noisy_server(count: u32) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "i=0; while [ $i -lt {count} ]; do echo \"line $i\" >&2; i=$((i+1)); done; sleep 30"
+        ),
+    ]
+}
+
+/// Polls `stderr_tail` until `want` shows up: the drain thread reads on its
+/// own schedule.
+fn wait_for_tail(c: &Client, want: &str) -> lsp::StderrTail {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let tail = c.stderr_tail();
+        if tail.text.contains(want) || Instant::now() > until {
+            return tail;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stderr_tail_is_bounded_and_reports_the_cut() {
+    let mut c = Client::new_stdio(&noisy_server(200)).expect("spawn sh");
+    c.configure(ClientConfig {
+        initialize_timeout: Duration::from_millis(200),
+        stderr_tail_bytes: 64,
+        shutdown_timeout: Duration::from_millis(50),
+        exit_deadline: Duration::from_millis(50),
+        ..ClientConfig::default()
+    });
+    let err = c
+        .initialize(&lsp::file_uri("/tmp").to_string())
+        .expect_err("a server that never answers cannot initialize");
+    assert!(
+        matches!(err, LspError::Timeout { .. }),
+        "the handshake error keeps its shape: {err:?}"
+    );
+    let tail = wait_for_tail(&c, "line 199");
+    assert!(tail.captured);
+    assert!(
+        tail.text.contains("line 199"),
+        "tail must end at the newest byte: {tail:?}"
+    );
+    assert!(
+        !tail.text.contains("line 0\n"),
+        "oldest output must be cut: {tail:?}"
+    );
+    assert!(
+        tail.text.len() <= 64,
+        "bound ignored: {} bytes",
+        tail.text.len()
+    );
+    let written: u64 = (0..200).map(|i| format!("line {i}\n").len() as u64).sum();
+    assert_eq!(
+        tail.dropped_bytes + tail.text.len() as u64,
+        written,
+        "every byte is either kept or counted as dropped"
+    );
+    let shown = tail.to_string();
+    assert!(
+        shown.contains("earlier bytes dropped"),
+        "cut must be reported: {shown}"
+    );
+    assert!(
+        shown.contains("server stderr") && shown.contains("line 199"),
+        "the printed tail must carry the kept bytes: {shown}"
+    );
+    let _ = c.close();
+}
+
+#[test]
+fn stderr_tail_zero_keeps_nothing_but_counts() {
+    let mut c = Client::new_stdio(&noisy_server(3)).expect("spawn sh");
+    c.configure(ClientConfig {
+        stderr_tail_bytes: 0,
+        shutdown_timeout: Duration::from_millis(50),
+        exit_deadline: Duration::from_millis(50),
+        ..ClientConfig::default()
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while c.stderr_tail().dropped_bytes < 21 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let tail = c.stderr_tail();
+    assert_eq!(tail.text, "");
+    assert_eq!(tail.dropped_bytes, 21, "3 lines of 7 bytes: {tail:?}");
+    let _ = c.close();
 }
 
 #[test]
@@ -65,6 +170,9 @@ fn configure_round_trips_every_bound() {
         initialization_options: Some(
             serde_json::json!({"preferences": {"quotePreference": "single"}}),
         ),
+        experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
+        ready_failures: vec![rust_analyzer_failed()],
+        stderr_tail_bytes: 12,
     };
     let mut c = Client::new_stdio(&silent_server()).expect("spawn sleep");
     c.configure(cfg.clone());
@@ -293,4 +401,138 @@ fn did_open_buffer_is_what_a_real_server_resolves_against() {
         eprintln!("real-server case: {}", case.name);
         run_real_case(case);
     }
+}
+
+/// A workspace MEMBER copied without its workspace: cargo cannot load it, so
+/// rust-analyzer answers every query empty and never becomes ready.
+const ORPHAN_MEMBER: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname = \"member\"\nversion.workspace = true\nedition = \"2021\"\n",
+    ),
+    (
+        "src/lib.rs",
+        "pub fn helper() -> i32 { 1 }\npub fn f() -> i32 { helper() }\n",
+    ),
+];
+
+/// Starts rust-analyzer on [`ORPHAN_MEMBER`] under `cfg` and gates on a call
+/// that a loaded workspace would resolve.
+fn await_orphan_member(cfg: ClientConfig) -> (Result<(), LspError>, Duration) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    for (rel, content) in ORPHAN_MEMBER {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().expect("parent")).expect("dirs");
+        fs::write(&p, content).expect("fixture");
+    }
+    let mut c = Client::new_stdio(&["rust-analyzer".to_string()]).expect("spawn rust-analyzer");
+    c.configure(cfg);
+    c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
+        .expect("initialize");
+    let lib = root.join("src/lib.rs");
+    // Wall clock, to line up against the timestamps in the server's own log.
+    eprintln!(
+        "await_ready starts at unix {:?}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+    );
+    let started = Instant::now();
+    let got = c.await_ready(
+        lib.to_str().expect("utf-8"),
+        ORPHAN_MEMBER[1].1,
+        1,
+        "pub fn f() -> i32 { ".len() as u32,
+    );
+    let took = started.elapsed();
+    let _ = c.close();
+    (got, took)
+}
+
+/// The printed error, not only the field, must show the server's stderr: a
+/// caller that logs the error is the reader it exists for.
+fn assert_prints_stderr(err: &LspError, stderr: &lsp::StderrTail) {
+    let shown = err.to_string();
+    let newest = stderr
+        .text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .expect("the server wrote to stderr");
+    assert!(
+        shown.contains("server stderr") && shown.contains(newest.trim_end()),
+        "printed error must carry the stderr tail ending {newest:?}: {shown}"
+    );
+}
+
+#[test]
+fn rust_analyzer_reported_failure_stops_readiness_at_once() {
+    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "SKIP rust_analyzer_reported_failure_stops_readiness_at_once: set BAGE_LSP_REAL_TEST=1 to run"
+        );
+        return;
+    }
+    let declared = ClientConfig {
+        initialize_timeout: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(30),
+        ready_deadline: Duration::from_secs(120),
+        ready_retry: Duration::from_millis(250),
+        experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
+        ready_failures: vec![rust_analyzer_failed()],
+        ..ClientConfig::default()
+    };
+    let (got, took) = await_orphan_member(declared.clone());
+    match got {
+        Err(LspError::ServerReported {
+            ref method,
+            ref message,
+            ref stderr,
+        }) => {
+            assert_eq!(method, "experimental/serverStatus");
+            assert!(
+                message.contains("Failed to load workspaces"),
+                "server message must reach the caller: {message}"
+            );
+            assert!(stderr.captured);
+            assert!(
+                stderr.text.len() <= declared.stderr_tail_bytes,
+                "stderr bound ignored"
+            );
+            assert_prints_stderr(got.as_ref().unwrap_err(), stderr);
+            eprintln!("reported in {took:?}: {}", got.as_ref().unwrap_err());
+        }
+        other => panic!("want ServerReported, got {other:?}"),
+    }
+    // The server's own workspace load bounds how soon it can report, and that
+    // stretches with machine load; the deadline is what must not be spent.
+    assert!(
+        took < declared.ready_deadline,
+        "a reported failure must end the wait, not the deadline: {took:?}"
+    );
+
+    // Undeclared: probing alone decides, exactly as before, and the deadline
+    // error carries what the server said on stderr.
+    let (got, took) = await_orphan_member(ClientConfig {
+        ready_deadline: Duration::from_secs(8),
+        experimental_capabilities: None,
+        ready_failures: Vec::new(),
+        ..declared.clone()
+    });
+    match got {
+        Err(LspError::ReadyDeadline { ref stderr, .. }) => {
+            assert!(stderr.captured);
+            assert!(
+                stderr.text.contains("workspace"),
+                "the server's own explanation must ride on the error: {stderr:?}"
+            );
+            assert_prints_stderr(got.as_ref().unwrap_err(), stderr);
+        }
+        other => panic!("want ReadyDeadline, got {other:?}"),
+    }
+    assert!(
+        took >= Duration::from_secs(8),
+        "undeclared must wait out the deadline: {took:?}"
+    );
 }

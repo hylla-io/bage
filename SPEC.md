@@ -408,7 +408,10 @@ namespace needs `None`, or it exits when it cannot see the pid. For clangd, a mi
 on close) so a rename crosses translation units. A server still indexing may answer with a
 non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
 distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
-at a position inside a referencing file first. Container-verified for gopls, pyright, and clangd
+at a position inside a referencing file first. That gate is necessary, not sufficient: readiness is
+not monotonic while a server loads its workspace — rust-analyzer can pass the probe, then answer
+empty until its load finishes, so an empty result after the gate is still not proof of "none".
+Container-verified for gopls, pyright, and clangd
 (`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
 ### §12.6 Declared LSP session
@@ -416,13 +419,15 @@ A consumer declares every time bound of a session, and what the handshake says; 
 at compile time.
 `lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
 query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
-exit_poll, process_id, initialization_options }` is applied by `Client::configure` BEFORE
+exit_poll, process_id, initialization_options, experimental_capabilities, ready_failures,
+stderr_tail_bytes }` is applied by `Client::configure` BEFORE
 `initialize` (read back with
 `Client::config`), or carried by `LspPool::with_client_config`, which configures each server
 between spawn and handshake — the only point a pooled handshake can be bounded.
 `initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
 `shutdown_timeout + exit_deadline` before killing the child. `ClientConfig::default()` holds
-bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms).
+bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms;
+no experimental capabilities, no ready failures, 16 KiB of stderr).
 The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
 time rather than defaulting silently, and ships as a minor bump.
 `initialization_options` reaches the server VERBATIM as `initializationOptions`, and an unset
@@ -433,6 +438,26 @@ acquisition is the worked case — undeclared, it runs `npm install --ignore-scr
 types-registry@latest`, reaching the network and a user cache, and only
 `initializationOptions.disableAutomaticTypingAcquisition` stops it. Accept-vs-control proof
 against the real server: `tests/lsp_typing_acquisition.rs`.
+`experimental_capabilities` reaches the server VERBATIM as `capabilities.experimental`, beside
+bage's own capabilities, and is omitted when unset.
+A server that SAYS it has failed ends `await_ready` at once. Status notifications are server
+extensions with no common shape, so the caller declares each as a `ReadyFailure { method, when,
+message_pointer }`: the method to watch, members its params must carry (recursive subset match),
+and an RFC 6901 pointer to the message (absent or unresolved = the whole params). Only the LATEST
+notification per watched method counts, so a later recovery supersedes a failure; unwatched
+notifications are dropped, and a method no longer declared forgets its last status. When the
+latest status matches, `await_ready` returns `LspError::ServerReported { method, message, stderr }`
+instead of probing to the deadline; with none declared, probing alone decides, as before.
+rust-analyzer is `experimental_capabilities: {"serverStatusNotification": true}` plus
+`method: "experimental/serverStatus"`, `when: {"health": "error", "quiescent": true}`,
+`message_pointer: "/message"` — an orphaned workspace member reports "Failed to load workspaces."
+in under a second where the undeclared gate waits out its whole deadline.
+A stdio server's stderr is drained for the child's whole life into a ring of the last
+`stderr_tail_bytes` (zero keeps nothing); `StderrTail { text, dropped_bytes, captured }` says how
+much older output was discarded, so a cut is never silent. `ReadyDeadline` and `ServerReported`
+carry it and print it; every other error keeps its shape, and `Client::stderr_tail()` reads the
+tail after any failure. A `from_conn` client has no stderr (`captured: false`). Real-server proof:
+`tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, rust-analyzer).
 Document sync is public: `Client::did_open(path, text)` (close-then-open on a re-open, per the
 spec's balanced open/close rule) and `Client::did_close(path) -> Result<bool>` (`false`, nothing
 sent, when the document is not open). Real-server proof: `tests/lsp_session.rs`
@@ -451,7 +476,8 @@ registration) and keeps the server's `capabilities`; a method whose provider is 
 `false` fails with `LspError::Unsupported { method, capability }` and sends nothing — never an
 empty answer. Before a handshake nothing is known, so the request goes out. All four run under the
 declared `call_timeout`, `query_deadline` and `query_retry` (§12.6); an empty result still carries
-no readiness, so gate with `await_ready` first. Measured on the local servers: rust-analyzer
+no readiness, so gate with `await_ready` first — and even past that gate an empty answer is not
+proof of "none" while rust-analyzer is still loading its workspace (§12.5). Measured on the local servers: rust-analyzer
 advertises implementation but NOT type hierarchy; gopls and clangd advertise both; pyright advertises
 neither. Real-server proof: `tests/lsp_hierarchy.rs` (`BAGE_LSP_REAL_TEST=1`); a server that starts
 advertising a capability fails its `Unsupported` row loudly so it moves to the positive rows.
