@@ -99,7 +99,11 @@ bage defines none of that shape and encodes no policy. So is `experimental_capab
 with it `ready_failures`: a declared status notification — rust-analyzer's
 `experimental/serverStatus` with `health: "error"`, `quiescent: true` — ends `await_ready` at
 once with `LspError::ServerReported` and the server's own message, instead of probing a server
-that has given up until the deadline. Readiness errors also carry the last
+that has given up until the deadline. `ready_signals` is the other half: a declared
+"done loading" status — rust-analyzer's `experimental/serverStatus` with `quiescent: true` —
+must match before `await_ready` sends any probe, because a probe alone passes a server that
+is still loading and will answer empty until it finishes. Undeclared, probing alone decides.
+Readiness errors also carry the last
 `stderr_tail_bytes` (16 KiB) of server stderr, cut reported; `stderr_tail()` reads it after any
 other failure (SPEC §12.6). Document sync is the caller's too:
 `did_open(path, text)` and `did_close(path)` (which returns `false` and sends nothing for a

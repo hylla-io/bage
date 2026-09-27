@@ -408,9 +408,11 @@ namespace needs `None`, or it exits when it cannot see the pid. For clangd, a mi
 on close) so a rename crosses translation units. A server still indexing may answer with a
 non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
 distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
-at a position inside a referencing file first. That gate is necessary, not sufficient: readiness is
-not monotonic while a server loads its workspace — rust-analyzer can pass the probe, then answer
-empty until its load finishes, so an empty result after the gate is still not proof of "none".
+at a position inside a referencing file first. The probe alone is necessary, not sufficient:
+readiness is not monotonic while a server loads its workspace — rust-analyzer can pass the probe,
+then answer empty until its load finishes, so an empty result after a probe-only gate is still not
+proof of "none". A declared ready signal (§12.6) narrows that window to what the server reports;
+it cannot close a reload the server has not yet announced.
 Container-verified for gopls, pyright, and clangd
 (`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
 
@@ -420,14 +422,14 @@ at compile time.
 `lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
 query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
 exit_poll, process_id, initialization_options, experimental_capabilities, ready_failures,
-stderr_tail_bytes }` is applied by `Client::configure` BEFORE
+ready_signals, stderr_tail_bytes }` is applied by `Client::configure` BEFORE
 `initialize` (read back with
 `Client::config`), or carried by `LspPool::with_client_config`, which configures each server
 between spawn and handshake — the only point a pooled handshake can be bounded.
 `initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
 `shutdown_timeout + exit_deadline` before killing the child. `ClientConfig::default()` holds
 bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms;
-no experimental capabilities, no ready failures, 16 KiB of stderr).
+no experimental capabilities, no ready failures, no ready signals, 16 KiB of stderr).
 The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
 time rather than defaulting silently, and ships as a minor bump.
 `initialization_options` reaches the server VERBATIM as `initializationOptions`, and an unset
@@ -447,11 +449,33 @@ and an RFC 6901 pointer to the message (absent or unresolved = the whole params)
 notification per watched method counts, so a later recovery supersedes a failure; unwatched
 notifications are dropped, and a method no longer declared forgets its last status. When the
 latest status matches, `await_ready` returns `LspError::ServerReported { method, message, stderr }`
-instead of probing to the deadline; with none declared, probing alone decides, as before.
+instead of probing to the deadline; with none declared, probing alone decides.
 rust-analyzer is `experimental_capabilities: {"serverStatusNotification": true}` plus
 `method: "experimental/serverStatus"`, `when: {"health": "error", "quiescent": true}`,
 `message_pointer: "/message"` — an orphaned workspace member reports "Failed to load workspaces."
 in under a second where the undeclared gate waits out its whole deadline.
+A server that SAYS it has finished loading is the other half. A probe cannot tell a loaded server
+from one mid-load: rust-analyzer resolves a declaration to itself while it rebuilds its crate
+graph, then answers `outgoingCalls` and cross-crate `definition` empty until the load ends. So the
+caller may declare `ReadySignal { method, when }` entries in `ready_signals`, matched as a
+`ReadyFailure`'s `when` is, against the LATEST notification per method. A notification with no
+params is stored as `null`, which no object matches, so `when: {}` is never met by it. `await_ready`
+sends no probe until EVERY declared signal matches; once they do, a non-empty answer ends the wait
+only if every signal still matches when it arrives — the reader applies notifications in wire
+order, so a withdrawal the server sent ahead of its answer voids that answer and the wait goes on.
+A signal never met fails the wait at `ready_deadline` with `ReadyDeadline`, whose `last` names the
+first unmet signal and the last status seen for it (`experimental/serverStatus has not reported
+{"quiescent":true}; latest: none`). A server that dies while a signal is unmet fails at once with
+`LspError::Closed`, as a probe would, rather than waiting out the deadline. With none declared,
+probing alone decides. WHAT NO GATE CLOSES: a server that answers while its signal still matches,
+and only afterwards announces a reload, passed the gate on a status it had not yet withdrawn; a
+later query may then answer empty. The signal narrows the window to what the server reports; it
+cannot see a reload the server has not announced. rust-analyzer is
+`experimental_capabilities: {"serverStatusNotification": true}` plus
+`method: "experimental/serverStatus"`, `when: {"quiescent": true}` — `quiescent` being its own
+"no pending background work which might change the status". A declared signal whose server never
+sends it (the capability left undeclared, say) holds the gate to its deadline and says why.
+Real-server proof, with that control: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`).
 A stdio server's stderr is drained for the child's whole life into a ring of the last
 `stderr_tail_bytes` (zero keeps nothing); `StderrTail { text, dropped_bytes, captured }` says how
 much older output was discarded, so a cut is never silent. `ReadyDeadline` and `ServerReported`

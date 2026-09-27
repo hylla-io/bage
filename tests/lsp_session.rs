@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bage::lsp::{self, Client, ClientConfig, LspError, LspPool, ReadyFailure};
+use bage::lsp::{self, Client, ClientConfig, LspError, LspPool, ReadyFailure, ReadySignal};
 
 /// A stdio child that reads nothing and answers nothing for longer than any
 /// bound under test.
@@ -47,6 +47,7 @@ fn default_config_is_the_documented_defaults() {
     assert_eq!(d.initialization_options, None);
     assert_eq!(d.experimental_capabilities, None);
     assert!(d.ready_failures.is_empty());
+    assert!(d.ready_signals.is_empty());
     assert_eq!(d.stderr_tail_bytes, 16 * 1024);
 }
 
@@ -56,6 +57,14 @@ fn rust_analyzer_failed() -> ReadyFailure {
         method: "experimental/serverStatus".to_string(),
         when: serde_json::json!({"health": "error", "quiescent": true}),
         message_pointer: Some("/message".to_string()),
+    }
+}
+
+/// rust-analyzer's "done loading", as a caller declares it.
+fn rust_analyzer_quiescent() -> ReadySignal {
+    ReadySignal {
+        method: "experimental/serverStatus".to_string(),
+        when: serde_json::json!({"quiescent": true}),
     }
 }
 
@@ -172,6 +181,7 @@ fn configure_round_trips_every_bound() {
         ),
         experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
         ready_failures: vec![rust_analyzer_failed()],
+        ready_signals: vec![rust_analyzer_quiescent()],
         stderr_tail_bytes: 12,
     };
     let mut c = Client::new_stdio(&silent_server()).expect("spawn sleep");
@@ -416,12 +426,25 @@ const ORPHAN_MEMBER: &[(&str, &str)] = &[
     ),
 ];
 
-/// Starts rust-analyzer on [`ORPHAN_MEMBER`] under `cfg` and gates on a call
-/// that a loaded workspace would resolve.
+/// [`ORPHAN_MEMBER`] as a crate of its own, which cargo loads.
+const LOADABLE_CRATE: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    ),
+    ORPHAN_MEMBER[1],
+];
+
 fn await_orphan_member(cfg: ClientConfig) -> (Result<(), LspError>, Duration) {
+    await_rust_crate(ORPHAN_MEMBER, cfg)
+}
+
+/// Starts rust-analyzer on `files` under `cfg` and gates on a call that a
+/// loaded workspace would resolve.
+fn await_rust_crate(files: &[(&str, &str)], cfg: ClientConfig) -> (Result<(), LspError>, Duration) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonical root");
-    for (rel, content) in ORPHAN_MEMBER {
+    for (rel, content) in files {
         let p = root.join(rel);
         fs::create_dir_all(p.parent().expect("parent")).expect("dirs");
         fs::write(&p, content).expect("fixture");
@@ -441,7 +464,7 @@ fn await_orphan_member(cfg: ClientConfig) -> (Result<(), LspError>, Duration) {
     let started = Instant::now();
     let got = c.await_ready(
         lib.to_str().expect("utf-8"),
-        ORPHAN_MEMBER[1].1,
+        files[1].1,
         1,
         "pub fn f() -> i32 { ".len() as u32,
     );
@@ -512,7 +535,7 @@ fn rust_analyzer_reported_failure_stops_readiness_at_once() {
         "a reported failure must end the wait, not the deadline: {took:?}"
     );
 
-    // Undeclared: probing alone decides, exactly as before, and the deadline
+    // Undeclared: probing alone decides, and the deadline
     // error carries what the server said on stderr.
     let (got, took) = await_orphan_member(ClientConfig {
         ready_deadline: Duration::from_secs(8),
@@ -535,4 +558,43 @@ fn rust_analyzer_reported_failure_stops_readiness_at_once() {
         took >= Duration::from_secs(8),
         "undeclared must wait out the deadline: {took:?}"
     );
+}
+
+#[test]
+fn rust_analyzer_quiescent_signal_gates_the_probe() {
+    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
+        eprintln!(
+            "SKIP rust_analyzer_quiescent_signal_gates_the_probe: set BAGE_LSP_REAL_TEST=1 to run"
+        );
+        return;
+    }
+    let declared = ClientConfig {
+        initialize_timeout: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(30),
+        ready_deadline: Duration::from_secs(120),
+        ready_retry: Duration::from_millis(250),
+        experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
+        ready_signals: vec![rust_analyzer_quiescent()],
+        ..ClientConfig::default()
+    };
+    let (got, took) = await_rust_crate(LOADABLE_CRATE, declared.clone());
+    assert!(got.is_ok(), "a loaded crate must pass the signal: {got:?}");
+    eprintln!("quiescent and resolved in {took:?}");
+
+    // Control: the signal declared, but the server never asked to send it.
+    let (got, _) = await_rust_crate(
+        LOADABLE_CRATE,
+        ClientConfig {
+            ready_deadline: Duration::from_secs(5),
+            experimental_capabilities: None,
+            ..declared
+        },
+    );
+    match got {
+        Err(LspError::ReadyDeadline { ref last, .. }) => assert_eq!(
+            last,
+            "experimental/serverStatus has not reported {\"quiescent\":true}; latest: none"
+        ),
+        other => panic!("want ReadyDeadline naming the signal, got {other:?}"),
+    }
 }
