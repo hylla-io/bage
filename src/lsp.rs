@@ -137,6 +137,29 @@ pub struct ReadyFailure {
     pub message_pointer: Option<String>,
 }
 
+/// A server status notification that means "done loading": [`Client::await_ready`]
+/// does not probe, and so cannot pass, until the LATEST such notification
+/// matches.
+///
+/// A probe alone cannot tell a loaded server from one mid-load: rust-analyzer
+/// resolves a declaration to itself while its crate graph is still being
+/// rebuilt, then answers `outgoingCalls` and cross-crate `definition` empty
+/// until the load ends. Only the server's own statement closes that window.
+/// bage knows no server: rust-analyzer, once the caller also declares
+/// `{"serverStatusNotification": true}` in
+/// [`ClientConfig::experimental_capabilities`], is
+/// `method: "experimental/serverStatus"`, `when: {"quiescent": true}`.
+/// A server that never sends it fails the wait at `ready_deadline`, naming the
+/// signal and the last status seen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadySignal {
+    /// The notification method to watch.
+    pub method: String,
+    /// Members the notification's params must carry, matched as
+    /// [`ReadyFailure::when`] is.
+    pub when: Value,
+}
+
 /// The last bytes a server wrote to stderr. Readiness errors carry it; after
 /// any other failure — a handshake that timed out, say — read it with
 /// [`Client::stderr_tail`], which leaves those errors' shape untouched. Holds
@@ -215,6 +238,7 @@ impl StderrRing {
 #[derive(Default)]
 struct StatusWatch {
     rules: Vec<ReadyFailure>,
+    signals: Vec<ReadySignal>,
     latest: HashMap<String, Value>,
 }
 
@@ -222,18 +246,44 @@ impl StatusWatch {
     /// Forgets the status of any method no longer watched: notifications for
     /// it are dropped from here on, so a value kept now would be stale if the
     /// method were watched again.
-    fn set_rules(&mut self, rules: Vec<ReadyFailure>) {
-        self.latest
-            .retain(|method, _| rules.iter().any(|rule| &rule.method == method));
+    fn set_watch(&mut self, rules: Vec<ReadyFailure>, signals: Vec<ReadySignal>) {
         self.rules = rules;
+        self.signals = signals;
+        let (rules, signals) = (&self.rules, &self.signals);
+        self.latest.retain(|method, _| {
+            rules.iter().any(|r| &r.method == method) || signals.iter().any(|s| &s.method == method)
+        });
     }
 
-    /// Keeps `params` as `method`'s latest status only when a rule watches it.
+    fn watches(&self, method: &str) -> bool {
+        self.rules.iter().any(|rule| rule.method == method)
+            || self.signals.iter().any(|signal| signal.method == method)
+    }
+
+    /// Keeps `params` as `method`'s latest status only when a rule or signal
+    /// watches it.
     fn observe(&mut self, method: &str, params: Option<&Value>) {
-        if self.rules.iter().any(|rule| rule.method == method) {
+        if self.watches(method) {
             let params = params.cloned().unwrap_or(Value::Null);
             self.latest.insert(method.to_string(), params);
         }
+    }
+
+    /// The first declared signal the latest status does not match, described
+    /// with what was last seen for it.
+    fn unmet_signal(&self) -> Option<String> {
+        self.signals.iter().find_map(|signal| {
+            let latest = self.latest.get(&signal.method);
+            if latest.is_some_and(|params| value_contains(params, &signal.when)) {
+                return None;
+            }
+            Some(format!(
+                "{} has not reported {}; latest: {}",
+                signal.method,
+                signal.when,
+                latest.map_or_else(|| "none".to_string(), Value::to_string)
+            ))
+        })
     }
 
     /// The first declared rule the latest status matches, as (method, message).
@@ -331,6 +381,10 @@ pub struct ClientConfig {
     /// with [`LspError::ServerReported`]. Default: none, so readiness is
     /// decided by probing alone.
     pub ready_failures: Vec<ReadyFailure>,
+    /// Server status notifications that must ALL match before
+    /// [`Client::await_ready`] probes. Default: none, so readiness is decided
+    /// by probing alone.
+    pub ready_signals: Vec<ReadySignal>,
     /// Bytes of server stderr kept for [`StderrTail`]. Default 16 KiB. Zero
     /// keeps nothing but still counts what was dropped.
     pub stderr_tail_bytes: usize,
@@ -354,6 +408,7 @@ impl Default for ClientConfig {
             initialization_options: None,
             experimental_capabilities: None,
             ready_failures: Vec::new(),
+            ready_signals: Vec::new(),
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
         }
     }
@@ -1472,6 +1527,7 @@ impl Client {
             initialization_options,
             experimental_capabilities,
             ready_failures,
+            ready_signals,
             stderr_tail_bytes,
         } = cfg;
         self.initialize_timeout = initialize_timeout;
@@ -1488,7 +1544,7 @@ impl Client {
         self.process_id = process_id;
         self.initialization_options = initialization_options;
         self.experimental_capabilities = experimental_capabilities;
-        lock(&self.status).set_rules(ready_failures);
+        lock(&self.status).set_watch(ready_failures, ready_signals);
         lock(&self.stderr).set_cap(stderr_tail_bytes);
     }
 
@@ -1500,6 +1556,10 @@ impl Client {
 
     /// The bounds currently in force, including any set field by field.
     pub fn config(&self) -> ClientConfig {
+        let (ready_failures, ready_signals) = {
+            let status = lock(&self.status);
+            (status.rules.clone(), status.signals.clone())
+        };
         ClientConfig {
             initialize_timeout: self.initialize_timeout,
             call_timeout: self.call_timeout,
@@ -1515,7 +1575,8 @@ impl Client {
             process_id: self.process_id,
             initialization_options: self.initialization_options.clone(),
             experimental_capabilities: self.experimental_capabilities.clone(),
-            ready_failures: lock(&self.status).rules.clone(),
+            ready_failures,
+            ready_signals,
             stderr_tail_bytes: lock(&self.stderr).cap,
         }
     }
@@ -2035,7 +2096,12 @@ impl Client {
     /// property of the SERVER, not of the probe position, but it is NOT
     /// monotonic while the server is still loading its workspace:
     /// rust-analyzer can resolve the probe, then answer the same query empty
-    /// until its load finishes. A pass here does not cover that window.
+    /// until its load finishes. A probe alone does not cover that window; a
+    /// declared [`ClientConfig::ready_signals`] narrows it — no probe is sent
+    /// until every declared signal's latest status matches, and an answer
+    /// counts only if they all still match when it arrives. A server probed
+    /// on a met signal it has not yet withdrawn can still answer stale; no
+    /// client-side gate sees a reload the server has not announced.
     ///
     /// A server that SAYS it has failed stops the wait at once: when its
     /// latest status notification matches a declared
@@ -2059,15 +2125,33 @@ impl Client {
         let mut last;
         loop {
             self.check_reported_failure()?;
-            match self.call(METHOD, params.clone(), self.call_timeout) {
-                Ok(v) => {
-                    if !decode_goto(METHOD, v)?.is_empty() {
-                        return Ok(());
-                    }
-                    last = "empty result".to_string();
+            let unmet = lock(&self.status).unmet_signal();
+            if let Some(unmet) = unmet {
+                // A dead server sends no further status: fail as a probe would.
+                if self.dead.load(Ordering::Acquire) {
+                    return Err(LspError::Closed {
+                        method: METHOD.to_string(),
+                    });
                 }
-                Err(e) if is_fatal_transport(&e) => return Err(e),
-                Err(e) => last = e.to_string(),
+                last = unmet;
+            } else {
+                match self.call(METHOD, params.clone(), self.call_timeout) {
+                    Ok(v) => {
+                        if decode_goto(METHOD, v)?.is_empty() {
+                            last = "empty result".to_string();
+                        } else {
+                            // The reader stores a status sent ahead of this
+                            // answer before delivering it: a reload the server
+                            // announced mid-probe voids the answer.
+                            match lock(&self.status).unmet_signal() {
+                                None => return Ok(()),
+                                Some(unmet) => last = unmet,
+                            }
+                        }
+                    }
+                    Err(e) if is_fatal_transport(&e) => return Err(e),
+                    Err(e) => last = e.to_string(),
+                }
             }
             self.check_reported_failure()?;
             if Instant::now() > deadline {
@@ -2107,10 +2191,11 @@ impl Client {
     /// the answer for a symbol that genuinely has no definition; `null` versus
     /// `[]` does not separate them either, and neither does latency. The
     /// caller must establish readiness ITSELF — see [`Client::await_ready`].
-    /// Passing it is necessary, NOT sufficient: while a server is still
+    /// Passing its probe is necessary, NOT sufficient: while a server is still
     /// loading its workspace, readiness is not monotonic — rust-analyzer can
     /// resolve the probe and then answer this query empty until its load
-    /// finishes. No signal here separates that empty from "no definition".
+    /// finishes. Only a declared [`ClientConfig::ready_signals`] the server
+    /// reports separates that empty from "no definition".
     ///
     /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
     /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
@@ -3037,7 +3122,8 @@ fn read_loop(
                 continue;
             }
             // A server→client REQUEST (has an id) gets method-not-found; a
-            // notification is dropped unless a declared `ReadyFailure` watches it.
+            // notification is dropped unless a declared `ReadyFailure` or
+            // `ReadySignal` watches it.
             if let Some(id) = obj.get("id") {
                 let resp = json!({
                     "jsonrpc": "2.0",
@@ -6550,6 +6636,254 @@ mod tests {
         );
     }
 
+    fn quiescent_signal() -> ReadySignal {
+        ReadySignal {
+            method: "experimental/serverStatus".to_string(),
+            when: json!({"quiescent": true}),
+        }
+    }
+
+    /// Gates under `signals`, returning the outcome and how many probes the
+    /// server saw.
+    fn await_ready_signalled(
+        statuses: Vec<(String, Value)>,
+        signals: Vec<ReadySignal>,
+    ) -> (Result<(), LspError>, usize) {
+        let (client_conn, server_conn) = conn_pair();
+        let probes = spawn_status_server(server_conn, statuses, StatusAt::Initialized);
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.ready_deadline = Duration::from_millis(120);
+        let mut cfg = c.config();
+        cfg.ready_signals = signals;
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        round_trip(&mut c);
+        let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
+        round_trip(&mut c);
+        (got, probes.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_declared_ready_signal_not_yet_sent_holds_every_probe_and_names_itself() {
+        // (statuses sent, what the error must report as last seen)
+        let cases = [
+            (Vec::new(), "latest: none"),
+            (
+                vec![server_status("ok", false, "loading")],
+                "\"message\":\"loading\"",
+            ),
+            (
+                vec![
+                    server_status("ok", true, ""),
+                    server_status("ok", false, "reloading"),
+                ],
+                "\"message\":\"reloading\"",
+            ),
+        ];
+        for (statuses, latest) in cases {
+            let (got, probes) = await_ready_signalled(statuses.clone(), vec![quiescent_signal()]);
+            assert_eq!(probes, 0, "{statuses:?}: probed a server still loading");
+            match got {
+                Err(LspError::ReadyDeadline { ref last, .. }) => {
+                    assert!(
+                        last.starts_with(
+                            "experimental/serverStatus has not reported {\"quiescent\":true}; latest: "
+                        ),
+                        "{statuses:?}: {last}"
+                    );
+                    assert!(last.contains(latest), "{statuses:?}: {last}");
+                }
+                other => panic!("{statuses:?}: want ReadyDeadline, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_declared_signal_must_match_before_a_probe() {
+        let other = ReadySignal {
+            method: "$/loaded".to_string(),
+            when: json!({"done": true}),
+        };
+        let (got, probes) = await_ready_signalled(
+            vec![server_status("ok", true, "")],
+            vec![quiescent_signal(), other],
+        );
+        assert_eq!(probes, 0, "one met signal of two let a probe through");
+        assert!(
+            matches!(got, Err(LspError::ReadyDeadline { ref last, .. })
+                if last.starts_with("$/loaded has not reported {\"done\":true}; latest: none")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_signal_declared_a_loading_status_does_not_hold_the_probe() {
+        let (got, probes) =
+            await_ready_signalled(vec![server_status("ok", false, "loading")], Vec::new());
+        assert!(probes > 0, "undeclared, probing alone decides");
+        assert!(
+            matches!(got, Err(LspError::ReadyDeadline { ref last, .. }) if last == "empty result"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_server_under_an_unmet_signal_fails_closed_at_once() {
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        // Answers the handshake, then exits on the gate's didOpen having sent
+        // no status at all.
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/didOpen" => break,
+                    _ => {}
+                }
+            }
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        let mut cfg = c.config();
+        cfg.ready_signals = vec![quiescent_signal()];
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        let start = Instant::now();
+        let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
+        assert!(
+            matches!(got, Err(LspError::Closed { ref method }) if method == "textDocument/definition"),
+            "{got:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a dead server must not wait out the {:?} deadline: {:?}",
+            c.ready_deadline,
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_signal_alone_keeps_its_status_and_unwatching_it_forgets() {
+        let mut watch = StatusWatch::default();
+        watch.set_watch(Vec::new(), vec![quiescent_signal()]);
+        let (method, quiescent) = server_status("ok", true, "");
+        watch.observe(&method, Some(&quiescent));
+        assert_eq!(watch.unmet_signal(), None);
+        assert_eq!(watch.failure(), None, "a signal is not a failure rule");
+        watch.set_watch(Vec::new(), Vec::new());
+        watch.set_watch(Vec::new(), vec![quiescent_signal()]);
+        let unmet = watch.unmet_signal().expect("forgotten status cannot meet");
+        assert!(unmet.ends_with("latest: none"), "{unmet}");
+    }
+
+    #[test]
+    fn a_paramless_notification_never_meets_an_empty_object() {
+        let mut watch = StatusWatch::default();
+        let signal = |when| ReadySignal {
+            method: "$/loaded".to_string(),
+            when,
+        };
+        watch.set_watch(Vec::new(), vec![signal(json!({}))]);
+        watch.observe("$/loaded", None);
+        let unmet = watch.unmet_signal().expect("null is not an object");
+        assert!(unmet.ends_with("latest: null"), "{unmet}");
+        watch.set_watch(Vec::new(), vec![signal(Value::Null)]);
+        assert_eq!(watch.unmet_signal(), None, "null matches null");
+    }
+
+    #[test]
+    fn a_met_ready_signal_lets_the_probe_decide() {
+        let (got, probes) = await_ready_signalled(
+            vec![
+                server_status("ok", false, "loading"),
+                server_status("ok", true, ""),
+            ],
+            vec![quiescent_signal()],
+        );
+        assert!(probes > 0, "a quiescent server must be probed");
+        assert!(
+            matches!(got, Err(LspError::ReadyDeadline { ref last, .. }) if last == "empty result"),
+            "the probe, not the signal, decides once the signal is met: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_reload_announced_ahead_of_an_answer_voids_it() {
+        const HOLD: Duration = Duration::from_millis(150);
+        let (client_conn, server_conn) = conn_pair();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&probes);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let status = |w: &mut PipeWriter, quiescent: bool| {
+                let (method, params) = server_status("ok", quiescent, "");
+                write_frame(
+                    w,
+                    &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                )
+                .unwrap();
+            };
+            let location = json!([{
+                "uri": "file:///work/dep.rs",
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 2},
+                },
+            }]);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "initialized" => status(&mut w, true),
+                    "textDocument/definition" => {
+                        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                            status(&mut w, false);
+                            reply_ok(&mut w, &id, location.clone());
+                            thread::sleep(HOLD);
+                            status(&mut w, true);
+                        } else {
+                            reply_ok(&mut w, &id, location.clone());
+                        }
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        let mut cfg = c.config();
+        cfg.ready_signals = vec![quiescent_signal()];
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        round_trip(&mut c);
+        let start = Instant::now();
+        c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3)
+            .unwrap();
+        assert!(
+            start.elapsed() >= HOLD,
+            "returned on an answer the server voided: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the answer sent under quiescent:false must not end the wait"
+        );
+    }
+
     #[test]
     fn await_ready_ignores_a_failure_status_nobody_declared() {
         let (got, _) = await_ready_under(
@@ -6627,14 +6961,14 @@ mod tests {
     #[test]
     fn unwatching_a_status_forgets_it() {
         let mut watch = StatusWatch::default();
-        watch.set_rules(vec![status_rule()]);
+        watch.set_watch(vec![status_rule()], Vec::new());
         let (method, failed) = server_status("error", true, "old failure");
         watch.latest.insert(method, failed);
         assert!(watch.failure().is_some());
         // Unwatched, a recovery notification would be dropped; re-watching
         // must not resurrect the failure it superseded.
-        watch.set_rules(Vec::new());
-        watch.set_rules(vec![status_rule()]);
+        watch.set_watch(Vec::new(), Vec::new());
+        watch.set_watch(vec![status_rule()], Vec::new());
         assert_eq!(watch.failure(), None);
     }
 
