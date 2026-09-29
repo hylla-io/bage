@@ -173,7 +173,13 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 - **Outline names** come from the grammar's own fields (`name`, `declarator`), so a C, C++, C#
   or Java declaration is named after what it declares, never its return or field type:
   `Point make_point()` → `make_point`, `Point Shape::area()` → `Shape::area`,
-  `namespace Fixture.Geo;` → `Fixture.Geo`, `int a, b;` → `a` (the first declarator).
+  `namespace Fixture.Geo;` → `Fixture.Geo`, `int a, b;` → `a` (the first declarator),
+  `operator const char *() const` → `operator const char *`. A TypeScript/JavaScript member key
+  loses its brackets and quotes only when a plain identifier or number is left (`['KEY']` →
+  `KEY`); others stay as written (`['a-b']`). A class, interface or enum body is unnamed. These
+  rules apply to a clean parse: a block whose top-level item holds a parse ERROR, or whose whole
+  file parses to an ERROR root (an unexpanded macro, C++ in a `.h` read as C), keeps exactly its
+  v0.11.0 name. Full rule: SPEC §9.4.
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
 - **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
   rust-analyzer do full cross-file rename natively; clangd is carried across translation
