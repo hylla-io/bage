@@ -265,6 +265,8 @@ makes the grammar-less open→edit→write path corruption-proof.
 - **20 tree-sitter grammars** (real parse + round-trip fixtures): Go, TypeScript, TSX,
   JavaScript, Python, Rust, Java, C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile,
   Bash, **Markdown**.
+- **Hylla's MVP code languages** are a subset: Rust, TypeScript/TSX, JavaScript, Python, Go, C,
+  C++, C#. Java and Ruby are parsed, outlined and edited by Båge but are not in Hylla's MVP.
 - **Text fallback** (lossless, no grammar): MDX, SCSS, Dockerfile, `.txt`, dotfiles, and any
   unknown type.
 - **LSP rename availability VARIES by design** — it is an accelerator, not a precondition (the
@@ -280,6 +282,62 @@ makes the grammar-less open→edit→write path corruption-proof.
   declaration nodes (grammar-agnostic, by node kind) with byte + 1-based line ranges; the
   text fallback returns one line `Symbol` per source line, and data grammars list their named
   keys (§12.4).
+- **Clean parse or misread — one rule, every code grammar.** A code `Symbol` is named by the
+  field rules below only when the top-level item holding it (the root's child it sits in)
+  contains no ERROR or MISSING node and the root itself is not an ERROR (an unbalanced
+  include guard makes it one, and then no top-level item is a unit the grammar read, however
+  clean its own nodes). Otherwise the grammar misread the code around it, and the
+  block keeps EXACTLY the name v0.11.0 gave it: the text of its first identifier-kind direct
+  child, else of the first one a level down — raw, so it may be a keyword, a type, a macro, or
+  text spanning lines with comments in it. Why: the grammar cannot expand macros and reads
+  every `.h` as C, so inside a misread its fields hold whatever word landed there (a keyword, a
+  macro, a parameter, a callee), and per-shape recovery rules fixed the cases they were written
+  for and broke code nobody had read. Keeping v0.11.0's name there changes nothing a host
+  already relied on. The rule is coarse by design: one ERROR anywhere in an include-guarded
+  header or an `extern "C" {` block puts every declaration in it on the v0.11.0 name.
+- On a clean parse, a code `Symbol`'s `name` is read from the grammar's FIELDS, never from the
+  first identifier child, because a C-family declaration starts with its type. In order: the `name` field (kept
+  whole, so qualified names survive: `Fixture.Geo`, `inner::deep`); else the `declarator` field,
+  followed through pointer / reference / array / function / parenthesized / init declarators to
+  the declared identifier (`char *dup()` → `dup`, `Point Shape::area()` → `Shape::area`,
+  `int (*get_cmp(void))(int, int)` → `get_cmp`); a declaration with several declarators takes the
+  first. An MSVC calling convention is not a declarator: `static void __cdecl f(void);` → `f`.
+  Template ids, structured bindings, nested namespaces and specializations are kept whole:
+  `f<int>`, `Vec<int>`, `[a, b]`, `a::b::c`, `Box<int>`; operator names are written as declared,
+  so `operator/` and `operator/=` contain a `/`.
+- On a clean parse a C or C++ name is one line: whitespace runs collapse to one space and
+  comments are dropped; a field-free fallback name that still holds a comment is `""`.
+- Wrappers name what they wrap: a Python `decorated_definition`, a C++ `template_declaration`
+  and a C++ `friend_declaration` take the name of what they hold (`friend class Vec<int>;` →
+  `Vec<int>`).
+- C# members without a name field are named `~Point` (destructor), `operator +`,
+  `implicit operator int`, and `this` (indexer).
+- A C++ conversion operator is `operator` plus its target type, pointer and reference kept, never
+  its parameters or qualifiers: `operator const char *() const` → `operator const char *`,
+  `operator int &()` → `operator int &`, `Widget::operator bool() const` →
+  `Widget::operator bool`.
+- A TypeScript/JavaScript member keyed by a string, number or computed key loses its brackets
+  and quotes ONLY when what is left is a plain ASCII identifier or a number: `['KEY']` → `KEY`,
+  `[42]` → `42`, `"field"` → `field`. Every other key stays exactly as written: `['a-b']`,
+  `['a/b']`, `['.env']`, `[Symbol.iterator]`, `[KEY]`, `[KEY + '2']`, `['k' /* c */]`.
+  Stripping those would put a separator into a path built from names, or make distinct keys
+  look alike.
+- A TypeScript construct signature is `new()`, as TypeScript's navigation tree names it, never
+  its return type.
+- **A clean C or C++ parse can still be a misread**: the grammar reads some unexpanded macros and
+  C++-in-a-`.h` without any ERROR. Three shapes are handled, each seen in the corpora:
+  - the declarator chain ends on a keyword (for C, the C keywords plus `operator`, which a C++
+    `operator()` read as C leaves there; other C++ keywords stay valid C names) or on a builtin
+    type spelling: `""`, except a typedef defining one (`typedef _Bool bool;` → `bool`);
+  - a keyword that names no type sits in the type slot (`export C_LIB_NAMESPACE {…}`): `""`;
+  - a definition whose declarator is bare parentheses (`do_library_init(void) {…}` after a
+    macro return type on the line before): the parentheses are the parameter list and the type
+    word is the function, `do_library_init`.
+- Named `""` besides, on a clean parse: an anonymous declaration (a C++ `namespace { }`); a
+  class, interface or enum BODY (`class_body`, `interface_body`, `enum_body`, Java
+  `enum_body_declarations`), which declares nothing, so it never takes its first member's name;
+  and a declarator chain that ends without a name. None falls back to the type.
+- Only a node whose grammar has no naming field falls back to the first-identifier search.
 
 ## 10. File-lifecycle ops: create / delete / move / batch (ADR-0004)
 

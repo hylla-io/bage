@@ -236,6 +236,14 @@ impl Tree {
     pub fn has_native(&self) -> bool {
         self.native.is_some()
     }
+
+    /// The engine's root node, when a native tree exists. Crate-internal
+    /// read-only passes use it for what the materialized [`Node`] does not
+    /// carry — the grammar's FIELD names, which say which child is a
+    /// declaration's name and which is its return type.
+    pub(crate) fn native_root(&self) -> Option<ts::Node<'_>> {
+        self.native.as_ref().map(ts::Tree::root_node)
+    }
 }
 
 /// Describes a single text edit for incremental reparsing, in the shape
