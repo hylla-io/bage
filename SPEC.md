@@ -265,6 +265,8 @@ makes the grammar-less open→edit→write path corruption-proof.
 - **20 tree-sitter grammars** (real parse + round-trip fixtures): Go, TypeScript, TSX,
   JavaScript, Python, Rust, Java, C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile,
   Bash, **Markdown**.
+- **Hylla's MVP code languages** are a subset: Rust, TypeScript/TSX, JavaScript, Python, Go, C,
+  C++, C#. Java and Ruby are parsed, outlined and edited by Båge but are not in Hylla's MVP.
 - **Text fallback** (lossless, no grammar): MDX, SCSS, Dockerfile, `.txt`, dotfiles, and any
   unknown type.
 - **LSP rename availability VARIES by design** — it is an accelerator, not a precondition (the
@@ -280,6 +282,17 @@ makes the grammar-less open→edit→write path corruption-proof.
   declaration nodes (grammar-agnostic, by node kind) with byte + 1-based line ranges; the
   text fallback returns one line `Symbol` per source line, and data grammars list their named
   keys (§12.4).
+- A code `Symbol`'s `name` is read from the grammar's FIELDS, never from the first identifier
+  child, because a C-family declaration starts with its type. In order: the `name` field (kept
+  whole, so qualified names survive: `Fixture.Geo`, `inner::deep`); else the `declarator` field,
+  followed through pointer / reference / array / function / parenthesized / init declarators to
+  the declared identifier (`char *dup()` → `dup`, `Point Shape::area()` → `Shape::area`,
+  `int (*get_cmp(void))(int, int)` → `get_cmp`); a declaration with several declarators takes the
+  first. Wrappers name what they wrap: a Python `decorated_definition` and a C++
+  `template_declaration` take their definition's name. C# members without a name field are named
+  `~Point` (destructor), `operator +`, `implicit operator int`, and `this` (indexer); a C++
+  conversion is `operator bool`. Anonymous declarations (a C++ `namespace { }`) are named `""`.
+  Only a node whose grammar has no naming field falls back to the first-identifier search.
 
 ## 10. File-lifecycle ops: create / delete / move / batch (ADR-0004)
 

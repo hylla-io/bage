@@ -70,6 +70,12 @@ Notes:
 - **`content` already exists** in Hylla's current schema (`summary`, `content`, `docstring` are universal fields today). Båge uses the raw region `content`, NOT the LLM `summary`, as the round-trip display/edit text.
 - **Byte range is authoritative**; line/col are derived conveniences. Tree-sitter provides all of them for free on every node (`start_byte`/`end_byte`/`start_point`/`end_point`), so populating them costs nothing at parse time.
 
+### 1a. Outline block names and Hylla's MVP languages
+
+- **Hylla's MVP code languages:** Rust, TypeScript/TSX, JavaScript, Python, Go, C, C++, C#. Båge also parses Java and Ruby (and the data/markup grammars in SPEC §9.3); Hylla's MVP does not ingest Java or Ruby.
+- **A `Block.name` is read from the grammar's fields**, never from the first identifier child: a C, C++, C# or Java declaration begins with its return or field TYPE, so the first identifier is the wrong name. The rule, with examples, is SPEC §9.4. In short: the `name` field kept whole (`Fixture.Geo`, `inner::deep`, `Shape::area`); else the `declarator` chain down to the declared identifier; the first declarator of a multi-declarator field; a Python `decorated_definition` or C++ `template_declaration` named after what it wraps.
+- **`name` is empty** for an anonymous declaration (a C++ `namespace { }`) and never falls back to a type name.
+
 ---
 
 ## 2. Per-FILE field Hylla MUST persist (the drift gate)

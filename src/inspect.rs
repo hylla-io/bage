@@ -3,6 +3,7 @@
 //! Everything here is strictly read-only — nothing writes to disk.
 
 use serde::{Deserialize, Serialize};
+use tree_sitter::Node as TsNode;
 
 use crate::hashing::{self, Hasher};
 use crate::parser::{Adapter, Lang, Node, ParserPort, Tree};
@@ -93,7 +94,9 @@ pub fn open_file(path: &str) -> Result<OpenedFile, InspectError> {
 /// One entry in a file's [`outline`]: a named declaration node (or, for the
 /// grammar-free text fallback, a single line). Bytes are the half-open CST
 /// range; lines are 1-based to match `EditResult` line numbering. `name` is
-/// best-effort and may be empty when no identifier child is found.
+/// read from the grammar's naming fields where it has them, so a C-family
+/// declaration is named after its declarator, never its return type; it is
+/// empty for an anonymous declaration or when no name is found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Symbol {
     /// The grammar node kind (e.g. "function_declaration"), or "line" for
@@ -124,11 +127,11 @@ pub struct Symbol {
 /// also use a "document" root, so the engine-free handle is the unambiguous
 /// discriminator.
 pub fn outline(tree: &Tree, lang: Lang) -> Vec<Symbol> {
-    if !tree.has_native() {
+    let Some(native) = tree.native_root() else {
         return outline_lines(&tree.source);
-    }
+    };
     let mut out = Vec::new();
-    walk_decls(&tree.root, &tree.source, lang, 0, &mut out);
+    walk_decls(&tree.root, Some(native), &tree.source, lang, 0, &mut out);
     out
 }
 
@@ -138,19 +141,40 @@ pub fn outline(tree: &Tree, lang: Lang) -> Vec<Symbol> {
 /// JSON pairs inside objects — are captured. `depth` is 0 for direct
 /// children of the root; TOML uses it to limit bare pairs to the top level.
 /// The root itself is never emitted.
-fn walk_decls(n: &Node, src: &[u8], lang: Lang, depth: usize, out: &mut Vec<Symbol>) {
-    for c in &n.children {
+///
+/// `tn` is the engine node `n` was materialized from, walked in lockstep so
+/// naming can read grammar fields. A child whose engine twin does not line up
+/// (a count or kind mismatch) is walked with `None` and named by the
+/// field-free fallback rather than by a wrong twin.
+fn walk_decls(
+    n: &Node,
+    tn: Option<TsNode>,
+    src: &[u8],
+    lang: Lang,
+    depth: usize,
+    out: &mut Vec<Symbol>,
+) {
+    let twins: Vec<TsNode> = match tn {
+        Some(t) => t.children(&mut t.walk()).collect(),
+        None => Vec::new(),
+    };
+    let aligned = twins.len() == n.children.len();
+    for (i, c) in n.children.iter().enumerate() {
+        let tc = twins
+            .get(i)
+            .copied()
+            .filter(|t| aligned && t.kind() == c.kind);
         if c.named && is_outline_kind(lang, &c.kind, depth) {
             out.push(Symbol {
                 kind: c.kind.clone(),
-                name: symbol_name(lang, c, src),
+                name: symbol_name(lang, c, tc, src),
                 start_byte: c.start_byte,
                 end_byte: c.end_byte,
                 start_line: c.start_point.row + 1,
                 end_line: c.end_point.row + 1,
             });
         }
-        walk_decls(c, src, lang, depth + 1, out);
+        walk_decls(c, tc, src, lang, depth + 1, out);
     }
 }
 
@@ -196,12 +220,12 @@ fn is_name_kind(kind: &str) -> bool {
     ) || kind.contains("identifier")
 }
 
-/// The declared identifier text for `n`, best-effort. It first looks at
-/// `n`'s direct named children, then — since some grammars wrap the name one
-/// level down (Go type_declaration → type_spec → type_identifier, C
-/// declaration → declarator → identifier) — at the direct named children of
-/// `n`'s named children. It stays shallow (≤2 levels) so it never grabs an
-/// identifier from a function body. Empty when none is found.
+/// The fallback name for a node whose grammar gives no naming field (see
+/// [`field_name`]), best-effort. It first looks at `n`'s direct named
+/// children, then — since some grammars wrap the name one level down (Go
+/// type_declaration → type_spec → type_identifier) — at the direct named
+/// children of `n`'s named children. It stays shallow (≤2 levels) so it never
+/// grabs an identifier from a function body. Empty when none is found.
 fn decl_name(n: &Node, src: &[u8]) -> String {
     let name = direct_name(n, src);
     if !name.is_empty() {
@@ -263,17 +287,150 @@ fn is_outline_kind(lang: Lang, kind: &str, depth: usize) -> bool {
 }
 
 /// The display name for an outline node: language-specific key/tag/selector
-/// extraction for the data-format grammars, the identifier-child search of
-/// [`decl_name`] for everything else.
-fn symbol_name(lang: Lang, n: &Node, src: &[u8]) -> String {
+/// extraction for the data-format grammars; for code, the grammar's own
+/// field names via [`field_name`], and the identifier-child search of
+/// [`decl_name`] only for a node whose grammar gives no naming field.
+fn symbol_name(lang: Lang, n: &Node, tn: Option<TsNode>, src: &[u8]) -> String {
     match lang {
         Lang::Json => json_key_name(n, src),
         Lang::Yaml | Lang::Toml => first_named_child_text(n, src),
         Lang::Xml => tag_name(n, src, "Name"),
         Lang::Html => tag_name(n, src, "tag_name"),
         Lang::Css => child_kind_text(n, src, "selectors").trim().to_string(),
-        _ => decl_name(n, src),
+        _ => tn
+            .and_then(|t| field_name(lang, t, src))
+            .unwrap_or_else(|| decl_name(n, src)),
     }
+}
+
+/// A declaration's name read from the grammar's FIELDS, or `None` when the
+/// node carries no naming field and the caller must fall back.
+///
+/// Fields are the only reliable signal in the C family: a C, C++, C# or Java
+/// declaration starts with its return or field TYPE, so the first identifier
+/// child is the type (`Point make_point()` is not named `Point`). The `name`
+/// field wins; otherwise a `declarator` field is followed down to the
+/// declared identifier. `Some("")` means the grammar was consulted and the
+/// node declares nothing nameable — an anonymous namespace, an abstract
+/// declarator — which must not fall back to a type name.
+fn field_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
+    match (lang, n.kind()) {
+        (Lang::Python, "decorated_definition") => {
+            return field_name(lang, n.child_by_field_name("definition")?, src);
+        }
+        (Lang::Cpp, "template_declaration" | "friend_declaration") => {
+            let inner = last_named_child(n, &["template_parameter_list", "requires_clause"])?;
+            return field_name(lang, inner, src).or_else(|| declarator_name(inner, src));
+        }
+        (Lang::CSharp, "field_declaration" | "event_field_declaration") => {
+            let decl = n
+                .named_children(&mut n.walk())
+                .find(|c| c.kind() == "variable_declaration")?;
+            return field_name(lang, decl, src);
+        }
+        (Lang::CSharp, "variable_declaration") => {
+            let first = n
+                .named_children(&mut n.walk())
+                .find(|c| c.kind() == "variable_declarator")?;
+            return Some(ts_text(first.child_by_field_name("name")?, src));
+        }
+        (Lang::CSharp, "destructor_declaration") => {
+            return Some(format!("~{}", ts_text(n.child_by_field_name("name")?, src)));
+        }
+        (Lang::CSharp, "operator_declaration") => {
+            let start = keyword_start(n, &["operator"])?;
+            let end = n.child_by_field_name("operator")?.end_byte();
+            return Some(slice_text(src, start, end));
+        }
+        (Lang::CSharp, "conversion_operator_declaration") => {
+            let start = keyword_start(n, &["implicit", "explicit", "operator"])?;
+            let end = n.child_by_field_name("type")?.end_byte();
+            return Some(slice_text(src, start, end));
+        }
+        (Lang::CSharp, "indexer_declaration") => return Some("this".to_string()),
+        _ => {}
+    }
+    if let Some(name) = n.child_by_field_name("name") {
+        return Some(ts_text(name, src));
+    }
+    let declarator = n.child_by_field_name("declarator")?;
+    Some(declarator_name(declarator, src).unwrap_or_default())
+}
+
+/// The identifier a C/C++/Java declarator declares, following the grammar's
+/// `declarator` field through pointer, reference, array, function,
+/// parenthesized and init declarators. Qualified and operator names are kept
+/// whole (`Shape::area`, `operator==`). `None` when the chain ends without a
+/// name, as an abstract declarator does.
+fn declarator_name(mut d: TsNode, src: &[u8]) -> Option<String> {
+    loop {
+        match d.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "primitive_type"
+            | "qualified_identifier"
+            | "operator_name"
+            | "destructor_name"
+            | "template_function"
+            | "template_method"
+            | "template_type"
+            | "structured_binding_declarator" => return Some(ts_text(d, src)),
+            // `operator bool()`: the name is the keyword plus the target type,
+            // everything before the abstract declarator holding the parameters.
+            "operator_cast" => {
+                let end = d
+                    .child_by_field_name("declarator")
+                    .map_or(d.end_byte(), |a| a.start_byte());
+                return Some(slice_text(src, d.start_byte(), end).trim().to_string());
+            }
+            "parenthesized_declarator"
+            | "reference_declarator"
+            | "attributed_declarator"
+            | "variadic_declarator" => {
+                d = d.named_children(&mut d.walk()).find(|c| {
+                    !matches!(
+                        c.kind(),
+                        "attribute_declaration" | "ms_call_modifier" | "type_qualifier"
+                    )
+                })?;
+            }
+            _ => {
+                if let Some(next) = d.child_by_field_name("declarator") {
+                    d = next;
+                } else {
+                    return Some(ts_text(d.child_by_field_name("name")?, src));
+                }
+            }
+        }
+    }
+}
+
+/// The last named child of `n` whose kind is not in `skip`.
+fn last_named_child<'t>(n: TsNode<'t>, skip: &[&str]) -> Option<TsNode<'t>> {
+    n.named_children(&mut n.walk())
+        .filter(|c| !skip.contains(&c.kind()))
+        .last()
+}
+
+/// The start byte of `n`'s first anonymous keyword child among `keywords`.
+fn keyword_start(n: TsNode, keywords: &[&str]) -> Option<usize> {
+    n.children(&mut n.walk())
+        .find(|c| !c.is_named() && keywords.contains(&c.kind()))
+        .map(|c| c.start_byte())
+}
+
+/// The source text of an engine node, bounds-guarded.
+fn ts_text(n: TsNode, src: &[u8]) -> String {
+    slice_text(src, n.start_byte(), n.end_byte())
+}
+
+/// `src[start..end]` as text; empty when the range does not fit `src`.
+fn slice_text(src: &[u8], start: usize, end: usize) -> String {
+    if start > end || end > src.len() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&src[start..end]).into_owned()
 }
 
 /// The raw source text of `n`, bounds-guarded; empty when the node's byte
@@ -1108,5 +1265,385 @@ mod tests {
         assert!(got.contains(&"impl_item:S".to_string()), "{got:?}");
         assert!(got.contains(&"function_item:m".to_string()), "{got:?}");
         assert!(got.contains(&"function_item:f".to_string()), "{got:?}");
+    }
+
+    /// The names of every outline symbol of `kind` in a file named `file`
+    /// holding `src`, in source order.
+    fn names_of(file: &str, src: &str, kind: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_temp(&dir, file, src.as_bytes());
+        let opened = open_file(&p).unwrap();
+        assert!(
+            parse_health(&opened).is_empty(),
+            "fixture {file} must parse cleanly: {:?}",
+            parse_health(&opened)
+        );
+        outline(&opened.tree, opened.lang)
+            .into_iter()
+            .filter(|s| s.kind == kind)
+            .map(|s| s.name)
+            .collect()
+    }
+
+    const C_SRC: &str = "\
+typedef struct Point { int x; int y; } Point;
+struct Node { struct Node *next; int (*cb)(int); };
+typedef int (*cmp_fn)(int, int);
+typedef unsigned long ulong;
+int count;
+int first, second;
+static const char *names[4];
+Point origin = {0, 0};
+int total(void) { return 0; }
+Point make_point(int x, int y) { Point p = {x, y}; return p; }
+struct Point make_struct(void) { struct Point p; return p; }
+char *dup(const char *s) { return 0; }
+unsigned long long big(void) { return 0; }
+int (*get_cmp(void))(int, int) { return 0; }
+Point decl_only(int x);
+Point *ptr_decl(void);
+";
+
+    #[test]
+    fn c_function_names_skip_the_return_type() {
+        assert_eq!(
+            names_of("a.c", C_SRC, "function_definition"),
+            [
+                "total",
+                "make_point",
+                "make_struct",
+                "dup",
+                "big",
+                "get_cmp"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_declaration_names_come_from_the_declarator() {
+        assert_eq!(
+            names_of("a.c", C_SRC, "declaration"),
+            [
+                "count",
+                "first",
+                "names",
+                "origin",
+                "p",
+                "p",
+                "decl_only",
+                "ptr_decl"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_typedef_and_field_names_come_from_the_declarator() {
+        assert_eq!(
+            names_of("a.c", C_SRC, "type_definition"),
+            ["Point", "cmp_fn", "ulong"]
+        );
+        assert_eq!(
+            names_of("a.c", C_SRC, "field_declaration"),
+            ["x", "y", "next", "cb"]
+        );
+    }
+
+    const CPP_SRC: &str = "\
+namespace geo {
+namespace inner::deep {
+struct Point { int x; int y; };
+}
+class Shape : public Base {
+public:
+    Shape();
+    ~Shape();
+    Point area() const;
+    virtual std::string name() const = 0;
+    Shape &operator=(const Shape &o);
+    bool operator==(const Shape &o) const;
+    operator bool() const;
+    int count;
+    static const int kMax = 4;
+    Point *ptr;
+    int &ref();
+};
+Point make_point(int x, int y) { return Point{x, y}; }
+std::string label() { return \"\"; }
+const Point &ref_point() { static Point p; return p; }
+Point *ptr_point() { return nullptr; }
+Point Shape::area() const { return Point{}; }
+Shape::Shape() {}
+Shape::~Shape() {}
+bool Shape::operator==(const Shape &o) const { return true; }
+template <typename T> T identity(T t) { return t; }
+template <typename T> class Box { T v; };
+std::vector<int> vec() { return {}; }
+auto trailing() -> int { return 0; }
+using Alias = int;
+}
+namespace {
+int hidden() { return 0; }
+}
+";
+
+    #[test]
+    fn cpp_function_names_skip_the_return_type() {
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "function_definition"),
+            [
+                "make_point",
+                "label",
+                "ref_point",
+                "ptr_point",
+                "Shape::area",
+                "Shape::Shape",
+                "Shape::~Shape",
+                "Shape::operator==",
+                "identity",
+                "vec",
+                "trailing",
+                "hidden",
+            ]
+        );
+    }
+
+    #[test]
+    fn cpp_member_names_come_from_the_declarator() {
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "field_declaration"),
+            [
+                "x",
+                "y",
+                "area",
+                "name",
+                "operator=",
+                "operator==",
+                "count",
+                "kMax",
+                "ptr",
+                "ref",
+                "v",
+            ]
+        );
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "declaration"),
+            ["Shape", "~Shape", "operator bool", "p"]
+        );
+    }
+
+    #[test]
+    fn cpp_namespaces_templates_and_aliases_are_named() {
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "namespace_definition"),
+            ["geo", "inner::deep", ""]
+        );
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "template_declaration"),
+            ["identity", "Box"]
+        );
+        assert_eq!(
+            names_of("a.cpp", CPP_SRC, "class_specifier"),
+            ["Shape", "Box"]
+        );
+        assert_eq!(names_of("a.cpp", CPP_SRC, "alias_declaration"), ["Alias"]);
+    }
+
+    const CS_FILE_SCOPED_SRC: &str = "\
+namespace Fixture.Geo;
+
+public class Point<T> : Base, IShape
+{
+    private int count;
+    private string label = \"x\", other;
+    public List<string> Items;
+    public int Prop { get; set; }
+    public event EventHandler Changed;
+    public Point(int c) { count = c; }
+    ~Point() {}
+    Point Make() { return null; }
+    int Total() { return 0; }
+    List<string> Names() { return null; }
+    int[] Arr() { return null; }
+    System.Text.StringBuilder Qualified() { return null; }
+    void IShape.Explicit() {}
+    public static Point operator +(Point a, Point b) { return a; }
+    public static implicit operator int(Point p) { return 0; }
+    public int this[int i] => 0;
+    public delegate Point Del(int x);
+}
+";
+
+    const CS_BLOCK_SRC: &str = "\
+namespace Block.Scoped
+{
+    struct S { }
+    interface IShape { Point Area(); }
+    enum Color { Red, Green }
+    record R(int A);
+}
+namespace Outer { namespace Inner { class C { } } }
+";
+
+    #[test]
+    fn csharp_method_names_skip_the_return_type() {
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "method_declaration"),
+            ["Make", "Total", "Names", "Arr", "Qualified", "Explicit"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_BLOCK_SRC, "method_declaration"),
+            ["Area"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "delegate_declaration"),
+            ["Del"]
+        );
+    }
+
+    #[test]
+    fn csharp_namespaces_keep_their_qualified_name() {
+        assert_eq!(
+            names_of(
+                "a.cs",
+                CS_FILE_SCOPED_SRC,
+                "file_scoped_namespace_declaration"
+            ),
+            ["Fixture.Geo"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_BLOCK_SRC, "namespace_declaration"),
+            ["Block.Scoped", "Outer", "Inner"]
+        );
+    }
+
+    #[test]
+    fn csharp_fields_are_named_after_their_first_declarator() {
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "field_declaration"),
+            ["count", "label", "Items"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "event_field_declaration"),
+            ["Changed"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "variable_declaration"),
+            ["count", "label", "Items", "Changed"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "property_declaration"),
+            ["Prop"]
+        );
+    }
+
+    #[test]
+    fn csharp_constructors_destructors_and_operators_are_named() {
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "constructor_declaration"),
+            ["Point"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "destructor_declaration"),
+            ["~Point"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "operator_declaration"),
+            ["operator +"]
+        );
+        assert_eq!(
+            names_of(
+                "a.cs",
+                CS_FILE_SCOPED_SRC,
+                "conversion_operator_declaration"
+            ),
+            ["implicit operator int"]
+        );
+        assert_eq!(
+            names_of("a.cs", CS_FILE_SCOPED_SRC, "indexer_declaration"),
+            ["this"]
+        );
+    }
+
+    const JAVA_SRC: &str = "\
+package fixture.geo;
+
+public class Geo<T> extends Base implements Shape {
+    private int count;
+    private String label = \"x\", other;
+    public static final List<String> NAMES = null;
+    int[] grid;
+    public Geo(int c) { this.count = c; }
+    String report() { return \"\"; }
+    int total() { return 0; }
+    List<String> names() { return null; }
+    <U> Map<String, U> generic(U u) { return null; }
+    int[] arr() { return null; }
+    java.util.List<String> qualified() { return null; }
+    void run() {}
+    interface Inner { Point make(); int CONST = 1; }
+    enum Color { RED, GREEN }
+    record Pair(int a, int b) { Pair { } }
+    @interface Ann { String value(); }
+}
+";
+
+    #[test]
+    fn java_method_names_skip_the_return_type() {
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "method_declaration"),
+            [
+                "report",
+                "total",
+                "names",
+                "generic",
+                "arr",
+                "qualified",
+                "run",
+                "make"
+            ]
+        );
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "annotation_type_element_declaration"),
+            ["value"]
+        );
+    }
+
+    #[test]
+    fn java_fields_and_constructors_are_named() {
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "field_declaration"),
+            ["count", "label", "NAMES", "grid"]
+        );
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "constant_declaration"),
+            ["CONST"]
+        );
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "constructor_declaration"),
+            ["Geo"]
+        );
+        assert_eq!(
+            names_of("A.java", JAVA_SRC, "compact_constructor_declaration"),
+            ["Pair"]
+        );
+    }
+
+    #[test]
+    fn python_decorated_definitions_take_the_definition_name() {
+        let src = "\
+@staticmethod
+def deco():
+    pass
+
+@dataclass
+class Model(Base):
+    @property
+    def value(self) -> int:
+        return 0
+";
+        assert_eq!(
+            names_of("a.py", src, "decorated_definition"),
+            ["deco", "Model", "value"]
+        );
     }
 }

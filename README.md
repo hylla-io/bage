@@ -168,6 +168,12 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 
 - **Grammars (20, parse + round-trip):** Go, TypeScript, TSX, JavaScript, Python, Rust, Java,
   C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
+- **Hylla's MVP code languages** are a subset of these: Rust, TypeScript/TSX, JavaScript,
+  Python, Go, C, C++ and C#. Båge parses Java and Ruby too; Hylla's MVP does not ingest them.
+- **Outline names** come from the grammar's own fields (`name`, `declarator`), so a C, C++, C#
+  or Java declaration is named after what it declares, never its return or field type:
+  `Point make_point()` → `make_point`, `Point Shape::area()` → `Shape::area`,
+  `namespace Fixture.Geo;` → `Fixture.Geo`, `int a, b;` → `a` (the first declarator).
 - **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
 - **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
   rust-analyzer do full cross-file rename natively; clangd is carried across translation
