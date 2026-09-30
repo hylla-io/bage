@@ -265,8 +265,11 @@ makes the grammar-less open→edit→write path corruption-proof.
 - **20 tree-sitter grammars** (real parse + round-trip fixtures): Go, TypeScript, TSX,
   JavaScript, Python, Rust, Java, C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile,
   Bash, **Markdown**.
-- **Hylla's MVP code languages** are a subset: Rust, TypeScript/TSX, JavaScript, Python, Go, C,
-  C++, C#. Java and Ruby are parsed, outlined and edited by Båge but are not in Hylla's MVP.
+- **Hylla's MVP code languages** are a subset: Rust, TypeScript/TSX, JavaScript, Python, Go.
+  Every grammar above is still parsed, outlined and edited by Båge.
+- **Outline names are verified** against each language's server for those five only. C and C++
+  names are unreliable on macro-heavy code and on code the grammar misreads (C++ in a `.h` is
+  read as C); C# names are lightly measured; Java and Ruby names are unmeasured.
 - **Text fallback** (lossless, no grammar): MDX, SCSS, Dockerfile, `.txt`, dotfiles, and any
   unknown type.
 - **LSP rename availability VARIES by design** — it is an accelerator, not a precondition (the
@@ -324,6 +327,25 @@ makes the grammar-less open→edit→write path corruption-proof.
   look alike.
 - A TypeScript construct signature is `new()`, as TypeScript's navigation tree names it, never
   its return type.
+- A TypeScript/JavaScript arrow function, function expression, generator expression or class
+  expression is named by the binding that holds it, never by a word from its parameters or body:
+  the variable (`const f = () => …` → `f`); the assignment's left side, its last property when
+  it is a member (`this.parseArg = (arg) => …` → `parseArg`, `obj.x = function () {}` → `x`,
+  `g.R ??= class {}` → `R`); an object key or class field key, by the member-key rule above
+  (`{ onload: () => … }` → `onload`, `{ 'on-error': … }` → `'on-error'`, `onClick = () => …` →
+  `onClick`). Parentheses, `as`, `satisfies` and `!` around it are seen through. Otherwise it is
+  bound to no plain name — a callback, an argument, a default value, a returned value, a
+  computed target (`handlers[k] = () => …`) — and is `""` unless it spells its own name
+  (`function helper() {}` → `helper`, `class Named {}` → `Named`).
+- A Rust `impl` is named by its `type` field as written, whitespace collapsed and comments
+  dropped (`impl BlobRef` → `BlobRef`, `impl<T> Wrapper<T>` → `Wrapper<T>`). A trait impl is that
+  type qualified by its trait, as Rust spells it: `impl Validate for BlobRef` →
+  `<BlobRef as Validate>`, `impl<T> From<T> for Wrapper<T>` → `<Wrapper<T> as From<T>>`,
+  `impl !Send for X` → `<X as !Send>`. Why: one type commonly has an inherent impl and several
+  trait impls in one file whose methods share names (`fmt` under `Display` and `Debug`); a host
+  that keys a member by its containers' names can tell them apart only when the impls' names
+  differ. Two impls with the same type AND trait (different generic bounds) can still share a
+  name.
 - **A clean C or C++ parse can still be a misread**: the grammar reads some unexpanded macros and
   C++-in-a-`.h` without any ERROR. Three shapes are handled, each seen in the corpora:
   - the declarator chain ends on a keyword (for C, the C keywords plus `operator`, which a C++

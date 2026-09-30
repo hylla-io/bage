@@ -409,6 +409,109 @@ fn member_key_name(key: TsNode, src: &[u8]) -> String {
     }
 }
 
+/// The TypeScript/JavaScript EXPRESSIONS that are outline units: arrow
+/// functions, function and generator expressions, and class expressions. An
+/// expression declares nothing itself, so its name comes from where it is
+/// bound (see [`js_expression_name`]).
+const JS_EXPRESSION_KINDS: [&str; 5] = [
+    "arrow_function",
+    "function_expression",
+    "function",
+    "generator_function",
+    "class",
+];
+
+/// The wrappers that leave an expression bound where it is: `(f)`,
+/// `f as T`, `f satisfies T`, `f!`. A binding seen through one still names
+/// the expression inside.
+const JS_TRANSPARENT_KINDS: [&str; 4] = [
+    "parenthesized_expression",
+    "as_expression",
+    "satisfies_expression",
+    "non_null_expression",
+];
+
+/// A TypeScript/JavaScript function or class expression's name, from the
+/// binding that holds it: the variable (`const f = () => …` → `f`), the
+/// assignment target's last property (`this.parseArg = (arg) => …` →
+/// `parseArg`, `obj.x = function () {}` → `x`, `g.R ??= class {}` → `R`),
+/// or the object or class key (`{ onload: () => … }` → `onload`,
+/// `onClick = () => …` in a class body → `onClick`). These are the names
+/// TypeScript's own navigation tree gives them. Anything else — a callback,
+/// an argument, a returned value, a default value, a computed target
+/// (`handlers[id] = () => …`) — is bound to no plain name, so it is unnamed
+/// unless it spells its own (`function helper() {}`, `class Named {}`). A
+/// word from its parameters or body is never its name: a callback that took
+/// one would carry whatever it happened to mention first.
+fn js_expression_name(n: TsNode, src: &[u8]) -> String {
+    let own = || {
+        n.child_by_field_name("name")
+            .map(|t| ts_text(t, src))
+            .unwrap_or_default()
+    };
+    let mut held = n;
+    let mut parent = n.parent();
+    while let Some(p) = parent.filter(|p| JS_TRANSPARENT_KINDS.contains(&p.kind())) {
+        if p.named_child(0) != Some(held) {
+            return own();
+        }
+        held = p;
+        parent = p.parent();
+    }
+    let Some(p) = parent else { return own() };
+    let holds = |field: &str| p.child_by_field_name(field) == Some(held);
+    let bound = match p.kind() {
+        "variable_declarator" if holds("value") => p
+            .child_by_field_name("name")
+            .filter(|t| t.kind() == "identifier")
+            .map(|t| ts_text(t, src)),
+        "assignment_expression" | "augmented_assignment_expression" if holds("right") => p
+            .child_by_field_name("left")
+            .and_then(|left| match left.kind() {
+                "identifier" => Some(ts_text(left, src)),
+                "member_expression" => left
+                    .child_by_field_name("property")
+                    .map(|t| ts_text(t, src)),
+                _ => None,
+            }),
+        "pair" if holds("value") => p
+            .child_by_field_name("key")
+            .map(|k| member_key_name(k, src)),
+        "public_field_definition" | "field_definition" if holds("value") => p
+            .child_by_field_name("name")
+            .or_else(|| p.child_by_field_name("property"))
+            .map(|k| member_key_name(k, src)),
+        _ => None,
+    };
+    bound.unwrap_or_else(own)
+}
+
+/// A Rust impl block's name: the type it implements for, as written
+/// (`BlobRef`, `Wrapper<T>`, `fmt::Formatter`), and for a trait impl the
+/// type qualified by its trait the way Rust itself spells it
+/// (`<BlobRef as Validate>`, `<X as !Send>`). One type commonly carries an
+/// inherent impl and several trait impls in one file, each with methods of
+/// the same name (`fmt` under both `Display` and `Debug`); a host that keys a
+/// member by the names of its containers can only tell those members apart
+/// when each impl's name differs. `None` when the grammar gives no `type`.
+fn rust_impl_name(n: TsNode, src: &[u8]) -> Option<String> {
+    let text = |t: TsNode| {
+        uncommented_text(t, t.start_byte(), t.end_byte(), src)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let ty = text(n.child_by_field_name("type")?);
+    let Some(tr) = n.child_by_field_name("trait") else {
+        return Some(ty);
+    };
+    let negative = n
+        .children(&mut n.walk())
+        .any(|c| !c.is_named() && c.kind() == "!");
+    let bang = if negative { "!" } else { "" };
+    Some(format!("<{ty} as {bang}{}>", text(tr)))
+}
+
 /// `text` without its first and last character when both are the same
 /// ASCII quote.
 fn unquote(text: &str) -> Option<&str> {
@@ -474,6 +577,12 @@ fn field_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
         (Lang::TypeScript | Lang::Tsx, "construct_signature") => {
             return Some("new()".to_string());
         }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, kind)
+            if JS_EXPRESSION_KINDS.contains(&kind) =>
+        {
+            return Some(js_expression_name(n, src));
+        }
+        (Lang::Rust, "impl_item") => return rust_impl_name(n, src),
         (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, kind)
             if JS_MEMBER_KINDS.contains(&kind) =>
         {
@@ -1718,6 +1827,102 @@ mod tests {
         assert!(got.contains(&"impl_item:S".to_string()), "{got:?}");
         assert!(got.contains(&"function_item:m".to_string()), "{got:?}");
         assert!(got.contains(&"function_item:f".to_string()), "{got:?}");
+    }
+
+    const JS_EXPR_SRC: &str = "\
+const parse = (arg) => arg.trim();
+let load = function (url) { return fetch(url); };
+class Cli {
+  constructor() {
+    this.parseArg = (arg) => arg.length;
+  }
+  onClick = () => this.render();
+}
+obj.handler = function () { return helper(); };
+const hooks = { onload: () => start(), 'on-error': (e) => report(e) };
+items.map((item) => item.id);
+items.forEach(function named(x) { use(x); });
+const Model = class extends Base { run() {} };
+register(class { go() {} });
+const typed = ((x) => x);
+globalThis.Observer ??= class { observe() {} };
+function View({ open = () => show() }, done = () => stop()) {}
+";
+
+    #[test]
+    fn js_arrow_and_function_expressions_are_named_by_their_binding() {
+        for file in ["a.js", "a.ts", "a.tsx"] {
+            assert_eq!(
+                names_of(file, JS_EXPR_SRC, "arrow_function"),
+                [
+                    "parse",
+                    "parseArg",
+                    "onClick",
+                    "onload",
+                    // A key that is no plain identifier stays as written.
+                    "'on-error'",
+                    "",
+                    "typed",
+                    // Default values name nothing, as in TypeScript's tree.
+                    "",
+                    ""
+                ],
+                "{file}"
+            );
+            assert_eq!(
+                names_of(file, JS_EXPR_SRC, "function_expression"),
+                ["load", "handler", "named"],
+                "{file}"
+            );
+            assert_eq!(
+                names_of(file, JS_EXPR_SRC, "class"),
+                ["Model", "", "Observer"],
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_callback_arrow_takes_no_word_from_its_body() {
+        let src = "\
+list.filter((node) => node.visible).map((n) => n.id);
+handlers[key] = () => fired.push(key);
+";
+        for file in ["a.js", "a.ts", "a.tsx"] {
+            assert_eq!(
+                names_of(file, src, "arrow_function"),
+                ["", "", ""],
+                "{file}"
+            );
+        }
+    }
+
+    const RUST_IMPL_SRC: &str = "\
+struct BlobRef;
+struct Wrapper<T>(T);
+impl BlobRef { fn new() -> Self { BlobRef } }
+impl Validate for BlobRef { fn validate(&self) {} }
+impl std::fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
+}
+impl<T: Clone> Wrapper<T> { fn get(&self) -> T { self.0.clone() } }
+impl<T> From<T> for Wrapper<T> { fn from(t: T) -> Self { Wrapper(t) } }
+impl !Send for BlobRef {}
+";
+
+    #[test]
+    fn rust_impls_are_named_by_type_and_qualified_by_trait() {
+        assert_eq!(
+            names_of("a.rs", RUST_IMPL_SRC, "impl_item"),
+            [
+                "BlobRef",
+                "<BlobRef as Validate>",
+                "<BlobRef as std::fmt::Display>",
+                "Wrapper<T>",
+                "<Wrapper<T> as From<T>>",
+                "<BlobRef as !Send>",
+            ]
+        );
     }
 
     /// The names of every outline symbol of `kind` in a file named `file`

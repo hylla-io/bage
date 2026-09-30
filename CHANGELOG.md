@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.13.0 — expression and impl names (contract change)
+
+**A CONTRACT change to `Symbol.name` / `Block.name`** (SPEC §9.4, HYLLA_NODE_CONTRACT §1a) for
+two kinds of block. Kinds, byte ranges, lines and `region_hash` are unchanged. A host that
+builds ids from names (Hylla) sees these nodes renamed. Misread items keep their v0.11.0 names,
+as in 0.12.0.
+
+### TypeScript / TSX / JavaScript: function and class expressions
+
+- **Named by the binding that holds them**, never by a word from their parameters or body:
+  `const f = () => …` → `f`; `this.parseArg = (arg) => …` → `parseArg`;
+  `obj.x = function () {}` → `x`; `{ onload: () => … }` → `onload`; `onClick = () => …` in a
+  class → `onClick`; `const Model = class {}` → `Model`.
+- **A callback is unnamed** (`""`), as are default values and computed targets. A function or
+  class that spells its own name keeps it (`function helper() {}`).
+- **Before**, an arrow took the first identifier in its parameters or body: `(node) =>
+  node.visible` was named `node`.
+
+### Rust: impl blocks
+
+- **Named by the type**, not the trait: `impl BlobRef` → `BlobRef`, `impl<T> Wrapper<T>` →
+  `Wrapper<T>`.
+- **A trait impl is `<Type as Trait>`**: `impl Validate for BlobRef` → `<BlobRef as Validate>`.
+  So `fmt` under `Display` and `fmt` under `Debug` sit under differently named impls.
+- **Before**, a trait impl took the trait's name (`Validate`), and `impl<T> W<T>` could take `T`.
+
+### Languages
+
+- **Hylla's MVP code languages are now Rust, TypeScript/TSX, JavaScript, Python and Go.** Their
+  outline names are verified against each language's server.
+- **C, C++ and C# leave Hylla's MVP.** Båge still ships and parses every grammar.
+- **Known unreliable:** C and C++ names on macro-heavy or misread code (C++ in a `.h` is read
+  as C). C# names are lightly measured.
+
+**Measured** on Hylla's own tree (`app/src` TS/TSX, `crates/**/*.rs`), old rule vs new, each
+block compared with a reference namer:
+
+| units | blocks | old matches reference | new matches reference |
+| --- | ---: | ---: | ---: |
+| TS/JS arrow functions | 11,339 | 7,400 | 11,280 |
+| — of those the reference names | 2,086 | 16 | 2,042 |
+| TS/JS class expressions | 38 | 12 | 34 |
+| TS/JS function expressions | 32 | 29 | 30 |
+| Rust impls | 1,073 | 609 | 1,073 |
+
+- **Reference, TS/JS:** the TypeScript 5.9.3 compiler's `getNameOfDeclaration`.
+- **Reference, Rust:** `rust-analyzer symbols` labels (`impl T for X` read as `<X as T>`).
+- **The remaining TS/JS differences are by rule:** 35 string keys that are not plain identifiers
+  stay quoted (`"tab.next"`); class-field and member-assigned expressions are named where
+  TypeScript's compiler leaves them unnamed; 13 arrows sit in misread items and keep old names.
+
 ## 0.12.0 — outline names (contract change)
 
 **Every change below is a CONTRACT change to `Symbol.name` / `Block.name`** (SPEC §9.4,
