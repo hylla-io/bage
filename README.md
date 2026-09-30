@@ -169,14 +169,22 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 - **Grammars (20, parse + round-trip):** Go, TypeScript, TSX, JavaScript, Python, Rust, Java,
   C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
 - **Hylla's MVP code languages** are a subset of these: Rust, TypeScript/TSX, JavaScript,
-  Python, Go, C, C++ and C#. Båge parses Java and Ruby too; Hylla's MVP does not ingest them.
+  Python and Go. Båge still parses, outlines and edits every grammar above.
+- **Outline names are verified** against each language's own server for those five only:
+  Rust, TypeScript/TSX, JavaScript, Python, Go.
+- **Known unreliable:** C and C++ names on macro-heavy code, and on code the grammar misreads
+  (C++ in a `.h` is read as C). C# names are lightly measured. Java and Ruby are unmeasured.
 - **Outline names** come from the grammar's own fields (`name`, `declarator`), so a C, C++, C#
   or Java declaration is named after what it declares, never its return or field type:
   `Point make_point()` → `make_point`, `Point Shape::area()` → `Shape::area`,
   `namespace Fixture.Geo;` → `Fixture.Geo`, `int a, b;` → `a` (the first declarator),
   `operator const char *() const` → `operator const char *`. A TypeScript/JavaScript member key
   loses its brackets and quotes only when a plain identifier or number is left (`['KEY']` →
-  `KEY`); others stay as written (`['a-b']`). A class, interface or enum body is unnamed. These
+  `KEY`); others stay as written (`['a-b']`). A TypeScript/JavaScript arrow, function or class
+  expression takes the name it is bound to (`const f = () => …` → `f`,
+  `this.parseArg = (arg) => …` → `parseArg`, `{ onload: () => … }` → `onload`); a callback is unnamed. A
+  Rust impl is named by its type (`BlobRef`), a trait impl as `<BlobRef as Validate>`. A class,
+  interface or enum body is unnamed. These
   rules apply to a clean parse: a block whose top-level item holds a parse ERROR, or whose whole
   file parses to an ERROR root (an unexpanded macro, C++ in a `.h` read as C), keeps exactly its
   v0.11.0 name. Full rule: SPEC §9.4.
