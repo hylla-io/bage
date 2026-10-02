@@ -24,8 +24,17 @@
 //! and the server answers WITH a result-id, making the round causally bound —
 //! routed to the B2 request-leg work. Servers lacking pull support keep the
 //! arrival-ordered best-effort behavior here.
+//!
+//! WHAT A SERVER SAYS ABOUT A PROJECT IS KEPT, NOT ONLY HANDED TO ONE WAITING
+//! CALL. The read loop stores the latest diagnostics per document (a later
+//! publish for a document replaces them, an empty one clears them), so
+//! [`Client::published_diagnostics`] reads them at any time and a declared
+//! [`DiagnosticFailure`] turns one of them into a located
+//! [`LspError::ServerReported`]. A server that answers only when asked is
+//! reached with [`Client::pull_diagnostics`], whose answer lands in the same
+//! store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -38,6 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsp_types as lt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -110,10 +120,34 @@ const DEFAULT_EXIT_POLL: Duration = Duration::from_millis(50);
 /// only there, and the tail — not the head — holds the failure.
 const DEFAULT_STDERR_TAIL_BYTES: usize = 16 * 1024;
 
-/// A server status notification that means "not functional and done trying":
+/// How what a server said counts toward a declared rule.
+///
+/// Servers speak in two ways and a rule must say which it listens to. A STATE
+/// is re-sent whenever it changes, so only its latest value is true:
+/// rust-analyzer's `experimental/serverStatus`. An EVENT is said once and
+/// never withdrawn, and the method that carried it goes on to carry unrelated
+/// things: gopls announces a finished load with one `window/showMessage`, and
+/// its next `showMessage` is about something else. Read as a state, that
+/// event is un-met by the first unrelated message, and a loaded server times
+/// out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyMode {
+    /// State-like: the rule holds only while the LATEST notification of its
+    /// method (or, for a [`DiagnosticFailure`], a diagnostic the server
+    /// CURRENTLY holds published) matches.
+    #[default]
+    Latest,
+    /// Event-like: the rule holds once ANY notification (or diagnostic)
+    /// matched, whatever the server says afterwards, for as long as that exact
+    /// rule stays declared.
+    Once,
+}
+
+/// A server notification that means "not functional and done trying":
 /// [`Client::await_ready`] stops at once with [`LspError::ServerReported`]
-/// while the LATEST such notification matches, instead of probing a server
-/// that has already said it will never answer.
+/// while it holds, instead of probing a server that has already said it will
+/// never answer; [`Client::check_failures`] reports it after the gate too.
 ///
 /// Status notifications are server extensions with no common shape, so the
 /// caller declares the method, the members that mark failure, and where the
@@ -122,8 +156,16 @@ const DEFAULT_STDERR_TAIL_BYTES: usize = 16 * 1024;
 /// [`ClientConfig::experimental_capabilities`], is
 /// `method: "experimental/serverStatus"`,
 /// `when: {"health": "error", "quiescent": true}`,
-/// `message_pointer: Some("/message")`.
-#[derive(Clone, Debug, PartialEq)]
+/// `message_pointer: Some("/message")`, `mode: ReadyMode::Latest`. pyright
+/// reports an unparsable configuration file only as one
+/// `window/logMessage` of `{"type": 1}`, an event: `mode: ReadyMode::Once`.
+///
+/// As data it is `{"method": …, "when": …, "message_pointer": …, "mode": …}`,
+/// the last two optional. A member it does not know is refused: a misspelt
+/// `mode` read as absent would be `latest`, and an event-like failure would
+/// be forgotten at the server's next message on that method.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadyFailure {
     /// The notification method to watch.
     pub method: String,
@@ -134,12 +176,18 @@ pub struct ReadyFailure {
     /// RFC 6901 pointer into the params to the server's human-readable
     /// message; `None`, or a pointer that finds no string, reports the whole
     /// params instead.
+    #[serde(default)]
     pub message_pointer: Option<String>,
+    /// Whether the latest notification or any notification counts. A
+    /// declaration silent about it is [`ReadyMode::Latest`]. Under
+    /// [`ReadyMode::Once`] the FIRST matching notification is the one
+    /// reported.
+    #[serde(default)]
+    pub mode: ReadyMode,
 }
 
-/// A server status notification that means "done loading": [`Client::await_ready`]
-/// does not probe, and so cannot pass, until the LATEST such notification
-/// matches.
+/// A server notification that means "done loading": [`Client::await_ready`]
+/// does not probe, and so cannot pass, until it holds.
 ///
 /// A probe alone cannot tell a loaded server from one mid-load: rust-analyzer
 /// resolves a declaration to itself while its crate graph is still being
@@ -148,16 +196,92 @@ pub struct ReadyFailure {
 /// bage knows no server: rust-analyzer, once the caller also declares
 /// `{"serverStatusNotification": true}` in
 /// [`ClientConfig::experimental_capabilities`], is
-/// `method: "experimental/serverStatus"`, `when: {"quiescent": true}`.
-/// A server that never sends it fails the wait at `ready_deadline`, naming the
-/// signal and the last status seen.
-#[derive(Clone, Debug, PartialEq)]
+/// `method: "experimental/serverStatus"`, `when: {"quiescent": true}`,
+/// `mode: ReadyMode::Latest`; gopls is `method: "window/showMessage"`,
+/// `when: {"message": "Finished loading packages."}`, `mode: ReadyMode::Once`.
+/// A server that never sends it fails the wait at `ready_deadline` with
+/// [`LspError::ReadySignalDeadline`], carrying the signal and the last params
+/// seen for its method.
+///
+/// A met signal says the server stopped loading, NOT that the load succeeded:
+/// gopls sends "Finished loading packages." for a module whose `go.mod` does
+/// not parse. Failure is a separate declaration ([`ReadyFailure`],
+/// [`DiagnosticFailure`]).
+///
+/// As data it is `{"method": …, "when": …, "mode": "latest" | "once"}`. A
+/// member it does not know is refused: a misspelt `mode` read as absent
+/// would be `latest`, and the server would time out with nothing to say why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadySignal {
     /// The notification method to watch.
     pub method: String,
     /// Members the notification's params must carry, matched as
     /// [`ReadyFailure::when`] is.
     pub when: Value,
+    /// Whether the latest notification or any notification counts. A
+    /// declaration silent about it is [`ReadyMode::Latest`]. A `Once` signal
+    /// stays met for as long as this exact declaration is made, across
+    /// [`Client::configure`] calls; any change to it starts over from the
+    /// latest notification kept for its method.
+    #[serde(default)]
+    pub mode: ReadyMode,
+}
+
+/// The method a server publishes diagnostics with, and the one a
+/// diagnostic-matched [`LspError::ServerReported`] names.
+pub const PUBLISH_DIAGNOSTICS_METHOD: &str = "textDocument/publishDiagnostics";
+
+/// ONE diagnostic that means the project did not load, or loaded wrong:
+/// [`Client::await_ready`] and [`Client::check_failures`] fail with
+/// [`LspError::ServerReported`], carrying every matching diagnostic's
+/// location, while it holds.
+///
+/// A whole-notification match cannot say this. A publish carries a document
+/// and all of its diagnostics, so a [`ReadyFailure`] on the publish method
+/// sees only the last document published and must equal its whole list. This
+/// rule looks at each diagnostic of every document instead. gopls marks a
+/// module it could not load with a diagnostic of `{"source": "go list"}`;
+/// which diagnostics stop a caller's work is the caller's declaration, and
+/// bage picks none.
+///
+/// Diagnostics reach the store by push (`publishDiagnostics`, whenever the
+/// server sends one) and by [`Client::pull_diagnostics`]. A server that only
+/// answers a pull is judged on nothing until the caller pulls.
+///
+/// As data it is `{"when": …, "file_name": …, "mode": …}`, the last two
+/// optional. A member it does not know is refused: a misspelt `file_name`
+/// read as absent would apply the rule to every document.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticFailure {
+    /// Members the diagnostic must carry, exactly as the server sent it (an
+    /// LSP `Diagnostic`: `severity` is the number, `code` the server's number
+    /// or string), matched as [`ReadyFailure::when`] is. `{}` matches every
+    /// diagnostic.
+    pub when: Value,
+    /// Restricts the rule to documents whose FILE NAME (the last path
+    /// segment) matches: `*` stands for any run of characters, every other
+    /// character for itself. `None` is every document. `"go.mod"` is every
+    /// `go.mod` the server reports on, in any directory; `"*.go"` every Go
+    /// file.
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// [`ReadyMode::Latest`]: only diagnostics the server currently holds
+    /// published count, so one the server withdrew no longer fails.
+    /// [`ReadyMode::Once`]: a match holds the rule for as long as that exact
+    /// rule stays declared, whatever the server or another rule does after.
+    /// The diagnostics it matched in a document keep being reported after
+    /// the server withdraws them, until a later publish for that document
+    /// holds a match of THIS rule and replaces them. A declaration silent
+    /// about it is `Latest`.
+    ///
+    /// The choice matters more than it looks: every query re-opens its
+    /// document, a server that diagnoses only open documents then withdraws
+    /// and later re-sends that document's diagnostics, and a `Latest` rule
+    /// read inside that gap sees none.
+    #[serde(default)]
+    pub mode: ReadyMode,
 }
 
 /// The last bytes a server wrote to stderr. Readiness errors carry it; after
@@ -232,23 +356,122 @@ impl StderrRing {
     }
 }
 
-/// The declared [`ReadyFailure`]s plus the latest params each watched method
-/// carried, shared with the read loop. Only watched methods are stored, so it
-/// is bounded by the declaration, never by what a server chooses to send.
+/// The declared rules plus everything the server has said that they are
+/// judged on, shared with the read loop.
+///
+/// Notifications are stored only for watched methods, so that part is bounded
+/// by the declaration. Diagnostics are stored for every document the server
+/// reports on, declared or not, because [`Client::published_diagnostics`]
+/// reads them: that part is bounded by the server's own view of the
+/// workspace, one entry per document that currently has a diagnostic.
+///
+/// What [`ReadyMode::Once`] diagnostic rules remember is bounded
+/// differently: for EACH such rule, one publish's worth of its own matches
+/// per document it has EVER matched in. A withdrawal does not shrink it, so
+/// a document the server stopped reporting on, or one since deleted, keeps
+/// its entry for as long as that exact rule stays declared. It grows with
+/// the number of `Once` rules times the distinct documents each failed in,
+/// never with how often a document was republished.
 #[derive(Default)]
 struct StatusWatch {
     rules: Vec<ReadyFailure>,
     signals: Vec<ReadySignal>,
+    diagnostic_rules: Vec<DiagnosticFailure>,
     latest: HashMap<String, Value>,
+    /// Per entry of `signals`: whether a [`ReadyMode::Once`] signal has been
+    /// met.
+    met: Vec<bool>,
+    /// Per entry of `rules`: the params that first matched a
+    /// [`ReadyMode::Once`] rule.
+    fired: Vec<Option<Value>>,
+    /// Per document URI, the diagnostics the server currently holds for it.
+    /// Ordered so a report lists documents the same way every time.
+    diagnostics: BTreeMap<String, Vec<PublishedDiagnostic>>,
+    /// Per entry of `diagnostic_rules`, then per document URI: the
+    /// diagnostics that [`ReadyMode::Once`] rule matched in the latest
+    /// publish for the document that held a match of its own. Empty for a
+    /// `Latest` rule. Kept per rule because one rule's later match must not
+    /// displace what another rule matched in the same document. Replaced
+    /// rather than appended to: the rule needs to know that it matched and
+    /// where the document last failed, and a list of every diagnostic ever
+    /// matched would grow for as long as the session lived.
+    seen: Vec<BTreeMap<String, Vec<PublishedDiagnostic>>>,
+    /// The workspace root as declared and as the filesystem spells it, for
+    /// naming documents relative to it.
+    root: Option<(PathBuf, Option<PathBuf>)>,
+}
+
+/// What a declared failure rule found: the method that carried it, the
+/// server's own message, and every diagnostic a declared
+/// [`DiagnosticFailure`] matches.
+#[derive(Debug, PartialEq)]
+struct Reported {
+    method: String,
+    message: String,
+    locations: Vec<PublishedDiagnostic>,
 }
 
 impl StatusWatch {
     /// Forgets the status of any method no longer watched: notifications for
     /// it are dropped from here on, so a value kept now would be stale if the
-    /// method were watched again.
-    fn set_watch(&mut self, rules: Vec<ReadyFailure>, signals: Vec<ReadySignal>) {
+    /// method were watched again. What a `Once` declaration already saw is
+    /// kept only while that exact declaration is still made.
+    fn set_watch(
+        &mut self,
+        rules: Vec<ReadyFailure>,
+        signals: Vec<ReadySignal>,
+        diagnostic_rules: Vec<DiagnosticFailure>,
+    ) {
+        let met = signals
+            .iter()
+            .map(|new| {
+                // A method watched all along still has its latest status: a
+                // `Once` signal declared after its event arrived, with no
+                // later notification behind it, is met by that.
+                let kept = self.latest.get(&new.method);
+                new.mode == ReadyMode::Once
+                    && (kept.is_some_and(|params| value_contains(params, &new.when))
+                        || self
+                            .signals
+                            .iter()
+                            .zip(&self.met)
+                            .any(|(old, met)| *met && old == new))
+            })
+            .collect();
+        let fired = rules
+            .iter()
+            .map(|new| {
+                self.rules
+                    .iter()
+                    .zip(&self.fired)
+                    .find(|(old, fired)| fired.is_some() && *old == new)
+                    .and_then(|(_, fired)| fired.clone())
+            })
+            .collect();
+        let seen = diagnostic_rules
+            .iter()
+            .map(|new| {
+                let mut memory = self
+                    .diagnostic_rules
+                    .iter()
+                    .zip(&self.seen)
+                    .find(|(old, _)| new.mode == ReadyMode::Once && *old == new)
+                    .map(|(_, memory)| memory.clone())
+                    .unwrap_or_default();
+                // A rule declared after its diagnostic arrived still
+                // remembers it.
+                for (uri, current) in &self.diagnostics {
+                    remember_matches(new, &mut memory, uri, current);
+                }
+                memory
+            })
+            .collect();
         self.rules = rules;
         self.signals = signals;
+        self.diagnostic_rules = diagnostic_rules;
+        self.met = met;
+        self.fired = fired;
+        self.seen = seen;
         let (rules, signals) = (&self.rules, &self.signals);
         self.latest.retain(|method, _| {
             rules.iter().any(|r| &r.method == method) || signals.iter().any(|s| &s.method == method)
@@ -261,48 +484,249 @@ impl StatusWatch {
     }
 
     /// Keeps `params` as `method`'s latest status only when a rule or signal
-    /// watches it.
+    /// watches it, and records every `Once` declaration it meets.
     fn observe(&mut self, method: &str, params: Option<&Value>) {
-        if self.watches(method) {
-            let params = params.cloned().unwrap_or(Value::Null);
-            self.latest.insert(method.to_string(), params);
+        if !self.watches(method) {
+            return;
+        }
+        let params = params.cloned().unwrap_or(Value::Null);
+        for (signal, met) in self.signals.iter().zip(self.met.iter_mut()) {
+            if signal.mode == ReadyMode::Once
+                && signal.method == method
+                && value_contains(&params, &signal.when)
+            {
+                *met = true;
+            }
+        }
+        for (rule, fired) in self.rules.iter().zip(self.fired.iter_mut()) {
+            if rule.mode == ReadyMode::Once
+                && fired.is_none()
+                && rule.method == method
+                && value_contains(&params, &rule.when)
+            {
+                *fired = Some(params.clone());
+            }
+        }
+        self.latest.insert(method.to_string(), params);
+    }
+
+    /// The first declared signal that does not hold, with the latest params
+    /// seen for its method.
+    fn unmet_signal(&self) -> Option<(ReadySignal, Option<Value>)> {
+        self.signals
+            .iter()
+            .zip(&self.met)
+            .find_map(|(signal, met)| {
+                let latest = self.latest.get(&signal.method);
+                let holds = match signal.mode {
+                    ReadyMode::Latest => {
+                        latest.is_some_and(|params| value_contains(params, &signal.when))
+                    }
+                    ReadyMode::Once => *met,
+                };
+                (!holds).then(|| (signal.clone(), latest.cloned()))
+            })
+    }
+
+    /// Records the workspace root documents are named relative to.
+    fn set_root(&mut self, root: &Path) {
+        self.root = Some((root.to_path_buf(), fs::canonicalize(root).ok()));
+    }
+
+    /// `uri`'s path relative to the root when it lies under it, else its
+    /// absolute path. A server may spell the same file differently from the
+    /// declared root (a symlinked temp directory, another letter case on a
+    /// case-insensitive volume), so a path that does not sit under the root
+    /// as written is asked of the filesystem before it is called outside.
+    fn document_path(&self, uri: &str) -> String {
+        let absolute = uri_str_to_path(uri);
+        let Some((declared, canonical)) = &self.root else {
+            return absolute;
+        };
+        let under = |path: &Path| {
+            [Some(declared), canonical.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .map(|rel| rel.to_string_lossy().into_owned())
+        };
+        under(Path::new(&absolute))
+            .or_else(|| under(&fs::canonicalize(&absolute).ok()?))
+            .unwrap_or(absolute)
+    }
+
+    /// Replaces `uri`'s diagnostics with `raw` (an empty list clears them);
+    /// the ones a `Once` rule matches, when there are any, replace what THAT
+    /// rule remembered for that document, and no other rule's memory. `None`
+    /// when an element is not an LSP `Diagnostic`: the publish is malformed
+    /// and nothing changes.
+    fn store_diagnostics(&mut self, uri: &str, raw: &[Value]) -> Option<()> {
+        let path = self.document_path(uri);
+        let decoded = raw
+            .iter()
+            .map(|d| PublishedDiagnostic::decode(uri, &path, d))
+            .collect::<Option<Vec<_>>>()?;
+        for (rule, memory) in self.diagnostic_rules.iter().zip(self.seen.iter_mut()) {
+            remember_matches(rule, memory, uri, &decoded);
+        }
+        if decoded.is_empty() {
+            self.diagnostics.remove(uri);
+        } else {
+            self.diagnostics.insert(uri.to_string(), decoded);
+        }
+        Some(())
+    }
+
+    /// A `publishDiagnostics` notification's params, stored per document.
+    fn publish(&mut self, params: &Value) {
+        if let (Some(uri), Some(raw)) = (
+            params.get("uri").and_then(Value::as_str),
+            params.get("diagnostics").and_then(Value::as_array),
+        ) {
+            // A malformed publish is skipped like any other malformed message.
+            let _ = self.store_diagnostics(uri, raw);
         }
     }
 
-    /// The first declared signal the latest status does not match, described
-    /// with what was last seen for it.
-    fn unmet_signal(&self) -> Option<String> {
-        self.signals.iter().find_map(|signal| {
-            let latest = self.latest.get(&signal.method);
-            if latest.is_some_and(|params| value_contains(params, &signal.when)) {
-                return None;
-            }
-            Some(format!(
-                "{} has not reported {}; latest: {}",
-                signal.method,
-                signal.when,
-                latest.map_or_else(|| "none".to_string(), Value::to_string)
-            ))
-        })
+    /// Every diagnostic the server currently holds, by document then in the
+    /// server's own order.
+    fn published(&self) -> Vec<PublishedDiagnostic> {
+        self.diagnostics.values().flatten().cloned().collect()
     }
 
-    /// The first declared rule the latest status matches, as (method, message).
-    fn failure(&self) -> Option<(String, String)> {
-        self.rules.iter().find_map(|rule| {
-            let params = self.latest.get(&rule.method)?;
-            if !value_contains(params, &rule.when) {
-                return None;
+    /// Every diagnostic a declared [`DiagnosticFailure`] holds on: the
+    /// current ones a rule matches, then, by document, the ones each `Once`
+    /// rule last matched in a document that no longer carries them.
+    fn failing_diagnostics(&self) -> Vec<PublishedDiagnostic> {
+        let mut out: Vec<PublishedDiagnostic> = self
+            .diagnostics
+            .values()
+            .flatten()
+            .filter(|d| {
+                self.diagnostic_rules
+                    .iter()
+                    .any(|rule| diagnostic_matches(rule, d))
+            })
+            .cloned()
+            .collect();
+        let mut remembered: Vec<&PublishedDiagnostic> = self
+            .seen
+            .iter()
+            .flat_map(|memory| memory.values().flatten())
+            .collect();
+        // Stable, so a report lists documents the same way whichever rule
+        // remembered them.
+        remembered.sort_by(|a, b| a.uri.cmp(&b.uri));
+        for d in remembered {
+            if !out.contains(d) {
+                out.push(d.clone());
             }
-            let message = rule
-                .message_pointer
-                .as_deref()
-                .and_then(|p| params.pointer(p))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| params.to_string());
-            Some((rule.method.clone(), message))
+        }
+        out
+    }
+
+    /// What the declared failure rules find in everything observed so far. A
+    /// notification rule names its own method and message; with none
+    /// matching, the first failing diagnostic's message stands for the
+    /// report. Either way every failing diagnostic rides along.
+    fn failure(&self) -> Option<Reported> {
+        let locations = self.failing_diagnostics();
+        let notified = self
+            .rules
+            .iter()
+            .zip(&self.fired)
+            .find_map(|(rule, fired)| {
+                let params = match rule.mode {
+                    ReadyMode::Latest => self
+                        .latest
+                        .get(&rule.method)
+                        .filter(|params| value_contains(params, &rule.when))?,
+                    ReadyMode::Once => fired.as_ref()?,
+                };
+                let message = rule
+                    .message_pointer
+                    .as_deref()
+                    .and_then(|p| params.pointer(p))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| params.to_string());
+                Some((rule.method.clone(), message))
+            });
+        let (method, message) = match notified {
+            Some(found) => found,
+            None => (
+                PUBLISH_DIAGNOSTICS_METHOD.to_string(),
+                locations.first()?.message.clone(),
+            ),
+        };
+        Some(Reported {
+            method,
+            message,
+            locations,
         })
     }
+}
+
+/// Whether `rule` selects `diagnostic`.
+fn diagnostic_matches(rule: &DiagnosticFailure, diagnostic: &PublishedDiagnostic) -> bool {
+    let named = rule.file_name.as_deref().is_none_or(|pattern| {
+        let name = diagnostic
+            .path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&diagnostic.path);
+        wildcard_match(pattern, name)
+    });
+    named && value_contains(&diagnostic.raw, &rule.when)
+}
+
+/// Records in `memory` what `rule`, when it is a [`ReadyMode::Once`] rule,
+/// selects in one document's publish. A publish it selects nothing in leaves
+/// the memory alone: an empty or unrelated publish must not unsay the event.
+fn remember_matches(
+    rule: &DiagnosticFailure,
+    memory: &mut BTreeMap<String, Vec<PublishedDiagnostic>>,
+    uri: &str,
+    published: &[PublishedDiagnostic],
+) {
+    if rule.mode != ReadyMode::Once {
+        return;
+    }
+    let matched: Vec<PublishedDiagnostic> = published
+        .iter()
+        .filter(|d| diagnostic_matches(rule, d))
+        .cloned()
+        .collect();
+    if !matched.is_empty() {
+        memory.insert(uri.to_string(), matched);
+    }
+}
+
+/// Whether `text` matches `pattern`, where `*` stands for any run of
+/// characters (none included) and every other character for itself.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0, 0);
+    // Where the last `*` sits and how much text it has swallowed so far: on a
+    // mismatch the star takes one more character and matching resumes there.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some((star_p, star_t)) = star {
+            star = Some((star_p, star_t + 1));
+            pi = star_p + 1;
+            ti = star_t + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
 }
 
 /// Recursive subset match: every member `want` names must match in `have`.
@@ -385,6 +809,26 @@ pub struct ClientConfig {
     /// [`Client::await_ready`] probes. Default: none, so readiness is decided
     /// by probing alone.
     pub ready_signals: Vec<ReadySignal>,
+    /// Diagnostics that end [`Client::await_ready`] at once, and fail
+    /// [`Client::check_failures`], with a located
+    /// [`LspError::ServerReported`]. Default: none, so no diagnostic stops
+    /// anything.
+    pub diagnostic_failures: Vec<DiagnosticFailure>,
+    /// The `textDocument.hover.contentFormat` capability of `initialize`: the
+    /// formats [`Client::hover`] accepts, most wanted first. Default:
+    /// markdown, then plain text.
+    ///
+    /// WHY MARKDOWN FIRST: it is the one format in which every server keeps
+    /// a symbol's signature apart from its documentation, in a code fence.
+    /// Asked for plain text, rust-analyzer runs a heading into the code
+    /// that follows it and drops code spans, and TypeScript's server joins
+    /// the signature to the first sentence with nothing between. Plain text
+    /// stays declared as the fallback for a server with no markdown.
+    ///
+    /// Empty omits the member, and the server then chooses for itself: gopls
+    /// answers markdown; rust-analyzer, TypeScript's server and pyright
+    /// answer plain text.
+    pub hover_content_format: Vec<MarkupKind>,
     /// Bytes of server stderr kept for [`StderrTail`]. Default 16 KiB. Zero
     /// keeps nothing but still counts what was dropped.
     pub stderr_tail_bytes: usize,
@@ -409,8 +853,64 @@ impl Default for ClientConfig {
             experimental_capabilities: None,
             ready_failures: Vec::new(),
             ready_signals: Vec::new(),
+            diagnostic_failures: Vec::new(),
+            hover_content_format: vec![MarkupKind::Markdown, MarkupKind::PlainText],
             stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
         }
+    }
+}
+
+/// What a readiness probe came back with, kept as data so a caller can tell a
+/// server that answered nothing from one that refused or stayed silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeAnswer {
+    /// The server answered, with no location: what a server still loading
+    /// returns, and what a position that resolves to nothing returns.
+    Empty,
+    /// The server refused the request with a JSON-RPC error.
+    Refused {
+        /// The server's error message, verbatim.
+        message: String,
+    },
+    /// No response arrived within the per-call bound.
+    NoResponse {
+        /// How long the probe waited.
+        after: Duration,
+    },
+}
+
+impl std::fmt::Display for ProbeAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeAnswer::Empty => f.write_str("empty result"),
+            ProbeAnswer::Refused { message } => write!(f, "refused: {message}"),
+            ProbeAnswer::NoResponse { after } => write!(f, "no response after {after:?}"),
+        }
+    }
+}
+
+/// Prints each failing diagnostic on its own line, positions one-based as an
+/// editor shows them.
+struct Located<'a>(&'a [PublishedDiagnostic]);
+
+impl std::fmt::Display for Located<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for d in self.0 {
+            write!(
+                f,
+                "\n  at {}:{}:{}: {}",
+                d.path,
+                d.start_line + 1,
+                d.start_char + 1,
+                d.message
+            )?;
+            match (&d.source, &d.code) {
+                (Some(source), Some(code)) => write!(f, " [{source} {code}]")?,
+                (Some(tag), None) | (None, Some(tag)) => write!(f, " [{tag}]")?,
+                (None, None) => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -478,8 +978,8 @@ pub enum LspError {
     /// This covers only the refusing server. A server that is still indexing
     /// far more often ANSWERS with an empty result, which is indistinguishable
     /// on the wire from a genuine no-result and therefore never reaches this
-    /// variant — see [`LspError::ReadyDeadline`] and [`Client::await_ready`]
-    /// for the outcome that does carry readiness.
+    /// variant — see [`LspError::ReadyProbeDeadline`] and
+    /// [`Client::await_ready`] for the outcome that does carry readiness.
     #[error("lsp: {method} {path:?}: not ready after {after:?}: {last}")]
     QueryDeadline {
         /// The request method.
@@ -491,15 +991,38 @@ pub enum LspError {
         /// The last not-ready error observed.
         last: String,
     },
-    /// [`Client::await_ready`] probed for its whole deadline and the probe
-    /// position never produced a location, so the server is not ready to be
-    /// queried. THIS is the outcome that carries readiness information: a
-    /// caller that gets it must not proceed to query, because every answer it
-    /// would receive is an empty result it cannot interpret.
+    /// [`Client::await_ready`] waited its whole deadline for a declared
+    /// [`ReadySignal`] the server never sent (or sent and withdrew), so the
+    /// server never said it had finished loading and was not probed past
+    /// that. A caller that gets it must not proceed to query.
     #[error(
-        "lsp: not ready: {path:?}:{line}:{character} still empty after {after:?}: {last}{stderr}"
+        "lsp: not ready: {} did not report {} within {after:?}; latest: {}{stderr}",
+        .signal.method,
+        .signal.when,
+        .latest.as_ref().map_or_else(|| "none".to_string(), |params| params.to_string())
     )]
-    ReadyDeadline {
+    ReadySignalDeadline {
+        /// The declared signal that did not hold when the deadline passed.
+        /// Boxed, as `latest` is, because both hold JSON of any size and
+        /// every fallible call here returns this enum by value.
+        signal: Box<ReadySignal>,
+        /// The latest params the server sent for the signal's method; `None`
+        /// when it never sent that method at all.
+        latest: Option<Box<Value>>,
+        /// The configured readiness deadline.
+        after: Duration,
+        /// The server's recent stderr.
+        stderr: StderrTail,
+    },
+    /// [`Client::await_ready`] probed for its whole deadline, every declared
+    /// signal holding, and the probe position never produced a location, so
+    /// the server is not ready to be queried. A caller that gets it must not
+    /// proceed to query, because every answer it would receive is an empty
+    /// result it cannot interpret.
+    #[error(
+        "lsp: not ready: {path:?}:{line}:{character} unresolved after {after:?}: {last}{stderr}"
+    )]
+    ReadyProbeDeadline {
         /// The file the probe targeted.
         path: String,
         /// Zero-based probe line.
@@ -508,21 +1031,32 @@ pub enum LspError {
         character: u32,
         /// The configured readiness deadline.
         after: Duration,
-        /// The last outcome observed (an empty result, or a refusal message).
-        last: String,
+        /// What the last probe came back with.
+        last: ProbeAnswer,
         /// The server's recent stderr.
         stderr: StderrTail,
     },
-    /// [`Client::await_ready`] stopped because the server's latest status
-    /// notification matched a declared [`ReadyFailure`]: the server has said
-    /// it is not functional and has no work left that could change that, so
-    /// probing on would only wait out the deadline.
-    #[error("lsp: not ready: server reported failure via {method}: {message}{stderr}")]
+    /// The server said the project did not load: a declared [`ReadyFailure`]
+    /// or [`DiagnosticFailure`] holds. Returned by [`Client::await_ready`],
+    /// which stops at once rather than probing a server that has given up,
+    /// and by [`Client::check_failures`].
+    #[error(
+        "lsp: not ready: server reported failure via {method}: {message}{}{stderr}",
+        Located(.locations)
+    )]
     ServerReported {
-        /// The status notification method that matched.
+        /// The notification method that carried the failure;
+        /// [`PUBLISH_DIAGNOSTICS_METHOD`] when only a diagnostic rule held.
         method: String,
-        /// The server's message.
+        /// The server's own message: the matched notification's, or the
+        /// first failing diagnostic's when only a diagnostic rule held.
         message: String,
+        /// Every diagnostic a declared [`DiagnosticFailure`] holds on, each
+        /// with its document, range, source and code. Empty when the server
+        /// located nothing in a diagnostic, or when no diagnostic rule is
+        /// declared: a server may name the place only in `message` or on
+        /// `stderr`.
+        locations: Vec<PublishedDiagnostic>,
         /// The server's recent stderr.
         stderr: StderrTail,
     },
@@ -1036,6 +1570,181 @@ fn severity_label(sev: Option<lt::DiagnosticSeverity>) -> String {
     }
 }
 
+/// How serious a server says a diagnostic is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// LSP severity 1.
+    Error,
+    /// LSP severity 2.
+    Warning,
+    /// LSP severity 3.
+    Information,
+    /// LSP severity 4.
+    Hint,
+    /// A number the protocol does not define, as the server sent it.
+    Other(i64),
+}
+
+impl Severity {
+    fn from_wire(n: i64) -> Severity {
+        match n {
+            1 => Severity::Error,
+            2 => Severity::Warning,
+            3 => Severity::Information,
+            4 => Severity::Hint,
+            other => Severity::Other(other),
+        }
+    }
+}
+
+/// One diagnostic a server holds for a document, with where it is.
+///
+/// Read from [`Client::published_diagnostics`] and
+/// [`Client::pull_diagnostics`], and carried by
+/// [`LspError::ServerReported`]. Positions are zero-based UTF-16 code units,
+/// as [`SymbolLocation`]'s are; convert with [`byte_offset`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedDiagnostic {
+    /// The document's URI exactly as the server sent it.
+    pub uri: String,
+    /// The document's path: relative to the workspace root when the document
+    /// lies under it, otherwise absolute.
+    pub path: String,
+    /// Zero-based start line.
+    pub start_line: u32,
+    /// Zero-based start character, in UTF-16 code units.
+    pub start_char: u32,
+    /// Zero-based end line.
+    pub end_line: u32,
+    /// Zero-based end character, in UTF-16 code units.
+    pub end_char: u32,
+    /// The server's severity; `None` when it sent none.
+    pub severity: Option<Severity>,
+    /// Who produced it, in the server's words (`"compiler"`, `"go list"`,
+    /// `"rustc"`); `None` when it sent none.
+    pub source: Option<String>,
+    /// The server's code, a number rendered in decimal or a string as sent;
+    /// `None` when it sent none.
+    pub code: Option<String>,
+    /// The server's message, verbatim.
+    pub message: String,
+    /// The whole diagnostic as the server sent it, for the members bage does
+    /// not name (`relatedInformation`, `tags`, `data`, `codeDescription`) and
+    /// for [`DiagnosticFailure::when`] to match against.
+    pub raw: Value,
+}
+
+impl PublishedDiagnostic {
+    /// Reads one LSP `Diagnostic`. `None` when it lacks what the protocol
+    /// requires of every diagnostic: a range and a message.
+    fn decode(uri: &str, path: &str, raw: &Value) -> Option<PublishedDiagnostic> {
+        let range = serde_json::from_value::<lt::Range>(raw.get("range")?.clone()).ok()?;
+        let text = |member: &str| raw.get(member).and_then(Value::as_str).map(str::to_string);
+        Some(PublishedDiagnostic {
+            uri: uri.to_string(),
+            path: path.to_string(),
+            start_line: range.start.line,
+            start_char: range.start.character,
+            end_line: range.end.line,
+            end_char: range.end.character,
+            severity: raw
+                .get("severity")
+                .and_then(Value::as_i64)
+                .map(Severity::from_wire),
+            source: text("source"),
+            code: match raw.get("code") {
+                Some(Value::String(code)) => Some(code.clone()),
+                Some(Value::Number(code)) => Some(code.to_string()),
+                _ => None,
+            },
+            message: text("message")?,
+            raw: raw.clone(),
+        })
+    }
+}
+
+/// The text formats the protocol knows for hover content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarkupKind {
+    /// Text with no markup; wire name `plaintext`.
+    #[serde(rename = "plaintext")]
+    PlainText,
+    /// GitHub-flavoured markdown; wire name `markdown`.
+    #[serde(rename = "markdown")]
+    Markdown,
+}
+
+/// What a server shows for the symbol at a position, from [`Client::hover`]:
+/// its signature and documentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hover {
+    /// The content. A `MarkupContent` answer is passed through verbatim; the
+    /// protocol's older `MarkedString` shapes are rendered to the markdown
+    /// the protocol defines them as.
+    pub text: String,
+    /// Which format `text` is in — the server's choice among the declared
+    /// [`ClientConfig::hover_content_format`], stated by the server rather
+    /// than assumed from the request.
+    pub kind: MarkupKind,
+    /// The span the hover describes, when the server names one. Zero-based
+    /// UTF-16 code units, in the queried file.
+    pub range: Option<SymbolLocation>,
+}
+
+/// Decodes a `Hover | null` response. The protocol's older content shapes are
+/// markdown by definition: a bare string is markdown, a `{language, value}`
+/// pair is that value in a fenced code block, and a list is its entries in
+/// order, so they are returned as markdown rather than relabelled. An answer
+/// whose content is empty is `None`, as `null` is.
+fn decode_hover(method: &str, path: &str, v: Value) -> Result<Option<Hover>, LspError> {
+    let hover = serde_json::from_value::<Option<lt::Hover>>(v).map_err(|e| LspError::Rpc {
+        method: method.to_string(),
+        message: format!("decode response: {e}"),
+    })?;
+    let Some(hover) = hover else {
+        return Ok(None);
+    };
+    let marked = |m: lt::MarkedString| match m {
+        lt::MarkedString::String(markdown) => markdown,
+        lt::MarkedString::LanguageString(code) => {
+            format!("```{}\n{}\n```", code.language, code.value)
+        }
+    };
+    let (text, kind) = match hover.contents {
+        lt::HoverContents::Markup(content) => (
+            content.value,
+            match content.kind {
+                lt::MarkupKind::PlainText => MarkupKind::PlainText,
+                lt::MarkupKind::Markdown => MarkupKind::Markdown,
+            },
+        ),
+        lt::HoverContents::Scalar(one) => (marked(one), MarkupKind::Markdown),
+        lt::HoverContents::Array(many) => (
+            many.into_iter()
+                .map(marked)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            MarkupKind::Markdown,
+        ),
+    };
+    // The protocol's own "nothing here" is `null`, but its content types
+    // admit an empty answer too, and a hover with no text shows nothing.
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Hover {
+        text,
+        kind,
+        range: hover.range.map(|r| SymbolLocation {
+            path: path.to_string(),
+            start_line: r.start.line,
+            start_char: r.start.character,
+            end_line: r.end.line,
+            end_char: r.end.character,
+        }),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Code-navigation query results
 // ---------------------------------------------------------------------------
@@ -1210,6 +1919,21 @@ fn to_call_target(item: &lt::CallHierarchyItem) -> Result<CallTarget, LspError> 
 // JSON-RPC framing
 // ---------------------------------------------------------------------------
 
+/// Builds a request (`id` set) or a notification. A `null` params is sent as
+/// NO `params` member: JSON-RPC allows the member only as an object or an
+/// array, and a server that checks — TypeScript's — rejects
+/// `"params": null` on `shutdown` and `exit` and then never exits.
+fn rpc_message(id: Option<u64>, method: &str, params: Value) -> Value {
+    let mut msg = json!({"jsonrpc": "2.0", "method": method});
+    if let Some(id) = id {
+        msg["id"] = json!(id);
+    }
+    if !params.is_null() {
+        msg["params"] = params;
+    }
+    msg
+}
+
 /// Writes one Content-Length-framed JSON-RPC message.
 fn write_frame(w: &mut dyn Write, msg: &Value) -> io::Result<()> {
     let body =
@@ -1382,8 +2106,11 @@ pub struct Client {
     /// The `capabilities.experimental` sent in `initialize`; see
     /// [`ClientConfig::experimental_capabilities`].
     pub experimental_capabilities: Option<Value>,
-    /// Declared [`ReadyFailure`]s and the latest watched status, shared with
-    /// the read loop.
+    /// The hover formats declared in `initialize`; see
+    /// [`ClientConfig::hover_content_format`].
+    pub hover_content_format: Vec<MarkupKind>,
+    /// The declared failure rules and ready signals, and what the server has
+    /// said that they are judged on, shared with the read loop.
     status: Arc<Mutex<StatusWatch>>,
     /// Server stderr tail, fed by the drain thread `new_stdio` starts.
     stderr: Arc<Mutex<StderrRing>>,
@@ -1500,6 +2227,7 @@ impl Client {
             process_id: Some(std::process::id()),
             initialization_options: None,
             experimental_capabilities: None,
+            hover_content_format: vec![MarkupKind::Markdown, MarkupKind::PlainText],
             status,
             stderr: Arc::new(Mutex::new(StderrRing {
                 cap: DEFAULT_STDERR_TAIL_BYTES,
@@ -1528,6 +2256,8 @@ impl Client {
             experimental_capabilities,
             ready_failures,
             ready_signals,
+            diagnostic_failures,
+            hover_content_format,
             stderr_tail_bytes,
         } = cfg;
         self.initialize_timeout = initialize_timeout;
@@ -1544,7 +2274,8 @@ impl Client {
         self.process_id = process_id;
         self.initialization_options = initialization_options;
         self.experimental_capabilities = experimental_capabilities;
-        lock(&self.status).set_watch(ready_failures, ready_signals);
+        self.hover_content_format = hover_content_format;
+        lock(&self.status).set_watch(ready_failures, ready_signals, diagnostic_failures);
         lock(&self.stderr).set_cap(stderr_tail_bytes);
     }
 
@@ -1556,9 +2287,13 @@ impl Client {
 
     /// The bounds currently in force, including any set field by field.
     pub fn config(&self) -> ClientConfig {
-        let (ready_failures, ready_signals) = {
+        let (ready_failures, ready_signals, diagnostic_failures) = {
             let status = lock(&self.status);
-            (status.rules.clone(), status.signals.clone())
+            (
+                status.rules.clone(),
+                status.signals.clone(),
+                status.diagnostic_rules.clone(),
+            )
         };
         ClientConfig {
             initialize_timeout: self.initialize_timeout,
@@ -1577,6 +2312,8 @@ impl Client {
             experimental_capabilities: self.experimental_capabilities.clone(),
             ready_failures,
             ready_signals,
+            diagnostic_failures,
+            hover_content_format: self.hover_content_format.clone(),
             stderr_tail_bytes: lock(&self.stderr).cap,
         }
     }
@@ -1612,7 +2349,7 @@ impl Client {
             });
         }
 
-        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let req = rpc_message(Some(id), method, params);
         if let Err(e) = write_frame(lock(&self.writer).as_mut(), &req) {
             lock(&self.pending).remove(&id);
             return Err(LspError::Io(e));
@@ -1639,7 +2376,7 @@ impl Client {
 
     /// Sends one notification (no response expected).
     fn notify(&self, method: &str, params: Value) -> Result<(), LspError> {
-        let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let msg = rpc_message(None, method, params);
         write_frame(lock(&self.writer).as_mut(), &msg).map_err(LspError::Io)
     }
 
@@ -1661,6 +2398,7 @@ impl Client {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        lock(&self.status).set_root(&root);
         self.root = Some(root);
         let mut params = json!({
             "processId": self.process_id,
@@ -1696,6 +2434,14 @@ impl Client {
         }
         if let Some(experimental) = &self.experimental_capabilities {
             params["capabilities"]["experimental"] = experimental.clone();
+        }
+        // The pull-diagnostics capability (`textDocument.diagnostic`) is
+        // deliberately NOT claimed: a server that sees it may stop pushing
+        // diagnostics altogether, and `pull_diagnostics` needs only the
+        // server's own `diagnosticProvider`.
+        if !self.hover_content_format.is_empty() {
+            params["capabilities"]["textDocument"]["hover"] =
+                json!({"contentFormat": self.hover_content_format});
         }
         let result = self.call("initialize", params, self.initialize_timeout)?;
         self.server_capabilities = Some(
@@ -1930,9 +2676,7 @@ impl Client {
         self.next_id += 1;
         let barrier_id = self.next_id;
         self.barrier_arm.store(barrier_id, Ordering::Release);
-        let req = json!({
-            "jsonrpc": "2.0", "id": barrier_id, "method": BARRIER_METHOD, "params": Value::Null,
-        });
+        let req = rpc_message(Some(barrier_id), BARRIER_METHOD, Value::Null);
         let write_res = write_frame(lock(&self.writer).as_mut(), &req);
         let out = match write_res {
             // Write failed: the transport is gone. FATAL (parity with `call`).
@@ -2072,8 +2816,11 @@ impl Client {
     }
 
     /// Blocks until the server can actually answer code-navigation queries,
-    /// or fails with [`LspError::ReadyDeadline`] — THE readiness gate every
-    /// consumer must pass before reading an empty result as "found nothing".
+    /// or fails saying which half never came: [`LspError::ReadySignalDeadline`]
+    /// (a declared signal the server never sent) or
+    /// [`LspError::ReadyProbeDeadline`] (the probe never resolved) — THE
+    /// readiness gate every consumer must pass before reading an empty result
+    /// as "found nothing".
     ///
     /// Probing is the only mechanism that works. A successful response with an
     /// empty result is what a still-indexing server returns, and it is
@@ -2098,16 +2845,18 @@ impl Client {
     /// rust-analyzer can resolve the probe, then answer the same query empty
     /// until its load finishes. A probe alone does not cover that window; a
     /// declared [`ClientConfig::ready_signals`] narrows it — no probe is sent
-    /// until every declared signal's latest status matches, and an answer
-    /// counts only if they all still match when it arrives. A server probed
-    /// on a met signal it has not yet withdrawn can still answer stale; no
-    /// client-side gate sees a reload the server has not announced.
+    /// until every declared signal holds, and an answer counts only if they
+    /// all still hold when it arrives. A server probed on a met signal it has
+    /// not yet withdrawn can still answer stale; no client-side gate sees a
+    /// reload the server has not announced.
     ///
-    /// A server that SAYS it has failed stops the wait at once: when its
-    /// latest status notification matches a declared
-    /// [`ClientConfig::ready_failures`] rule, this returns
-    /// [`LspError::ServerReported`] carrying the server's message rather than
-    /// probing a server that will never answer until the deadline.
+    /// A server that SAYS it has failed stops the wait at once: when a
+    /// declared [`ClientConfig::ready_failures`] or
+    /// [`ClientConfig::diagnostic_failures`] rule holds, this returns
+    /// [`LspError::ServerReported`] carrying the server's message and the
+    /// failing diagnostics' locations rather than probing a server that will
+    /// never answer until the deadline. A failure the server reports only
+    /// AFTER this returns is caught by [`Client::check_failures`].
     pub fn await_ready(
         &mut self,
         path: &str,
@@ -2121,65 +2870,218 @@ impl Client {
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
         });
+        /// Why the wait has not ended yet.
+        enum Waiting {
+            Signal(ReadySignal, Option<Value>),
+            Probe(ProbeAnswer),
+        }
         let deadline = Instant::now() + self.ready_deadline;
         let mut last;
         loop {
-            self.check_reported_failure()?;
+            self.check_failures()?;
             let unmet = lock(&self.status).unmet_signal();
-            if let Some(unmet) = unmet {
+            if let Some((signal, latest)) = unmet {
                 // A dead server sends no further status: fail as a probe would.
                 if self.dead.load(Ordering::Acquire) {
                     return Err(LspError::Closed {
                         method: METHOD.to_string(),
                     });
                 }
-                last = unmet;
+                last = Waiting::Signal(signal, latest);
             } else {
                 match self.call(METHOD, params.clone(), self.call_timeout) {
                     Ok(v) => {
                         if decode_goto(METHOD, v)?.is_empty() {
-                            last = "empty result".to_string();
+                            last = Waiting::Probe(ProbeAnswer::Empty);
                         } else {
                             // The reader stores a status sent ahead of this
                             // answer before delivering it: a reload the server
                             // announced mid-probe voids the answer.
                             match lock(&self.status).unmet_signal() {
                                 None => return Ok(()),
-                                Some(unmet) => last = unmet,
+                                Some((signal, latest)) => last = Waiting::Signal(signal, latest),
                             }
                         }
                     }
-                    Err(e) if is_fatal_transport(&e) => return Err(e),
-                    Err(e) => last = e.to_string(),
+                    Err(LspError::Rpc { message, .. }) => {
+                        last = Waiting::Probe(ProbeAnswer::Refused { message });
+                    }
+                    Err(LspError::Timeout { after, .. }) => {
+                        last = Waiting::Probe(ProbeAnswer::NoResponse { after });
+                    }
+                    // Anything else means the transport is gone: probing a
+                    // dead process to the deadline would only delay the
+                    // pool's respawn.
+                    Err(e) => return Err(e),
                 }
             }
-            self.check_reported_failure()?;
+            self.check_failures()?;
             if Instant::now() > deadline {
-                return Err(LspError::ReadyDeadline {
-                    path: path.to_string(),
-                    line,
-                    character: col,
-                    after: self.ready_deadline,
-                    last,
-                    stderr: self.stderr_tail(),
+                let (after, stderr) = (self.ready_deadline, self.stderr_tail());
+                return Err(match last {
+                    Waiting::Signal(signal, latest) => LspError::ReadySignalDeadline {
+                        signal: Box::new(signal),
+                        latest: latest.map(Box::new),
+                        after,
+                        stderr,
+                    },
+                    Waiting::Probe(last) => LspError::ReadyProbeDeadline {
+                        path: path.to_string(),
+                        line,
+                        character: col,
+                        after,
+                        last,
+                        stderr,
+                    },
                 });
             }
             thread::sleep(self.ready_retry);
         }
     }
 
-    /// [`LspError::ServerReported`] when the latest watched status matches a
-    /// declared [`ReadyFailure`].
-    fn check_reported_failure(&self) -> Result<(), LspError> {
+    /// Judges the declared [`ClientConfig::ready_failures`] and
+    /// [`ClientConfig::diagnostic_failures`] against everything the server
+    /// has said SO FAR, and returns [`LspError::ServerReported`] when one
+    /// holds. Sends nothing and waits for nothing, so a caller can ask after
+    /// its queries as well as before them.
+    ///
+    /// WHY AFTER: a server keeps talking once it has answered. Measured:
+    /// gopls answers a readiness probe, then publishes the `go list`
+    /// diagnostic that says the module never loaded about a second later,
+    /// its own diagnostics delay; rust-analyzer reports quiescent and sends
+    /// its `cargo check` diagnostics some 0.3 s after on an idle machine,
+    /// later on a loaded one. [`Client::await_ready`] can pass before either
+    /// arrives.
+    ///
+    /// WHAT THIS CANNOT PROMISE: `Ok` means no declared failure has ARRIVED,
+    /// never that none will. No message says "that was every diagnostic", so
+    /// nothing here or in the protocol's push model can wait for the last
+    /// one; a caller that must cover a server's delay waits that long itself
+    /// before asking. A server that publishes nothing unasked is judged on
+    /// nothing until [`Client::pull_diagnostics`] has been called for the
+    /// documents that matter.
+    pub fn check_failures(&self) -> Result<(), LspError> {
         let failure = lock(&self.status).failure();
         match failure {
-            Some((method, message)) => Err(LspError::ServerReported {
-                method,
-                message,
+            Some(reported) => Err(LspError::ServerReported {
+                method: reported.method,
+                message: reported.message,
+                locations: reported.locations,
                 stderr: self.stderr_tail(),
             }),
             None => Ok(()),
         }
+    }
+
+    /// Every diagnostic the server currently holds, across all documents:
+    /// for each document the latest publish (or pull), sorted by document
+    /// URI and then in the server's own order. A document whose latest
+    /// publish was empty has none.
+    ///
+    /// This is a reading of what has ARRIVED, with the timing limits of
+    /// [`Client::check_failures`]: a server diagnoses on its own schedule,
+    /// many only for documents that are open, and re-opening a document (as
+    /// every query does) can make a server withdraw and later re-send that
+    /// document's diagnostics.
+    pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
+        lock(&self.status).published()
+    }
+
+    /// Opens `path` (didOpen with `content`) and ASKS the server for that
+    /// document's diagnostics with `textDocument/diagnostic` (LSP 3.17),
+    /// returning them and storing them as that document's current
+    /// diagnostics, exactly as a publish would.
+    ///
+    /// For a server that does not push: TypeScript's server publishes
+    /// diagnostics for `tsconfig.json` only, and reports a syntax error, a
+    /// type error or an unresolved import in a source file to nobody until
+    /// asked. The answer is also causally bound to the request, which no
+    /// pushed publish is.
+    ///
+    /// Refused with [`LspError::Unsupported`], nothing sent, when the server
+    /// did not advertise `diagnosticProvider`. A report that says the
+    /// diagnostics are unchanged returns what is stored. Diagnostics the
+    /// server reports for related documents are stored under their own URIs.
+    pub fn pull_diagnostics(
+        &mut self,
+        path: &str,
+        content: &str,
+    ) -> Result<Vec<PublishedDiagnostic>, LspError> {
+        const METHOD: &str = "textDocument/diagnostic";
+        self.require_capability(METHOD, "diagnosticProvider")?;
+        self.did_open(path, content)?;
+        let uri = file_uri(path).to_string();
+        let params = json!({"textDocument": {"uri": uri}});
+        let report = self.query_with_retry(METHOD, path, params)?;
+        let malformed = || LspError::Rpc {
+            method: METHOD.to_string(),
+            message: format!("decode response: not a document diagnostic report: {report}"),
+        };
+        let mut status = lock(&self.status);
+        if let Some(related) = report.get("relatedDocuments").and_then(Value::as_object) {
+            for (related_uri, related_report) in related {
+                if let Some(items) = related_report.get("items").and_then(Value::as_array) {
+                    status
+                        .store_diagnostics(related_uri, items)
+                        .ok_or_else(malformed)?;
+                }
+            }
+        }
+        match report.get("items").and_then(Value::as_array) {
+            Some(items) => status
+                .store_diagnostics(&uri, items)
+                .ok_or_else(malformed)?,
+            None if report.get("kind").and_then(Value::as_str) == Some("unchanged") => {}
+            None => return Err(malformed()),
+        }
+        Ok(status.diagnostics.get(&uri).cloned().unwrap_or_default())
+    }
+
+    /// What the server shows for the symbol at the zero-based (line, UTF-16
+    /// character) position in `path`: its signature and its documentation,
+    /// including for a symbol defined OUTSIDE the workspace — the standard
+    /// library, a dependency. `content` is the authoritative text sent via
+    /// didOpen. `Ok(None)` when the server has nothing for the position: it
+    /// answered `null`, or with empty content.
+    ///
+    /// The text is the server's, in one of the formats declared in
+    /// [`ClientConfig::hover_content_format`], and [`Hover::kind`] says
+    /// which. What it contains is the server's choice and differs by server:
+    /// a signature in a code fence, then prose, sometimes a link.
+    ///
+    /// Refused with [`LspError::Unsupported`], nothing sent, when the server
+    /// did not advertise `hoverProvider`. Otherwise the outcome discipline is
+    /// that of [`Client::definition`]: `None` does NOT distinguish "nothing
+    /// to show" from "not ready", so gate with [`Client::await_ready`] first.
+    /// A server can only show documentation it can read: the dependency's
+    /// source or declarations must be where the server looks for them.
+    ///
+    /// A POSITION OUTSIDE THE TEXT COSTS THE WHOLE `query_deadline` on a
+    /// server that refuses it. A refusal (JSON-RPC error) is also how a
+    /// loading server says "not yet", the two cannot be told apart, and so
+    /// every refusal is retried: the call returns
+    /// [`LspError::QueryDeadline`] only once the deadline is spent, with the
+    /// server's refusal as `last`. Measured: gopls refuses a column past the
+    /// end of its line and a line past the end of the file; rust-analyzer
+    /// refuses the line and answers the column with `None`.
+    /// [`Client::definition`] behaves the same. A caller that cannot rule
+    /// such positions out declares a `query_deadline` it can afford.
+    pub fn hover(
+        &mut self,
+        path: &str,
+        content: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Hover>, LspError> {
+        const METHOD: &str = "textDocument/hover";
+        self.require_capability(METHOD, "hoverProvider")?;
+        self.did_open(path, content)?;
+        let params = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": character},
+        });
+        let v = self.query_with_retry(METHOD, path, params)?;
+        decode_hover(METHOD, path, v)
     }
 
     /// Resolves where the symbol at the zero-based (line, UTF-16 col) position
@@ -2199,7 +3101,9 @@ impl Client {
     ///
     /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
     /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
-    /// units; see [`SymbolLocation`].
+    /// units; see [`SymbolLocation`]. A position outside the text that the
+    /// server refuses is retried until `query_deadline` and ends as
+    /// [`LspError::QueryDeadline`], as [`Client::hover`] describes.
     ///
     /// Unlike `rename` this does NOT prime the workspace: priming re-opens
     /// every sibling file, which is amortizable across one rename but not
@@ -3072,7 +3976,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The connection's read loop: parses Content-Length frames and routes each
 /// message. Responses are matched to pending requests by id;
-/// `textDocument/publishDiagnostics` notifications are forwarded into the
+/// `textDocument/publishDiagnostics` notifications are stored per document
+/// in the shared [`StatusWatch`] and then forwarded into the
 /// bounded diagnostics queue with `try_send` so a full buffer DROPS the
 /// message and never blocks the loop; other server→client requests are
 /// answered with method-not-found; malformed messages are skipped. On
@@ -3102,7 +4007,16 @@ fn read_loop(
         let Some(obj) = msg.as_object() else { continue };
 
         if let Some(method) = obj.get("method").and_then(Value::as_str) {
-            if method == "textDocument/publishDiagnostics" {
+            if method == PUBLISH_DIAGNOSTICS_METHOD {
+                if let Some(params) = obj.get("params") {
+                    // Kept before it is offered to a waiting `diagnostics`
+                    // call: that queue drops on overflow and is read by one
+                    // call for one document, while the store answers for
+                    // every document at any time.
+                    let mut watch = lock(&status);
+                    watch.observe(method, Some(params));
+                    watch.publish(params);
+                }
                 if let Some(params) = obj.get("params")
                     && let Ok(p) =
                         serde_json::from_value::<lt::PublishDiagnosticsParams>(params.clone())
@@ -6386,7 +7300,7 @@ mod tests {
             .await_ready("/work/main.rs", "fn main() {}\n", 4, 11)
             .unwrap_err();
         match err {
-            LspError::ReadyDeadline {
+            LspError::ReadyProbeDeadline {
                 ref path,
                 line,
                 character,
@@ -6395,9 +7309,70 @@ mod tests {
             } => {
                 assert_eq!(path, "/work/main.rs");
                 assert_eq!((line, character), (4, 11));
-                assert!(last.contains("empty"), "last: {last}");
+                assert_eq!(*last, ProbeAnswer::Empty);
             }
-            other => panic!("want ReadyDeadline, got {other:?}"),
+            other => panic!("want ReadyProbeDeadline, got {other:?}"),
+        }
+    }
+
+    /// The last probe's outcome is data, one variant per way a probe can
+    /// fail to resolve, so a caller never reads it out of a sentence.
+    #[test]
+    fn a_probe_deadline_says_how_the_last_probe_ended() {
+        let probe_under = |answer: fn() -> Option<Result<Value, String>>, call_timeout| {
+            let (client_conn, server_conn) = conn_pair();
+            spawn_query_server(server_conn, move |method, _| match method {
+                "textDocument/definition" => answer(),
+                _ => None,
+            });
+            let mut c = ready_client(client_conn);
+            c.ready_retry = Duration::from_millis(5);
+            c.ready_deadline = Duration::from_millis(60);
+            c.call_timeout = call_timeout;
+            match c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3) {
+                Err(LspError::ReadyProbeDeadline { last, .. }) => last,
+                other => panic!("want ReadyProbeDeadline, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            probe_under(
+                || Some(Err("waiting for cargo metadata".to_string())),
+                Duration::from_secs(2)
+            ),
+            ProbeAnswer::Refused {
+                message: "waiting for cargo metadata".to_string()
+            }
+        );
+        assert_eq!(
+            probe_under(|| Some(Ok(Value::Null)), Duration::from_secs(2)),
+            ProbeAnswer::Empty
+        );
+
+        // A server that takes the probe and never answers it.
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+                    reply_ok(&mut w, &msg["id"], json!({"capabilities": {}}));
+                }
+            }
+        });
+        let mut c = ready_client(client_conn);
+        c.ready_deadline = Duration::ZERO;
+        c.call_timeout = Duration::from_millis(40);
+        match c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3) {
+            Err(LspError::ReadyProbeDeadline { last, .. }) => assert_eq!(
+                last,
+                ProbeAnswer::NoResponse {
+                    after: Duration::from_millis(40)
+                }
+            ),
+            other => panic!("want ReadyProbeDeadline, got {other:?}"),
         }
     }
 
@@ -6470,6 +7445,7 @@ mod tests {
             method: "experimental/serverStatus".to_string(),
             when: json!({"health": "error", "quiescent": true}),
             message_pointer: Some("/message".to_string()),
+            mode: ReadyMode::Latest,
         }
     }
 
@@ -6599,7 +7575,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    LspError::ServerReported { .. } | LspError::ReadyDeadline { .. }
+                    LspError::ServerReported { .. } | LspError::ReadyProbeDeadline { .. }
                 ),
                 "{err:?}"
             );
@@ -6622,10 +7598,12 @@ mod tests {
             Err(LspError::ServerReported {
                 ref method,
                 ref message,
+                ref locations,
                 ref stderr,
             }) => {
                 assert_eq!(method, "experimental/serverStatus");
                 assert_eq!(message, "Failed to load workspaces.");
+                assert!(locations.is_empty(), "no diagnostic rule was declared");
                 assert!(!stderr.captured, "an in-memory transport has no stderr");
             }
             other => panic!("want ServerReported, got {other:?}"),
@@ -6640,6 +7618,7 @@ mod tests {
         ReadySignal {
             method: "experimental/serverStatus".to_string(),
             when: json!({"quiescent": true}),
+            mode: ReadyMode::Latest,
         }
     }
 
@@ -6666,35 +7645,44 @@ mod tests {
 
     #[test]
     fn a_declared_ready_signal_not_yet_sent_holds_every_probe_and_names_itself() {
-        // (statuses sent, what the error must report as last seen)
+        // (statuses sent, the latest params the error must carry)
         let cases = [
-            (Vec::new(), "latest: none"),
+            (Vec::new(), None),
             (
                 vec![server_status("ok", false, "loading")],
-                "\"message\":\"loading\"",
+                Some(server_status("ok", false, "loading").1),
             ),
             (
                 vec![
                     server_status("ok", true, ""),
                     server_status("ok", false, "reloading"),
                 ],
-                "\"message\":\"reloading\"",
+                Some(server_status("ok", false, "reloading").1),
             ),
         ];
-        for (statuses, latest) in cases {
+        for (statuses, want_latest) in cases {
             let (got, probes) = await_ready_signalled(statuses.clone(), vec![quiescent_signal()]);
             assert_eq!(probes, 0, "{statuses:?}: probed a server still loading");
             match got {
-                Err(LspError::ReadyDeadline { ref last, .. }) => {
+                Err(LspError::ReadySignalDeadline {
+                    ref signal,
+                    ref latest,
+                    after,
+                    ..
+                }) => {
+                    assert_eq!(**signal, quiescent_signal(), "{statuses:?}");
+                    assert_eq!(latest.as_deref(), want_latest.as_ref(), "{statuses:?}");
+                    assert_eq!(after, Duration::from_millis(120));
+                    let shown = got.as_ref().unwrap_err().to_string();
                     assert!(
-                        last.starts_with(
-                            "experimental/serverStatus has not reported {\"quiescent\":true}; latest: "
+                        shown.starts_with(
+                            "lsp: not ready: experimental/serverStatus did not report \
+                             {\"quiescent\":true} within 120ms; latest: "
                         ),
-                        "{statuses:?}: {last}"
+                        "{statuses:?}: {shown}"
                     );
-                    assert!(last.contains(latest), "{statuses:?}: {last}");
                 }
-                other => panic!("{statuses:?}: want ReadyDeadline, got {other:?}"),
+                other => panic!("{statuses:?}: want ReadySignalDeadline, got {other:?}"),
             }
         }
     }
@@ -6704,15 +7692,16 @@ mod tests {
         let other = ReadySignal {
             method: "$/loaded".to_string(),
             when: json!({"done": true}),
+            mode: ReadyMode::Latest,
         };
         let (got, probes) = await_ready_signalled(
             vec![server_status("ok", true, "")],
-            vec![quiescent_signal(), other],
+            vec![quiescent_signal(), other.clone()],
         );
         assert_eq!(probes, 0, "one met signal of two let a probe through");
         assert!(
-            matches!(got, Err(LspError::ReadyDeadline { ref last, .. })
-                if last.starts_with("$/loaded has not reported {\"done\":true}; latest: none")),
+            matches!(got, Err(LspError::ReadySignalDeadline { ref signal, latest: None, .. })
+                if **signal == other),
             "{got:?}"
         );
     }
@@ -6723,7 +7712,13 @@ mod tests {
             await_ready_signalled(vec![server_status("ok", false, "loading")], Vec::new());
         assert!(probes > 0, "undeclared, probing alone decides");
         assert!(
-            matches!(got, Err(LspError::ReadyDeadline { ref last, .. }) if last == "empty result"),
+            matches!(
+                got,
+                Err(LspError::ReadyProbeDeadline {
+                    last: ProbeAnswer::Empty,
+                    ..
+                })
+            ),
             "{got:?}"
         );
     }
@@ -6771,15 +7766,15 @@ mod tests {
     #[test]
     fn a_signal_alone_keeps_its_status_and_unwatching_it_forgets() {
         let mut watch = StatusWatch::default();
-        watch.set_watch(Vec::new(), vec![quiescent_signal()]);
+        watch.set_watch(Vec::new(), vec![quiescent_signal()], Vec::new());
         let (method, quiescent) = server_status("ok", true, "");
         watch.observe(&method, Some(&quiescent));
         assert_eq!(watch.unmet_signal(), None);
         assert_eq!(watch.failure(), None, "a signal is not a failure rule");
-        watch.set_watch(Vec::new(), Vec::new());
-        watch.set_watch(Vec::new(), vec![quiescent_signal()]);
+        watch.set_watch(Vec::new(), Vec::new(), Vec::new());
+        watch.set_watch(Vec::new(), vec![quiescent_signal()], Vec::new());
         let unmet = watch.unmet_signal().expect("forgotten status cannot meet");
-        assert!(unmet.ends_with("latest: none"), "{unmet}");
+        assert_eq!(unmet, (quiescent_signal(), None));
     }
 
     #[test]
@@ -6788,12 +7783,13 @@ mod tests {
         let signal = |when| ReadySignal {
             method: "$/loaded".to_string(),
             when,
+            mode: ReadyMode::Latest,
         };
-        watch.set_watch(Vec::new(), vec![signal(json!({}))]);
+        watch.set_watch(Vec::new(), vec![signal(json!({}))], Vec::new());
         watch.observe("$/loaded", None);
         let unmet = watch.unmet_signal().expect("null is not an object");
-        assert!(unmet.ends_with("latest: null"), "{unmet}");
-        watch.set_watch(Vec::new(), vec![signal(Value::Null)]);
+        assert_eq!(unmet.1, Some(Value::Null));
+        watch.set_watch(Vec::new(), vec![signal(Value::Null)], Vec::new());
         assert_eq!(watch.unmet_signal(), None, "null matches null");
     }
 
@@ -6808,9 +7804,243 @@ mod tests {
         );
         assert!(probes > 0, "a quiescent server must be probed");
         assert!(
-            matches!(got, Err(LspError::ReadyDeadline { ref last, .. }) if last == "empty result"),
+            matches!(
+                got,
+                Err(LspError::ReadyProbeDeadline {
+                    last: ProbeAnswer::Empty,
+                    ..
+                })
+            ),
             "the probe, not the signal, decides once the signal is met: {got:?}"
         );
+    }
+
+    /// gopls's "done loading": one `window/showMessage`, on a method that
+    /// goes on to carry unrelated messages.
+    fn finished_loading(mode: ReadyMode) -> ReadySignal {
+        ReadySignal {
+            method: "window/showMessage".to_string(),
+            when: json!({"message": "Finished loading packages."}),
+            mode,
+        }
+    }
+
+    fn show_message(kind: u8, message: &str) -> (String, Value) {
+        (
+            "window/showMessage".to_string(),
+            json!({"type": kind, "message": message}),
+        )
+    }
+
+    #[test]
+    fn a_later_notification_withdraws_a_latest_signal_and_never_a_once_signal() {
+        for mode in [ReadyMode::Latest, ReadyMode::Once] {
+            let signal = finished_loading(mode);
+            let mut watch = StatusWatch::default();
+            watch.set_watch(Vec::new(), vec![signal.clone()], Vec::new());
+            assert_eq!(
+                watch.unmet_signal(),
+                Some((signal.clone(), None)),
+                "{mode:?}: nothing sent yet"
+            );
+            let (method, loading) = show_message(4, "Loading packages...");
+            watch.observe(&method, Some(&loading));
+            assert_eq!(
+                watch.unmet_signal(),
+                Some((signal.clone(), Some(loading))),
+                "{mode:?}: another message on the method is not the signal"
+            );
+            let (_, finished) = show_message(3, "Finished loading packages.");
+            watch.observe(&method, Some(&finished));
+            assert_eq!(watch.unmet_signal(), None, "{mode:?}: the signal itself");
+            let (_, later) = show_message(4, "Calculating file diagnostics...");
+            watch.observe(&method, Some(&later));
+            let want = match mode {
+                ReadyMode::Latest => Some((signal.clone(), Some(later))),
+                ReadyMode::Once => None,
+            };
+            assert_eq!(
+                watch.unmet_signal(),
+                want,
+                "{mode:?}: after an unrelated message on the same method"
+            );
+        }
+    }
+
+    #[test]
+    fn a_once_signal_is_kept_only_while_that_exact_declaration_stands() {
+        let once = finished_loading(ReadyMode::Once);
+        let (method, finished) = show_message(3, "Finished loading packages.");
+        let (_, later) = show_message(3, "Done.");
+        let mut watch = StatusWatch::default();
+        watch.set_watch(Vec::new(), vec![once.clone()], Vec::new());
+        watch.observe(&method, Some(&finished));
+        watch.observe(&method, Some(&later));
+        assert_eq!(watch.unmet_signal(), None);
+
+        // Declared again, at another position: a warm server never repeats
+        // the event, so what was seen must follow the declaration.
+        watch.set_watch(
+            Vec::new(),
+            vec![quiescent_signal(), once.clone()],
+            Vec::new(),
+        );
+        assert_eq!(watch.unmet_signal(), Some((quiescent_signal(), None)));
+        let (status, quiescent) = server_status("ok", true, "");
+        watch.observe(&status, Some(&quiescent));
+        assert_eq!(
+            watch.unmet_signal(),
+            None,
+            "the once signal moved, still met"
+        );
+
+        // Any other declaration starts from what is kept: the latest status.
+        let other_text = ReadySignal {
+            when: json!({"message": "Loaded."}),
+            ..once.clone()
+        };
+        let as_state = finished_loading(ReadyMode::Latest);
+        for changed in [other_text, as_state, once.clone()] {
+            watch.set_watch(Vec::new(), vec![changed.clone()], Vec::new());
+            assert_eq!(
+                watch.unmet_signal(),
+                Some((changed.clone(), Some(later.clone()))),
+                "{changed:?} inherited another declaration's event"
+            );
+        }
+
+        watch.observe(&method, Some(&finished));
+        watch.observe(&method, Some(&later));
+        assert_eq!(watch.unmet_signal(), None, "precondition: met again");
+        watch.set_watch(Vec::new(), Vec::new(), Vec::new());
+        watch.set_watch(Vec::new(), vec![once.clone()], Vec::new());
+        assert_eq!(
+            watch.unmet_signal(),
+            Some((once, None)),
+            "an unwatched method forgets, events included"
+        );
+    }
+
+    #[test]
+    fn a_once_signal_declared_after_its_event_is_met_by_the_kept_status() {
+        let (method, finished) = show_message(3, "Finished loading packages.");
+        let (_, later) = show_message(3, "Done.");
+        let once = finished_loading(ReadyMode::Once);
+
+        let mut watch = StatusWatch::default();
+        watch.set_watch(
+            Vec::new(),
+            vec![finished_loading(ReadyMode::Latest)],
+            Vec::new(),
+        );
+        watch.observe(&method, Some(&finished));
+        watch.set_watch(Vec::new(), vec![once.clone()], Vec::new());
+        assert_eq!(watch.unmet_signal(), None, "the kept status is the event");
+        watch.observe(&method, Some(&later));
+        assert_eq!(watch.unmet_signal(), None, "and it stays met");
+
+        // Only the latest status of a watched method is kept, so an event
+        // already superseded when the signal is declared was never seen.
+        let mut watch = StatusWatch::default();
+        watch.set_watch(
+            Vec::new(),
+            vec![finished_loading(ReadyMode::Latest)],
+            Vec::new(),
+        );
+        watch.observe(&method, Some(&finished));
+        watch.observe(&method, Some(&later));
+        watch.set_watch(Vec::new(), vec![once.clone()], Vec::new());
+        assert_eq!(watch.unmet_signal(), Some((once, Some(later))));
+    }
+
+    #[test]
+    fn await_ready_probes_past_later_messages_under_once_and_holds_under_latest() {
+        let loaded_then_busy = vec![
+            show_message(4, "Loading packages..."),
+            show_message(3, "Finished loading packages."),
+            show_message(4, "Calculating file diagnostics..."),
+            show_message(3, "Done."),
+        ];
+        let done = show_message(3, "Done.").1;
+
+        let (got, probes) = await_ready_signalled(
+            loaded_then_busy.clone(),
+            vec![finished_loading(ReadyMode::Once)],
+        );
+        assert!(probes > 0, "a server that said it loaded must be probed");
+        assert!(
+            matches!(
+                got,
+                Err(LspError::ReadyProbeDeadline {
+                    last: ProbeAnswer::Empty,
+                    ..
+                })
+            ),
+            "the probe decides once the event was seen: {got:?}"
+        );
+
+        let latest = finished_loading(ReadyMode::Latest);
+        let (got, probes) = await_ready_signalled(loaded_then_busy, vec![latest.clone()]);
+        assert_eq!(probes, 0, "read as a state, the event was withdrawn");
+        assert!(
+            matches!(got, Err(LspError::ReadySignalDeadline { ref signal, latest: Some(ref said), .. })
+                if **signal == latest && **said == done),
+            "{got:?}"
+        );
+
+        // The event never sent: a once signal holds the gate like any other.
+        let once = finished_loading(ReadyMode::Once);
+        let (got, probes) = await_ready_signalled(
+            vec![
+                show_message(4, "Loading packages..."),
+                show_message(3, "Done."),
+            ],
+            vec![once.clone()],
+        );
+        assert_eq!(probes, 0, "probed a server that never said it loaded");
+        assert!(
+            matches!(got, Err(LspError::ReadySignalDeadline { ref signal, latest: Some(ref said), .. })
+                if **signal == once && **said == done),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_signal_declaration_silent_about_mode_is_latest_and_a_wrong_one_is_refused() {
+        let declare = |extra: Value| {
+            let mut declared = json!({
+                "method": "window/showMessage",
+                "when": {"message": "Finished loading packages."},
+            });
+            for (member, value) in extra.as_object().expect("an object of extra members") {
+                declared[member] = value.clone();
+            }
+            serde_json::from_value::<ReadySignal>(declared)
+        };
+        assert_eq!(
+            declare(json!({})).expect("the two-member form"),
+            finished_loading(ReadyMode::Latest)
+        );
+        for (name, mode) in [("latest", ReadyMode::Latest), ("once", ReadyMode::Once)] {
+            let declared = declare(json!({"mode": name})).expect(name);
+            assert_eq!(declared, finished_loading(mode));
+            assert_eq!(
+                serde_json::to_value(&declared).expect("serializes")["mode"],
+                json!(name)
+            );
+        }
+        // Either mistake read as `latest` would be the hang the mode exists
+        // to prevent, with nothing to say why.
+        for wrong in [
+            json!({"mode": "sticky"}),
+            json!({"mode": "Once"}),
+            json!({"mod": "once"}),
+        ] {
+            assert!(
+                declare(wrong.clone()).is_err(),
+                "{wrong} must be refused, never defaulted"
+            );
+        }
     }
 
     #[test]
@@ -6892,7 +8122,7 @@ mod tests {
             Duration::from_millis(150),
         );
         assert!(
-            matches!(got, Err(LspError::ReadyDeadline { .. })),
+            matches!(got, Err(LspError::ReadyProbeDeadline { .. })),
             "undeclared: probing alone decides, got {got:?}"
         );
     }
@@ -6914,8 +8144,8 @@ mod tests {
                 Duration::from_millis(150),
             );
             assert!(
-                matches!(got, Err(LspError::ReadyDeadline { .. })),
-                "{statuses:?}: want ReadyDeadline, got {got:?}"
+                matches!(got, Err(LspError::ReadyProbeDeadline { .. })),
+                "{statuses:?}: want ReadyProbeDeadline, got {got:?}"
             );
         }
     }
@@ -6961,15 +8191,1057 @@ mod tests {
     #[test]
     fn unwatching_a_status_forgets_it() {
         let mut watch = StatusWatch::default();
-        watch.set_watch(vec![status_rule()], Vec::new());
+        watch.set_watch(vec![status_rule()], Vec::new(), Vec::new());
         let (method, failed) = server_status("error", true, "old failure");
         watch.latest.insert(method, failed);
         assert!(watch.failure().is_some());
         // Unwatched, a recovery notification would be dropped; re-watching
         // must not resurrect the failure it superseded.
-        watch.set_watch(Vec::new(), Vec::new());
-        watch.set_watch(vec![status_rule()], Vec::new());
+        watch.set_watch(Vec::new(), Vec::new(), Vec::new());
+        watch.set_watch(vec![status_rule()], Vec::new(), Vec::new());
         assert_eq!(watch.failure(), None);
+    }
+
+    #[test]
+    fn a_once_failure_is_kept_only_while_its_exact_rule_stays_declared() {
+        let once = ReadyFailure {
+            mode: ReadyMode::Once,
+            ..status_rule()
+        };
+        let message = |watch: &StatusWatch| watch.failure().map(|reported| reported.message);
+        let mut watch = StatusWatch::default();
+        watch.set_watch(vec![once.clone()], Vec::new(), Vec::new());
+        // Two matches, so the one held is told apart from the latest one kept
+        // for the method.
+        let (method, first) = server_status("error", true, "first failure");
+        let (_, second) = server_status("error", true, "second failure");
+        watch.observe(&method, Some(&first));
+        watch.observe(&method, Some(&second));
+
+        // A caller that configures again without touching the rule must not
+        // lose a failure the server will never repeat.
+        watch.set_watch(vec![once.clone()], Vec::new(), Vec::new());
+        assert_eq!(message(&watch), Some("first failure".to_string()));
+
+        // A changed rule is a different question: what the old one saw does
+        // not answer it, and neither does the notification still kept for
+        // the method, though it matches.
+        let changed = ReadyFailure {
+            when: json!({"health": "error"}),
+            ..once
+        };
+        watch.set_watch(vec![changed], Vec::new(), Vec::new());
+        assert_eq!(watch.failure(), None);
+        let (_, third) = server_status("error", false, "third failure");
+        watch.observe(&method, Some(&third));
+        assert_eq!(message(&watch), Some("third failure".to_string()));
+    }
+
+    // ---- diagnostics kept per document, and the rules judged on them ----
+
+    /// One LSP `Diagnostic` as a server sends it, spanning columns 2 to 9 of
+    /// `line`.
+    fn wire_diagnostic(line: u32, severity: u8, source: &str, message: &str) -> Value {
+        json!({
+            "range": {
+                "start": {"line": line, "character": 2},
+                "end": {"line": line, "character": 9},
+            },
+            "severity": severity,
+            "source": source,
+            "message": message,
+        })
+    }
+
+    fn publish_params(uri: &str, diagnostics: Vec<Value>) -> Value {
+        json!({"uri": uri, "diagnostics": diagnostics})
+    }
+
+    /// A publish as a status server pushes it.
+    fn published(uri: &str, diagnostics: Vec<Value>) -> (String, Value) {
+        (
+            PUBLISH_DIAGNOSTICS_METHOD.to_string(),
+            publish_params(uri, diagnostics),
+        )
+    }
+
+    fn diagnostic_rule(when: Value, file_name: Option<&str>, mode: ReadyMode) -> DiagnosticFailure {
+        DiagnosticFailure {
+            when,
+            file_name: file_name.map(str::to_string),
+            mode,
+        }
+    }
+
+    /// A watch rooted at `/work` under `rules`.
+    fn diagnostic_watch(rules: Vec<DiagnosticFailure>) -> StatusWatch {
+        let mut watch = StatusWatch::default();
+        watch.set_root(Path::new("/work"));
+        watch.set_watch(Vec::new(), Vec::new(), rules);
+        watch
+    }
+
+    /// (path, message) of each diagnostic, in the order given.
+    fn summary(diagnostics: &[PublishedDiagnostic]) -> Vec<(&str, &str)> {
+        diagnostics
+            .iter()
+            .map(|d| (d.path.as_str(), d.message.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_later_publish_replaces_a_documents_diagnostics_and_an_empty_one_clears_them() {
+        let (a, go_mod) = ("file:///work/a.go", "file:///work/go.mod");
+        let mut watch = diagnostic_watch(Vec::new());
+        assert!(watch.published().is_empty());
+
+        watch.publish(&publish_params(
+            a,
+            vec![
+                wire_diagnostic(0, 1, "compiler", "first"),
+                wire_diagnostic(3, 2, "compiler", "second"),
+            ],
+        ));
+        watch.publish(&publish_params(
+            go_mod,
+            vec![wire_diagnostic(5, 1, "syntax", "unterminated")],
+        ));
+        assert_eq!(
+            summary(&watch.published()),
+            [
+                ("a.go", "first"),
+                ("a.go", "second"),
+                ("go.mod", "unterminated")
+            ],
+            "by document, then in the server's order"
+        );
+
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(7, 1, "compiler", "third")],
+        ));
+        assert_eq!(
+            summary(&watch.published()),
+            [("a.go", "third"), ("go.mod", "unterminated")],
+            "a later publish replaces that document's list and no other's"
+        );
+
+        watch.publish(&publish_params(a, Vec::new()));
+        assert_eq!(
+            summary(&watch.published()),
+            [("go.mod", "unterminated")],
+            "an empty publish clears that document and no other"
+        );
+
+        watch.publish(&publish_params(go_mod, Vec::new()));
+        assert!(watch.published().is_empty());
+        assert!(
+            watch.diagnostics.is_empty(),
+            "a cleared document leaves no entry behind"
+        );
+    }
+
+    #[test]
+    fn the_read_loop_keeps_each_documents_latest_diagnostics_with_no_rule_declared() {
+        let import = json!({
+            "range": {
+                "start": {"line": 2, "character": 7},
+                "end": {"line": 2, "character": 32},
+            },
+            "severity": 1,
+            "source": "compiler",
+            "code": "BrokenImport",
+            "message": "could not import example.com/missing/pkg",
+            "tags": [1],
+        });
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(
+            server_conn,
+            vec![
+                published(
+                    "file:///work/a.go",
+                    vec![wire_diagnostic(0, 1, "compiler", "superseded")],
+                ),
+                published(
+                    "file:///work/go.mod",
+                    vec![wire_diagnostic(5, 1, "syntax", "unterminated")],
+                ),
+                published("file:///work/a.go", vec![import.clone()]),
+                published(
+                    "file:///work/b.go",
+                    vec![wire_diagnostic(1, 2, "compiler", "withdrawn")],
+                ),
+                published("file:///work/b.go", Vec::new()),
+            ],
+            StatusAt::Initialized,
+        );
+        let mut c = status_client(client_conn, Vec::new(), Duration::from_secs(10));
+        round_trip(&mut c);
+        assert_eq!(
+            c.published_diagnostics(),
+            vec![
+                PublishedDiagnostic {
+                    uri: "file:///work/a.go".to_string(),
+                    path: "a.go".to_string(),
+                    start_line: 2,
+                    start_char: 7,
+                    end_line: 2,
+                    end_char: 32,
+                    severity: Some(Severity::Error),
+                    source: Some("compiler".to_string()),
+                    code: Some("BrokenImport".to_string()),
+                    message: "could not import example.com/missing/pkg".to_string(),
+                    raw: import,
+                },
+                PublishedDiagnostic {
+                    uri: "file:///work/go.mod".to_string(),
+                    path: "go.mod".to_string(),
+                    start_line: 5,
+                    start_char: 2,
+                    end_line: 5,
+                    end_char: 9,
+                    severity: Some(Severity::Error),
+                    source: Some("syntax".to_string()),
+                    code: None,
+                    message: "unterminated".to_string(),
+                    raw: wire_diagnostic(5, 1, "syntax", "unterminated"),
+                },
+            ]
+        );
+        c.check_failures()
+            .expect("with no rule declared no diagnostic is a failure");
+    }
+
+    #[test]
+    fn a_diagnostic_is_read_with_what_the_server_sent_and_nothing_it_did_not() {
+        // (members beside range and message, severity, source, code)
+        let cases = [
+            (json!({}), None, None, None),
+            (
+                json!({"severity": 1, "source": "compiler", "code": "BrokenImport"}),
+                Some(Severity::Error),
+                Some("compiler"),
+                Some("BrokenImport"),
+            ),
+            (
+                json!({"severity": 2, "code": 5023}),
+                Some(Severity::Warning),
+                None,
+                Some("5023"),
+            ),
+            (
+                json!({"severity": 3, "source": "ts"}),
+                Some(Severity::Information),
+                Some("ts"),
+                None,
+            ),
+            (json!({"severity": 4}), Some(Severity::Hint), None, None),
+            (json!({"severity": 9}), Some(Severity::Other(9)), None, None),
+        ];
+        for (extra, severity, source, code) in cases {
+            let mut raw = json!({
+                "range": {
+                    "start": {"line": 4, "character": 13},
+                    "end": {"line": 5, "character": 1},
+                },
+                "message": "said",
+            });
+            for (member, value) in extra.as_object().expect("an object of extra members") {
+                raw[member] = value.clone();
+            }
+            let got = PublishedDiagnostic::decode("file:///work/a.go", "a.go", &raw)
+                .unwrap_or_else(|| panic!("{raw} is a well-formed diagnostic"));
+            assert_eq!(
+                (got.start_line, got.start_char, got.end_line, got.end_char),
+                (4, 13, 5, 1),
+                "{raw}"
+            );
+            assert_eq!(got.severity, severity, "{raw}");
+            assert_eq!(got.source.as_deref(), source, "{raw}");
+            assert_eq!(got.code.as_deref(), code, "{raw}");
+            assert_eq!(
+                (got.uri.as_str(), got.path.as_str()),
+                ("file:///work/a.go", "a.go")
+            );
+            assert_eq!(got.message, "said");
+            assert_eq!(got.raw, raw);
+        }
+    }
+
+    #[test]
+    fn a_malformed_publish_changes_nothing() {
+        let a = "file:///work/a.go";
+        let mut watch = diagnostic_watch(Vec::new());
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(0, 1, "compiler", "kept")],
+        ));
+        let before = watch.published();
+        assert_eq!(summary(&before), [("a.go", "kept")]);
+
+        let range = wire_diagnostic(1, 1, "compiler", "new")["range"].clone();
+        for broken in [
+            json!({"message": "no range"}),
+            json!({"range": range}),
+            json!({"range": "0:0", "message": "a range that is not one"}),
+            json!("not an object"),
+        ] {
+            watch.publish(&publish_params(
+                a,
+                vec![wire_diagnostic(1, 1, "compiler", "new"), broken.clone()],
+            ));
+            assert_eq!(watch.published(), before, "{broken}");
+        }
+        for params in [
+            json!({"uri": a}),
+            json!({"diagnostics": []}),
+            json!({"uri": 7, "diagnostics": []}),
+            json!({"uri": a, "diagnostics": {}}),
+            Value::Null,
+        ] {
+            watch.publish(&params);
+            assert_eq!(watch.published(), before, "{params}");
+        }
+    }
+
+    #[test]
+    fn a_rule_selects_one_diagnostic_by_its_declared_fields_and_file_name() {
+        let coded = |line, source: &str, code: Value, message: &str| {
+            let mut d = wire_diagnostic(line, 1, source, message);
+            d["code"] = code;
+            d
+        };
+        let mut watch = diagnostic_watch(Vec::new());
+        watch.publish(&publish_params(
+            "file:///work/a.go",
+            vec![
+                wire_diagnostic(0, 2, "go list", "initialization failed"),
+                coded(2, "compiler", json!("BrokenImport"), "could not import"),
+            ],
+        ));
+        watch.publish(&publish_params(
+            "file:///work/go.mod",
+            vec![
+                wire_diagnostic(5, 1, "syntax", "unterminated block"),
+                wire_diagnostic(2, 2, "go mod tidy", "unused requirement"),
+            ],
+        ));
+        watch.publish(&publish_params(
+            "file:///work/sub/b.go",
+            vec![coded(
+                3,
+                "compiler",
+                json!("IncompatibleAssign"),
+                "cannot use",
+            )],
+        ));
+        watch.publish(&publish_params(
+            "file:///work/tsconfig.json",
+            vec![coded(1, "ts", json!(5023), "unknown compiler option")],
+        ));
+
+        // (when, file name pattern, the messages it must select)
+        let cases: Vec<(Value, Option<&str>, Vec<&str>)> = vec![
+            (
+                json!({"source": "go list"}),
+                None,
+                vec!["initialization failed"],
+            ),
+            (
+                json!({"severity": 1}),
+                Some("go.mod"),
+                vec!["unterminated block"],
+            ),
+            (
+                json!({"severity": 1}),
+                Some("*.go"),
+                vec!["could not import", "cannot use"],
+            ),
+            (
+                json!({}),
+                Some("go.mod"),
+                vec!["unterminated block", "unused requirement"],
+            ),
+            (
+                json!({"code": "BrokenImport"}),
+                None,
+                vec!["could not import"],
+            ),
+            (json!({"code": 5023}), None, vec!["unknown compiler option"]),
+            // Matched as the server sent it: a number is not its digits.
+            (json!({"code": "5023"}), None, vec![]),
+            (
+                json!({"severity": 1, "source": "compiler"}),
+                Some("a.*"),
+                vec!["could not import"],
+            ),
+            (json!({"source": "nobody"}), None, vec![]),
+            // The pattern is the whole file name, and only the file name.
+            (json!({"severity": 1}), Some("mod"), vec![]),
+            (json!({"severity": 1}), Some("sub"), vec![]),
+            (json!({"severity": 1}), Some("sub/*"), vec![]),
+        ];
+        for (when, file_name, want) in cases {
+            let rule = diagnostic_rule(when, file_name, ReadyMode::Latest);
+            watch.set_watch(Vec::new(), Vec::new(), vec![rule.clone()]);
+            let failing = watch.failing_diagnostics();
+            let got: Vec<&str> = failing.iter().map(|d| d.message.as_str()).collect();
+            assert_eq!(got, want, "{rule:?}");
+            assert_eq!(
+                watch.failure().is_some(),
+                !want.is_empty(),
+                "{rule:?}: a rule fails exactly when it selects a diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_name_pattern_matches_whole_names_with_a_star_for_any_run() {
+        // (pattern, name, whether it matches)
+        let cases = [
+            ("go.mod", "go.mod", true),
+            ("go.mod", "go.modx", false),
+            ("go.mod", "xgo.mod", false),
+            ("Go.mod", "go.mod", false),
+            ("*.go", "a.go", true),
+            ("*.go", ".go", true),
+            ("*.go", "a.go.bak", false),
+            ("*", "", true),
+            ("*", "anything", true),
+            ("", "", true),
+            ("", "a", false),
+            ("a*b*c", "abc", true),
+            ("a*b*c", "aXbYc", true),
+            ("a*b*c", "aXbYcZ", false),
+            ("a*b*c", "abcbc", true),
+            ("a**b", "ab", true),
+            ("*.d.ts", "lib.dom.d.ts", true),
+            ("tsconfig*.json", "tsconfig.build.json", true),
+            ("tsconfig*.json", "tsconfig.json", true),
+            // Only `*` is special.
+            ("?.go", "a.go", false),
+            ("[ab].go", "a.go", false),
+            ("*é", "café", true),
+        ];
+        for (pattern, name, want) in cases {
+            assert_eq!(
+                wildcard_match(pattern, name),
+                want,
+                "{pattern:?} on {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_diagnostic_stops_readiness_at_once_with_every_location() {
+        let import = {
+            let mut d = wire_diagnostic(2, 1, "compiler", "could not import example.com/x");
+            d["code"] = json!("BrokenImport");
+            d
+        };
+        let (client_conn, server_conn) = conn_pair();
+        let probes = spawn_status_server(
+            server_conn,
+            vec![
+                published(
+                    "file:///work/go.mod",
+                    vec![wire_diagnostic(5, 1, "syntax", "unterminated block")],
+                ),
+                published(
+                    "file:///work/a.go",
+                    vec![
+                        wire_diagnostic(0, 2, "go list", "initialization failed"),
+                        wire_diagnostic(4, 2, "compiler", "unused variable"),
+                    ],
+                ),
+                published("file:///work/b.go", vec![import]),
+            ],
+            StatusAt::Initialized,
+        );
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        let mut cfg = c.config();
+        cfg.diagnostic_failures = vec![
+            diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Latest),
+            diagnostic_rule(json!({"severity": 1}), None, ReadyMode::Latest),
+        ];
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        round_trip(&mut c);
+
+        let start = Instant::now();
+        let got = c.await_ready("/work/a.go", "package t\n", 0, 3);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must not wait out the deadline: {:?}",
+            start.elapsed()
+        );
+        match got {
+            Err(LspError::ServerReported {
+                ref method,
+                ref message,
+                ref locations,
+                ..
+            }) => {
+                assert_eq!(method, PUBLISH_DIAGNOSTICS_METHOD);
+                assert_eq!(
+                    message, "initialization failed",
+                    "the first failing diagnostic's message stands for the report"
+                );
+                assert_eq!(
+                    summary(locations),
+                    [
+                        ("a.go", "initialization failed"),
+                        ("b.go", "could not import example.com/x"),
+                        ("go.mod", "unterminated block"),
+                    ],
+                    "every diagnostic a rule selects, and none it does not"
+                );
+                let go_mod = &locations[2];
+                assert_eq!(go_mod.uri, "file:///work/go.mod");
+                assert_eq!(
+                    (
+                        go_mod.start_line,
+                        go_mod.start_char,
+                        go_mod.end_line,
+                        go_mod.end_char
+                    ),
+                    (5, 2, 5, 9)
+                );
+                assert_eq!(go_mod.severity, Some(Severity::Error));
+                assert_eq!(go_mod.source.as_deref(), Some("syntax"));
+                assert_eq!(locations[1].code.as_deref(), Some("BrokenImport"));
+            }
+            ref other => panic!("want ServerReported, got {other:?}"),
+        }
+        assert_eq!(
+            got.unwrap_err().to_string(),
+            "lsp: not ready: server reported failure via textDocument/publishDiagnostics: \
+             initialization failed\
+             \n  at a.go:1:3: initialization failed [go list]\
+             \n  at b.go:3:3: could not import example.com/x [compiler BrokenImport]\
+             \n  at go.mod:6:3: unterminated block [syntax]"
+        );
+        round_trip(&mut c);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "a server that already reported the failure must not be probed"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_diagnostic_stops_failing_under_latest_and_keeps_failing_under_once() {
+        let a = "file:///work/a.go";
+        let failing = wire_diagnostic(0, 2, "go list", "initialization failed");
+        for mode in [ReadyMode::Latest, ReadyMode::Once] {
+            let rule = diagnostic_rule(json!({"source": "go list"}), None, mode);
+            let mut watch = diagnostic_watch(vec![rule]);
+            assert_eq!(watch.failure(), None, "{mode:?}: nothing published yet");
+
+            watch.publish(&publish_params(
+                a,
+                vec![
+                    failing.clone(),
+                    wire_diagnostic(4, 1, "compiler", "another matter"),
+                ],
+            ));
+            let reported = watch.failure().expect("the rule selects a diagnostic");
+            assert_eq!(reported.method, PUBLISH_DIAGNOSTICS_METHOD);
+            assert_eq!(reported.message, "initialization failed");
+            assert_eq!(
+                summary(&reported.locations),
+                [("a.go", "initialization failed")]
+            );
+
+            // What a server does when the document is re-opened or repaired.
+            watch.publish(&publish_params(a, Vec::new()));
+            let after = watch.failure();
+            match mode {
+                ReadyMode::Latest => assert_eq!(after, None, "withdrawn, so no longer held"),
+                ReadyMode::Once => assert_eq!(
+                    after,
+                    Some(reported),
+                    "an event is not unsaid by a later publish"
+                ),
+            }
+
+            watch.publish(&publish_params(a, vec![failing.clone()]));
+            let again = watch
+                .failure()
+                .unwrap_or_else(|| panic!("{mode:?}: published again, so held again"));
+            assert_eq!(
+                summary(&again.locations),
+                [("a.go", "initialization failed")],
+                "{mode:?}: the same diagnostic sent twice is one location"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_once_diagnostic_rule_saw_lasts_as_long_as_that_rule_is_declared() {
+        let a = "file:///work/a.go";
+        let once = diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Once);
+        let mut watch = diagnostic_watch(Vec::new());
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+        ));
+        assert_eq!(watch.failure(), None, "no rule declared yet");
+
+        watch.set_watch(Vec::new(), Vec::new(), vec![once.clone()]);
+        watch.publish(&publish_params(a, Vec::new()));
+        assert!(
+            watch.failure().is_some(),
+            "a rule declared while its diagnostic was published remembers it"
+        );
+
+        watch.set_watch(Vec::new(), Vec::new(), Vec::new());
+        watch.set_watch(Vec::new(), Vec::new(), vec![once]);
+        assert_eq!(
+            watch.failure(),
+            None,
+            "an undeclared rule forgets what it saw"
+        );
+    }
+
+    #[test]
+    fn a_once_rule_remembers_per_document_only_what_it_last_matched_there() {
+        let (a, b) = ("file:///work/a.go", "file:///work/b.go");
+        let rule = diagnostic_rule(json!({"source": "compiler"}), None, ReadyMode::Once);
+        let mut watch = diagnostic_watch(vec![rule]);
+        // A document edited over a long session: every publish a new error.
+        for n in 0..50 {
+            watch.publish(&publish_params(
+                a,
+                vec![wire_diagnostic(n, 1, "compiler", &format!("error {n}"))],
+            ));
+        }
+        watch.publish(&publish_params(
+            b,
+            vec![wire_diagnostic(1, 1, "compiler", "other document")],
+        ));
+        // Neither a publish the rule selects nothing in nor a withdrawal
+        // replaces what the rule last matched in that document.
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(0, 2, "lint", "not selected")],
+        ));
+        watch.publish(&publish_params(a, Vec::new()));
+        watch.publish(&publish_params(b, Vec::new()));
+
+        let reported = watch.failure().expect("a declared once rule keeps holding");
+        assert_eq!(
+            summary(&reported.locations),
+            [("a.go", "error 49"), ("b.go", "other document")],
+            "one publish's matches per document, however many came before"
+        );
+        assert_eq!(
+            watch
+                .seen
+                .iter()
+                .flat_map(BTreeMap::values)
+                .map(Vec::len)
+                .sum::<usize>(),
+            2,
+            "the store holds what is reported and nothing older"
+        );
+    }
+
+    #[test]
+    fn one_once_rules_match_never_displaces_what_another_once_rule_matched() {
+        let a = "file:///work/a.go";
+        let first = diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Once);
+        let second = diagnostic_rule(json!({"source": "compiler"}), None, ReadyMode::Once);
+        let mut watch = diagnostic_watch(vec![first.clone(), second.clone()]);
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+        ));
+        // The same document, now failing only the other rule, then repaired.
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(4, 1, "compiler", "other")],
+        ));
+        watch.publish(&publish_params(a, Vec::new()));
+
+        let both = watch.failure().expect("both rules matched");
+        assert_eq!(
+            summary(&both.locations),
+            [("a.go", "initialization failed"), ("a.go", "other")],
+            "each rule reports what it matched, in rule order within a document"
+        );
+
+        for (kept, message) in [(first, "initialization failed"), (second, "other")] {
+            let mut alone = diagnostic_watch(vec![
+                diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Once),
+                diagnostic_rule(json!({"source": "compiler"}), None, ReadyMode::Once),
+            ]);
+            alone.publish(&publish_params(
+                a,
+                vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+            ));
+            alone.publish(&publish_params(
+                a,
+                vec![wire_diagnostic(4, 1, "compiler", "other")],
+            ));
+            alone.publish(&publish_params(a, Vec::new()));
+            alone.set_watch(Vec::new(), Vec::new(), vec![kept]);
+            let reported = alone
+                .failure()
+                .unwrap_or_else(|| panic!("the rule that matched {message:?} still holds"));
+            assert_eq!(summary(&reported.locations), [("a.go", message)]);
+        }
+    }
+
+    #[test]
+    fn remembered_diagnostics_are_listed_by_document_not_by_rule() {
+        let (a, b) = ("file:///work/a.go", "file:///work/b.go");
+        // Rule order and document order disagree: the first rule remembers
+        // the later document.
+        let mut watch = diagnostic_watch(vec![
+            diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Once),
+            diagnostic_rule(json!({"source": "compiler"}), None, ReadyMode::Once),
+        ]);
+        watch.publish(&publish_params(
+            b,
+            vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+        ));
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(4, 1, "compiler", "other")],
+        ));
+        watch.publish(&publish_params(a, Vec::new()));
+        watch.publish(&publish_params(b, Vec::new()));
+
+        let reported = watch.failure().expect("both rules matched");
+        assert_eq!(
+            summary(&reported.locations),
+            [("a.go", "other"), ("b.go", "initialization failed")],
+            "withdrawn diagnostics are listed by document, whichever rule remembered them"
+        );
+    }
+
+    #[test]
+    fn a_once_rule_keeps_its_memory_only_under_that_exact_declaration() {
+        let a = "file:///work/a.go";
+        let rule = diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Once);
+        let mut watch = diagnostic_watch(vec![rule.clone()]);
+        watch.publish(&publish_params(
+            a,
+            vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+        ));
+        watch.publish(&publish_params(a, Vec::new()));
+
+        // Declared again beside a new rule: the memory follows the rule.
+        let other = diagnostic_rule(json!({"severity": 1}), None, ReadyMode::Latest);
+        watch.set_watch(Vec::new(), Vec::new(), vec![other, rule]);
+        assert_eq!(
+            summary(&watch.failure().expect("still declared").locations),
+            [("a.go", "initialization failed")]
+        );
+
+        // A different rule selecting the same withdrawn diagnostic never saw
+        // it, and the latest mode of the same rule reads only what is held.
+        for changed in [
+            diagnostic_rule(json!({}), None, ReadyMode::Once),
+            diagnostic_rule(json!({"source": "go list"}), Some("*.go"), ReadyMode::Once),
+            diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Latest),
+        ] {
+            let mut redeclared = diagnostic_watch(vec![diagnostic_rule(
+                json!({"source": "go list"}),
+                None,
+                ReadyMode::Once,
+            )]);
+            redeclared.publish(&publish_params(
+                a,
+                vec![wire_diagnostic(0, 2, "go list", "initialization failed")],
+            ));
+            redeclared.publish(&publish_params(a, Vec::new()));
+            redeclared.set_watch(Vec::new(), Vec::new(), vec![changed.clone()]);
+            assert_eq!(redeclared.failure(), None, "{changed:?}");
+        }
+    }
+
+    #[test]
+    fn a_notification_failure_names_itself_and_carries_the_located_diagnostics() {
+        let raw = wire_diagnostic(0, 1, "rustc", "unresolved import");
+        let mut watch = StatusWatch::default();
+        watch.set_root(Path::new("/work"));
+        watch.set_watch(
+            vec![status_rule()],
+            Vec::new(),
+            vec![diagnostic_rule(
+                json!({"source": "rustc"}),
+                None,
+                ReadyMode::Latest,
+            )],
+        );
+        let (method, failed) = server_status("error", true, "Failed to load workspaces.");
+        watch.observe(&method, Some(&failed));
+        watch.publish(&publish_params(
+            "file:///work/src/lib.rs",
+            vec![raw.clone()],
+        ));
+        let located =
+            PublishedDiagnostic::decode("file:///work/src/lib.rs", "src/lib.rs", &raw).unwrap();
+        assert_eq!(
+            watch.failure(),
+            Some(Reported {
+                method,
+                message: "Failed to load workspaces.".to_string(),
+                locations: vec![located],
+            })
+        );
+    }
+
+    #[test]
+    fn a_whole_notification_rule_on_the_publish_method_sees_only_the_last_document() {
+        let whole = ReadyFailure {
+            method: PUBLISH_DIAGNOSTICS_METHOD.to_string(),
+            when: json!({"uri": "file:///work/go.mod"}),
+            message_pointer: Some("/diagnostics/0/message".to_string()),
+            mode: ReadyMode::Latest,
+        };
+        let go_mod = published(
+            "file:///work/go.mod",
+            vec![wire_diagnostic(5, 1, "syntax", "unterminated block")],
+        );
+        let (got, _) = await_ready_under(
+            vec![go_mod.clone()],
+            vec![whole.clone()],
+            Duration::from_secs(10),
+        );
+        match got {
+            Err(LspError::ServerReported {
+                ref method,
+                ref message,
+                ref locations,
+                ..
+            }) => {
+                assert_eq!(method, PUBLISH_DIAGNOSTICS_METHOD);
+                assert_eq!(message, "unterminated block");
+                assert!(locations.is_empty(), "no diagnostic rule was declared");
+            }
+            other => panic!("want ServerReported, got {other:?}"),
+        }
+
+        // The same failure, still published, hidden by another document's
+        // publish: what a per-diagnostic rule exists to see past.
+        let then_another = vec![go_mod, published("file:///work/a.go", Vec::new())];
+        let (got, _) = await_ready_under(
+            then_another.clone(),
+            vec![whole],
+            Duration::from_millis(150),
+        );
+        assert!(
+            matches!(got, Err(LspError::ReadyProbeDeadline { .. })),
+            "{got:?}"
+        );
+
+        let (client_conn, server_conn) = conn_pair();
+        spawn_status_server(server_conn, then_another, StatusAt::Initialized);
+        let mut c = ready_client(client_conn);
+        let mut cfg = c.config();
+        cfg.diagnostic_failures = vec![diagnostic_rule(
+            json!({"source": "syntax"}),
+            Some("go.mod"),
+            ReadyMode::Latest,
+        )];
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        round_trip(&mut c);
+        match c.check_failures() {
+            Err(LspError::ServerReported { ref locations, .. }) => {
+                assert_eq!(summary(locations), [("go.mod", "unterminated block")]);
+            }
+            other => panic!("want ServerReported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_failures_reports_what_arrived_after_the_gate_passed() {
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let (method, late) = published("file:///work/src/lib.rs", {
+                let mut d = wire_diagnostic(0, 1, "rustc", "unresolved import `missing_crate`");
+                d["code"] = json!("E0432");
+                vec![d]
+            });
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "textDocument/definition" => reply_ok(
+                        &mut w,
+                        &id,
+                        json!([{
+                            "uri": "file:///work/src/util.rs",
+                            "range": {
+                                "start": {"line": 0, "character": 7},
+                                "end": {"line": 0, "character": 13},
+                            },
+                        }]),
+                    ),
+                    // The server's own later work, on the test's cue: sent
+                    // ahead of the answer, so it is stored once the call
+                    // returns.
+                    "test/checked" => {
+                        write_frame(
+                            &mut w,
+                            &json!({"jsonrpc": "2.0", "method": method, "params": late}),
+                        )
+                        .unwrap();
+                        reply_ok(&mut w, &id, Value::Null);
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+        let mut c = ready_client(client_conn);
+        let mut cfg = c.config();
+        cfg.diagnostic_failures = vec![diagnostic_rule(
+            json!({"source": "rustc", "severity": 1}),
+            None,
+            ReadyMode::Latest,
+        )];
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+
+        c.await_ready("/work/src/lib.rs", "use missing_crate::Thing;\n", 0, 3)
+            .expect("the probe resolves and nothing has been reported yet");
+        c.check_failures()
+            .expect("Ok says only that no declared failure has arrived");
+        assert!(c.published_diagnostics().is_empty());
+
+        c.call("test/checked", json!({}), Duration::from_secs(5))
+            .unwrap();
+        for ask in 0..2 {
+            match c.check_failures() {
+                Err(LspError::ServerReported {
+                    ref method,
+                    ref message,
+                    ref locations,
+                    ..
+                }) => {
+                    assert_eq!(method, PUBLISH_DIAGNOSTICS_METHOD);
+                    assert_eq!(message, "unresolved import `missing_crate`");
+                    assert_eq!(
+                        summary(locations),
+                        [("src/lib.rs", "unresolved import `missing_crate`")]
+                    );
+                    assert_eq!(locations[0].code.as_deref(), Some("E0432"));
+                }
+                other => panic!("ask {ask}: want ServerReported, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_document_is_named_relative_to_the_root_however_the_server_spells_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (real, link) = (base.join("real"), base.join("link"));
+        fs::create_dir_all(real.join("src")).unwrap();
+        fs::write(real.join("src/lib.rs"), "").unwrap();
+        fs::write(real.join("a b.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let uri = |root: &Path, rel: &str| file_uri(root.join(rel).to_str().unwrap()).to_string();
+
+        // (the root as declared, the root as the server spells it)
+        for (declared, served) in [(&real, &real), (&link, &real), (&real, &link)] {
+            let mut watch = StatusWatch::default();
+            watch.set_root(declared);
+            let case = format!("declared {declared:?}, served {served:?}");
+            assert_eq!(
+                watch.document_path(&uri(served, "src/lib.rs")),
+                "src/lib.rs",
+                "{case}"
+            );
+            assert_eq!(
+                watch.document_path(&uri(served, "a b.rs")),
+                "a b.rs",
+                "{case}"
+            );
+            assert_eq!(
+                watch.document_path("file:///elsewhere/x.rs"),
+                "/elsewhere/x.rs",
+                "{case}: outside the root a document keeps its absolute path"
+            );
+            assert_eq!(
+                watch.document_path(file_uri(served.to_str().unwrap()).as_str()),
+                served.to_str().unwrap(),
+                "{case}: the root itself has no relative name"
+            );
+        }
+
+        let rootless = StatusWatch::default();
+        assert_eq!(
+            rootless.document_path("file:///work/a.go"),
+            "/work/a.go",
+            "before a handshake there is no root to be relative to"
+        );
+    }
+
+    #[test]
+    fn a_failure_rule_as_data_defaults_what_it_omits_and_refuses_what_it_does_not_know() {
+        let short: DiagnosticFailure =
+            serde_json::from_value(json!({"when": {"source": "go list"}})).expect("when alone");
+        assert_eq!(
+            short,
+            diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Latest)
+        );
+        let full = diagnostic_rule(json!({"severity": 1}), Some("go.mod"), ReadyMode::Once);
+        let as_data = json!({"when": {"severity": 1}, "file_name": "go.mod", "mode": "once"});
+        assert_eq!(serde_json::to_value(&full).expect("serializes"), as_data);
+        assert_eq!(
+            serde_json::from_value::<DiagnosticFailure>(as_data).expect("the full form"),
+            full
+        );
+        // Each mistake read as absent would widen or weaken the rule.
+        for wrong in [
+            json!({"when": {}, "filename": "go.mod"}),
+            json!({"when": {}, "mode": "sticky"}),
+            json!({"when": {}, "mod": "once"}),
+            json!({"file_name": "go.mod"}),
+        ] {
+            assert!(
+                serde_json::from_value::<DiagnosticFailure>(wrong.clone()).is_err(),
+                "{wrong} must be refused, never defaulted"
+            );
+        }
+
+        let short: ReadyFailure =
+            serde_json::from_value(json!({"method": "window/logMessage", "when": {"type": 1}}))
+                .expect("method and when alone");
+        assert_eq!(
+            short,
+            ReadyFailure {
+                method: "window/logMessage".to_string(),
+                when: json!({"type": 1}),
+                message_pointer: None,
+                mode: ReadyMode::Latest,
+            }
+        );
+        for wrong in [
+            json!({"method": "m", "when": {}, "mod": "once"}),
+            json!({"method": "m", "when": {}, "mode": "Once"}),
+            json!({"method": "m", "when": {}, "message": "/message"}),
+        ] {
+            assert!(
+                serde_json::from_value::<ReadyFailure>(wrong.clone()).is_err(),
+                "{wrong} must be refused, never defaulted"
+            );
+        }
     }
 
     #[test]
@@ -7415,6 +9687,168 @@ mod tests {
             }
             assert_eq!(count(&log, want), 0, "{want} never reaches the wire");
         }
+    }
+
+    #[test]
+    fn hover_decodes_every_content_shape() {
+        let span = json!({
+            "start": {"line": 2, "character": 4},
+            "end": {"line": 2, "character": 9},
+        });
+        let shown = |text: &str, kind: MarkupKind, ranged: bool| {
+            Some(Hover {
+                text: text.to_string(),
+                kind,
+                range: ranged.then(|| SymbolLocation {
+                    path: "/work/a.rs".to_string(),
+                    start_line: 2,
+                    start_char: 4,
+                    end_line: 2,
+                    end_char: 9,
+                }),
+            })
+        };
+        // (name, the server's answer, what the caller reads)
+        let cases: &[(&str, Value, Option<Hover>)] = &[
+            ("null", Value::Null, None),
+            (
+                "markdown content with its span",
+                json!({"contents": {"kind": "markdown", "value": "# f\n\ndocs"}, "range": span}),
+                shown("# f\n\ndocs", MarkupKind::Markdown, true),
+            ),
+            (
+                "plain text content",
+                json!({"contents": {"kind": "plaintext", "value": "fn f()"}}),
+                shown("fn f()", MarkupKind::PlainText, false),
+            ),
+            (
+                "a bare string is markdown",
+                json!({"contents": "**docs**"}),
+                shown("**docs**", MarkupKind::Markdown, false),
+            ),
+            (
+                "a language string is a fenced block",
+                json!({"contents": {"language": "rust", "value": "fn f()"}}),
+                shown("```rust\nfn f()\n```", MarkupKind::Markdown, false),
+            ),
+            (
+                "a list keeps its order",
+                json!({"contents": [{"language": "go", "value": "func F()"}, "F does."]}),
+                shown(
+                    "```go\nfunc F()\n```\n\nF does.",
+                    MarkupKind::Markdown,
+                    false,
+                ),
+            ),
+            ("an empty list shows nothing", json!({"contents": []}), None),
+            (
+                "empty content shows nothing",
+                json!({"contents": {"kind": "markdown", "value": ""}, "range": span}),
+                None,
+            ),
+        ];
+        for (name, answer, want) in cases {
+            let (client_conn, server_conn) = conn_pair();
+            let seen = Arc::new(Mutex::new(Value::Null));
+            let sink = Arc::clone(&seen);
+            let answer = answer.clone();
+            let log = spawn_capable_server(
+                server_conn,
+                json!({"hoverProvider": true}),
+                move |method, params| match method {
+                    "textDocument/hover" => {
+                        *lock(&sink) = params.clone();
+                        Some(Ok(answer.clone()))
+                    }
+                    _ => None,
+                },
+            );
+            let mut c = capable_client(client_conn);
+            let got = c.hover("/work/a.rs", "fn f() {}\n", 2, 6);
+            assert_eq!(got.unwrap(), *want, "{name}");
+            assert_eq!(
+                *lock(&seen),
+                json!({
+                    "textDocument": {"uri": "file:///work/a.rs"},
+                    "position": {"line": 2, "character": 6},
+                }),
+                "{name}"
+            );
+            assert_eq!(
+                count(&log, "textDocument/didOpen"),
+                1,
+                "{name}: the server is given the text before it is asked about it"
+            );
+            assert_eq!(
+                count(&log, "textDocument/hover"),
+                1,
+                "{name}: an answer is final, never retried"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_that_is_not_a_hover_is_a_typed_error() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_capable_server(
+            server_conn,
+            json!({"hoverProvider": true}),
+            |method, _| match method {
+                "textDocument/hover" => Some(Ok(json!({"contents": 7}))),
+                _ => None,
+            },
+        );
+        let mut c = capable_client(client_conn);
+        match c.hover("/work/a.rs", "fn f() {}\n", 0, 3) {
+            Err(LspError::Rpc { ref method, .. }) => assert_eq!(method, "textDocument/hover"),
+            other => panic!("want Rpc, never a silent None: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_unsupported_is_typed_and_never_sent() {
+        let (client_conn, server_conn) = conn_pair();
+        let log = spawn_capable_server(server_conn, json!({"hoverProvider": false}), |_, _| None);
+        let mut c = capable_client(client_conn);
+        match c.hover("/work/a.rs", "fn f() {}\n", 0, 3) {
+            Err(LspError::Unsupported {
+                ref method,
+                ref capability,
+            }) => {
+                assert_eq!(method, "textDocument/hover");
+                assert_eq!(capability, "hoverProvider");
+            }
+            other => panic!("want Unsupported, got {other:?}"),
+        }
+        assert_eq!(count(&log, "textDocument/hover"), 0);
+        assert_eq!(
+            count(&log, "textDocument/didOpen"),
+            0,
+            "a refused query opens nothing"
+        );
+    }
+
+    #[test]
+    fn initialize_declares_the_hover_content_format() {
+        let hover = |sent: &Value| sent.pointer("/capabilities/textDocument/hover").cloned();
+        assert_eq!(
+            hover(&captured_initialize_params(|_| {})),
+            Some(json!({"contentFormat": ["markdown", "plaintext"]})),
+            "undeclared, markdown is asked for first"
+        );
+        assert_eq!(
+            hover(&captured_initialize_params(|c| {
+                c.hover_content_format = vec![MarkupKind::PlainText]
+            })),
+            Some(json!({"contentFormat": ["plaintext"]}))
+        );
+        let none = captured_initialize_params(|c| c.hover_content_format = Vec::new());
+        assert_eq!(hover(&none), None, "an empty declaration omits the member");
+        assert_eq!(
+            none["capabilities"]["textDocument"]["definition"]["linkSupport"],
+            json!(true),
+            "omitting hover must not displace bage's other capabilities"
+        );
     }
 
     #[test]

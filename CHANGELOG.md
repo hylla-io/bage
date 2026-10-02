@@ -1,5 +1,166 @@
 # Changelog
 
+## 0.14.0 — LSP: kept diagnostics, failure rules, hover (source breaks)
+
+**Every change is in `bage::lsp`** (SPEC §12.6). Parsing, names and `region_hash` are unchanged.
+The CLI's source is unchanged too; its sessions run through `LspPool`, so they now declare the
+hover capability and leave out a `null` params. **Five source breaks for a v0.13.0 caller**, each
+with a one-line fix, and four behaviour changes, all listed below.
+
+### Source breaks, and the fix for each
+
+- **`LspError::ReadyDeadline` is removed.** Match `LspError::ReadySignalDeadline { .. } |
+  LspError::ReadyProbeDeadline { .. }` instead. `last` is now a `ProbeAnswer`, not a `String`:
+  compare with `ProbeAnswer::Empty`, or print it with `last.to_string()`.
+- **`LspError::ServerReported` has a new field, `locations`.** In a pattern that names every
+  field, add `locations` or `..`.
+- **`ClientConfig` has two new fields.** In a full literal add `diagnostic_failures: Vec::new()`
+  and `hover_content_format: vec![MarkupKind::Markdown, MarkupKind::PlainText]`. A literal ending
+  in `..ClientConfig::default()` needs nothing.
+- **`ReadySignal` has a new field, `mode`.** Add `mode: ReadyMode::Latest`, which is what v0.13.0
+  did.
+- **`ReadyFailure` has a new field, `mode`.** Add `mode: ReadyMode::Latest`, likewise.
+
+### Behaviour changes
+
+- **`initialize` now declares a hover capability**: `textDocument.hover.contentFormat` of
+  `["markdown", "plaintext"]`. v0.13.0 sent none. `hover_content_format: Vec::new()` omits it
+  again.
+- **A rule on `textDocument/publishDiagnostics` is now observed.** v0.13.0 never showed that
+  method to a `ReadyFailure` or `ReadySignal`, so such a rule could not match. It now matches as
+  on any other method, and can end `await_ready`. Prefer a `DiagnosticFailure`: a whole-publish
+  match must equal a document's whole list. Under `Latest` it sees only the last document
+  published; under `Once` any publish that matches counts.
+- **A `null` params is no longer sent.** v0.13.0 wrote `"params": null`; the member is now left
+  out. It reaches `shutdown` and `exit` in `Client::close`, and the `$/bage/barrier` request in
+  `Client::diagnostics`. **Why**: JSON-RPC allows `params` only as an object or an array, and
+  TypeScript's server rejects `"params": null` on `shutdown` and `exit` and then never exits. No
+  in-process test asserts the member is absent.
+- **Error text changed** with the types.
+  - A probe deadline prints `unresolved after` (was `still empty after`).
+  - Its `last` text: a refusal prints `refused: <message>` (was `lsp: textDocument/definition:
+    <message>`); a timeout prints `no response after <duration>`, without that prefix.
+  - A probe deadline no longer carries a `<method> has not reported <when>` sentence. That case
+    is the signal deadline, which prints `<method> did not report <when> within <deadline>;
+    latest: …`.
+  - `ServerReported` prints one `at path:line:col: message [source code]` line per location.
+
+### Ready signals: a state or an event
+
+- **`ReadyMode::Latest`** (`"latest"`, the default) reads a STATE: the rule holds only while the
+  latest notification of its method matches. This is v0.13.0's behaviour.
+- **`ReadyMode::Once`** (`"once"`) reads an EVENT: any matching notification holds the rule for
+  good, whatever that method carries afterwards.
+- **Why**: gopls announces a finished load with ONE `window/showMessage` of `Finished loading
+  packages.`, then sends unrelated messages on that method. Read as a state, the signal is
+  withdrawn by the next message and a loaded server times out.
+- A `Once` signal stays met for as long as that exact declaration is made, across
+  `Client::configure` calls. A changed declaration starts over from the latest notification kept
+  for its method: it is met at once when that one matches.
+- `ReadyFailure` takes the same `mode`. Under `Once` the FIRST matching notification is the one
+  reported, and it is kept for as long as that exact declaration is made.
+- **A new or changed `Once` `ReadyFailure` starts with nothing**, unlike a signal: the
+  notification kept for its method is not read, so only one that arrives after the declaration
+  counts.
+- **A new or changed `Once` `DiagnosticFailure` does read what is held**: a diagnostic the server
+  currently holds counts at once when it matches.
+- `ReadySignal` and `ReadyFailure` now read and write as data (a signal is `{"method", "when",
+  "mode"}`). An unknown member or mode name is refused, never read as `latest`.
+
+### Diagnostics are kept, and can be read
+
+- **Every publish is stored per document.** A later publish for a document replaces its list; an
+  empty one clears it. v0.13.0 handed a publish only to a waiting `Client::diagnostics` call.
+- **`Client::published_diagnostics()`** reads every document's current list as
+  `PublishedDiagnostic { uri, path, start_line, start_char, end_line, end_char, severity, source,
+  code, message, raw }`. Positions are zero-based UTF-16. `path` is relative to the root when the
+  document lies under it, absolute otherwise. `raw` is the diagnostic as the server sent it.
+- **`severity` is an `Option<Severity>`**: `Error`, `Warning`, `Information`, `Hint` (LSP 1 to
+  4), or `Other(i64)` for a number the protocol does not define. `None` when the server sent
+  none.
+- **`Client::pull_diagnostics(path, content) -> Result<Vec<PublishedDiagnostic>, LspError>`**
+  asks with `textDocument/diagnostic`, returns that document's diagnostics and stores them the
+  same way. A server without `diagnosticProvider` is refused with `Unsupported`. No test covers
+  this method yet.
+- The store holds one entry per document that currently has a diagnostic, for the client's life.
+- `Client::diagnostics` and its `Diagnostic` shape are unchanged.
+
+### Diagnostic failure rules
+
+- **`DiagnosticFailure { when, file_name, mode }`** in `ClientConfig::diagnostic_failures`
+  declares which ONE diagnostic means the project did not load.
+  - `when` is matched against the diagnostic as sent: `{"source": "go list"}`, `{"severity": 1}`.
+  - `file_name` is an optional pattern on the last path segment, `*` being any run of
+    characters: `"go.mod"`, `"*.go"`.
+  - `mode`: `Latest` counts only diagnostics the server still holds; `Once` keeps counting one
+    the server withdrew.
+- As data it is `{"when", "file_name", "mode"}`; an unknown member is refused.
+- **Bage picks no diagnostic.** With none declared, none stops anything.
+- A rule that holds ends `await_ready` at once with `ServerReported`.
+
+### `ServerReported` says where
+
+- **`locations: Vec<PublishedDiagnostic>`** lists every diagnostic a declared rule selected.
+- It is empty when only a notification rule held, or when the server located nothing in a
+  diagnostic.
+- When only a diagnostic rule held, `method` is `PUBLISH_DIAGNOSTICS_METHOD` and `message` is the
+  first location's.
+
+### Two deadline errors instead of one
+
+- **`ReadySignalDeadline { signal, latest, after, stderr }`**: a declared signal never held.
+  `latest` is the last params seen for its method, `None` when the server never sent it.
+  `signal` is a `Box<ReadySignal>` and `latest` an `Option<Box<Value>>`.
+- **`ReadyProbeDeadline { path, line, character, after, last, stderr }`**: every signal held and
+  the probe never resolved. `last` is `ProbeAnswer::Empty`, `Refused { message }` or
+  `NoResponse { after }`.
+- **Why**: a caller reads which half never came without parsing a sentence.
+
+### `Client::check_failures()`
+
+- Judges the declared `ready_failures` and `diagnostic_failures` against everything received SO
+  FAR. Sends nothing, waits for nothing.
+- **For use after queries**: a server keeps reporting once it has answered.
+- **`Ok` means no declared failure has ARRIVED, never that none will.** A caller that must cover
+  a server's delay waits that long before asking.
+
+### `Client::hover`
+
+- **`Client::hover(path, content, line, character) -> Result<Option<Hover>>`**: what the server
+  shows for the symbol at a position, a symbol defined outside the workspace included.
+- **`Hover { text, kind, range }`**: the server's text, the `MarkupKind` (`Markdown` or
+  `PlainText`) the SERVER says it is in, and the span hovered when the server names one.
+- `None` is a `null` answer or empty content. It carries no readiness information: gate with
+  `await_ready` first.
+- A server without `hoverProvider` is refused with `Unsupported`, nothing sent.
+- **`ClientConfig::hover_content_format`** is the declared format list, most wanted first.
+  Markdown leads by default: it is the one format in which every server measured keeps the
+  signature apart from the documentation.
+- **`Client::hover_content_format`** is a new public field holding the list in force.
+- **`MarkupKind` reads and writes as data** as `"markdown"` and `"plaintext"`.
+- **A position outside the text costs the whole `query_deadline`** (30 s by default) on a server
+  that refuses it, and ends as `QueryDeadline`. `Client::definition` behaves the same. Bage
+  checks no position against the text.
+- **A server shows only documentation it can read.** rust-analyzer needs the toolchain's
+  `rust-src` for the standard library; pyright needs a Python interpreter on `PATH` for
+  docstrings.
+
+**Measured** against real servers (`tests/lsp_session.rs`, `BAGE_LSP_REAL_TEST=1`):
+
+- **gopls, `Once` signal**: holds through the messages that follow `Finished loading packages.`;
+  the same signal read as `Latest` is the control.
+- **gopls, `go.mod` with an unclosed `require (`**: reported at `go.mod` 5:0, source `syntax`.
+  Its `go list` diagnostic on the opened source file arrives about a second after the gate and
+  is found by `check_failures`. Undeclared, the same module waits out the deadline.
+- **rust-analyzer, `Cargo.toml` that does not parse**: publishes NO diagnostic. It reports
+  `Failed to load workspaces.` by status notification; the position exists only as cargo's text
+  in `stderr`, so `locations` is empty.
+- **Hover**: rust-analyzer on `HashMap::insert` and a vendored registry crate, with the
+  no-sources control; gopls on `fmt.Println`; `tsc --lsp` on `parseInt` and a `node_modules`
+  package; pyright on `json.dumps`.
+- **Positions outside the text**, at a 1 s deadline: gopls refuses a column past its line and a
+  line past the file; rust-analyzer refuses the line and answers the column with `None`.
+
 ## 0.13.0 — expression and impl names (contract change)
 
 **A CONTRACT change to `Symbol.name` / `Block.name`** (SPEC §9.4, HYLLA_NODE_CONTRACT §1a) for

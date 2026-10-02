@@ -502,14 +502,16 @@ at compile time.
 `lsp::ClientConfig { initialize_timeout, call_timeout, rename_deadline, rename_retry,
 query_deadline, query_retry, ready_deadline, ready_retry, shutdown_timeout, exit_deadline,
 exit_poll, process_id, initialization_options, experimental_capabilities, ready_failures,
-ready_signals, stderr_tail_bytes }` is applied by `Client::configure` BEFORE
+ready_signals, diagnostic_failures, hover_content_format, stderr_tail_bytes }` is applied by
+`Client::configure` BEFORE
 `initialize` (read back with
 `Client::config`), or carried by `LspPool::with_client_config`, which configures each server
 between spawn and handshake — the only point a pooled handshake can be bounded.
 `initialize` is bounded by `initialize_timeout`, not `call_timeout`; `close` blocks at most
 `shutdown_timeout + exit_deadline` before killing the child. `ClientConfig::default()` holds
 bage's values (30 s / 30 s / 30 s / 300 ms / 30 s / 300 ms / 120 s / 500 ms / 2 s / 3 s / 50 ms;
-no experimental capabilities, no ready failures, no ready signals, 16 KiB of stderr).
+no experimental capabilities, no ready failures, no ready signals, no diagnostic failures,
+hover as markdown then plain text, 16 KiB of stderr).
 The struct is exhaustive on purpose: a new bound breaks a full-literal declaration at compile
 time rather than defaulting silently, and ships as a minor bump.
 `initialization_options` reaches the server VERBATIM as `initializationOptions`, and an unset
@@ -524,12 +526,16 @@ against the real server: `tests/lsp_typing_acquisition.rs`.
 bage's own capabilities, and is omitted when unset.
 A server that SAYS it has failed ends `await_ready` at once. Status notifications are server
 extensions with no common shape, so the caller declares each as a `ReadyFailure { method, when,
-message_pointer }`: the method to watch, members its params must carry (recursive subset match),
-and an RFC 6901 pointer to the message (absent or unresolved = the whole params). Only the LATEST
-notification per watched method counts, so a later recovery supersedes a failure; unwatched
-notifications are dropped, and a method no longer declared forgets its last status. When the
-latest status matches, `await_ready` returns `LspError::ServerReported { method, message, stderr }`
-instead of probing to the deadline; with none declared, probing alone decides.
+message_pointer, mode }`: the method to watch, members its params must carry (recursive subset
+match), an RFC 6901 pointer to the message (absent or unresolved = the whole params), and a
+`ReadyMode` read as a signal's is. Under `Latest` only the LATEST notification per watched method
+counts, so a later recovery supersedes a failure; under `Once` the first match holds whatever
+that method carries afterwards, for as long as that exact rule stays declared — a new or changed
+rule starts with nothing.
+Unwatched notifications are dropped, and a method no longer declared forgets its last status.
+While a rule holds, `await_ready` returns
+`LspError::ServerReported { method, message, locations, stderr }` instead of probing to the
+deadline; with none declared, probing alone decides.
 rust-analyzer is `experimental_capabilities: {"serverStatusNotification": true}` plus
 `method: "experimental/serverStatus"`, `when: {"health": "error", "quiescent": true}`,
 `message_pointer: "/message"` — an orphaned workspace member reports "Failed to load workspaces."
@@ -537,15 +543,30 @@ in under a second where the undeclared gate waits out its whole deadline.
 A server that SAYS it has finished loading is the other half. A probe cannot tell a loaded server
 from one mid-load: rust-analyzer resolves a declaration to itself while it rebuilds its crate
 graph, then answers `outgoingCalls` and cross-crate `definition` empty until the load ends. So the
-caller may declare `ReadySignal { method, when }` entries in `ready_signals`, matched as a
-`ReadyFailure`'s `when` is, against the LATEST notification per method. A notification with no
+caller may declare `ReadySignal { method, when, mode }` entries in `ready_signals`, matched as a
+`ReadyFailure`'s `when` is. `mode` says how the server speaks. `ReadyMode::Latest` (`"latest"`,
+and what a declaration silent about it means) reads a STATE: met only while the LATEST
+notification of the method matches. `ReadyMode::Once` (`"once"`) reads an EVENT: met for good by
+any matching notification, whatever that method carries afterwards. gopls is the worked case: it
+announces a finished load with ONE `window/showMessage` of `Finished loading packages.` and goes
+on to send unrelated messages on that method, so read as a state its signal is withdrawn by the
+next one and a loaded server times out. A `Once` signal stays met for as long as that exact
+declaration is made, across `Client::configure` calls; a changed declaration starts over from
+the latest notification kept for its method. As data a signal is `{"method", "when", "mode"}`;
+an unknown member or mode name is refused, never read as `latest`. Real-server proof, with the
+state reading as its control: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, gopls).
+A notification with no
 params is stored as `null`, which no object matches, so `when: {}` is never met by it. `await_ready`
 sends no probe until EVERY declared signal matches; once they do, a non-empty answer ends the wait
 only if every signal still matches when it arrives — the reader applies notifications in wire
 order, so a withdrawal the server sent ahead of its answer voids that answer and the wait goes on.
-A signal never met fails the wait at `ready_deadline` with `ReadyDeadline`, whose `last` names the
-first unmet signal and the last status seen for it (`experimental/serverStatus has not reported
-{"quiescent":true}; latest: none`). A server that dies while a signal is unmet fails at once with
+The wait ends at `ready_deadline` in one of two typed ways, so a caller reads which half never
+came without parsing a sentence. `ReadySignalDeadline { signal, latest, after, stderr }`: the
+first unmet `ReadySignal` and the latest params seen for its method (`None` when the server never
+sent that method). `ReadyProbeDeadline { path, line, character, after, last, stderr }`: every
+signal held and the probe position never resolved; `last` is a `ProbeAnswer` of `Empty`,
+`Refused { message }` or `NoResponse { after }`. A server that dies while a signal is unmet fails
+at once with
 `LspError::Closed`, as a probe would, rather than waiting out the deadline. With none declared,
 probing alone decides. WHAT NO GATE CLOSES: a server that answers while its signal still matches,
 and only afterwards announces a reload, passed the gate on a status it had not yet withdrawn; a
@@ -558,10 +579,81 @@ sends it (the capability left undeclared, say) holds the gate to its deadline an
 Real-server proof, with that control: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`).
 A stdio server's stderr is drained for the child's whole life into a ring of the last
 `stderr_tail_bytes` (zero keeps nothing); `StderrTail { text, dropped_bytes, captured }` says how
-much older output was discarded, so a cut is never silent. `ReadyDeadline` and `ServerReported`
-carry it and print it; every other error keeps its shape, and `Client::stderr_tail()` reads the
+much older output was discarded, so a cut is never silent. `ReadySignalDeadline`,
+`ReadyProbeDeadline` and `ServerReported` carry it and print it; every other error keeps its
+shape, and `Client::stderr_tail()` reads the
 tail after any failure. A `from_conn` client has no stderr (`captured: false`). Real-server proof:
 `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, rust-analyzer).
+Diagnostics a server publishes are KEPT, per document: a later `publishDiagnostics` for a URI
+replaces that document's list and an empty one clears it. `Client::published_diagnostics()`
+reads every document's current list as `PublishedDiagnostic { uri, path, start_line, start_char,
+end_line, end_char, severity, source, code, message, raw }`, with `path` relative to the root
+when the document lies under it (a symlinked or differently spelt root included) and absolute
+otherwise. The store holds one entry per document that currently has a diagnostic, declared or
+not, so it is bounded by the server's view of the workspace. A publish with an element that is
+not a `Diagnostic` changes nothing.
+A caller declares which ONE diagnostic means the project did not load as
+`DiagnosticFailure { when, file_name, mode }` in `diagnostic_failures`: `when` is matched against
+the diagnostic as the server sent it (`{"source": "go list"}`, `{"severity": 1}`), `file_name` is
+an optional pattern on the document's last path segment where `*` is any run of characters
+(`"go.mod"`, `"*.go"`), and `mode` says whether a diagnostic the server withdrew still counts
+(`Once`) or not (`Latest`). A `Once` rule that matched holds for as long as that exact rule stays
+declared, whatever the server or another rule does after. Each `Once` rule remembers, per
+document, the diagnostics IT matched in the latest publish that held one: a withdrawal, a publish
+it selects nothing in, or another rule's match leaves them; its own later match in that document
+replaces them. That store is, per `Once` rule, one publish's matches per document the rule ever
+matched in. It grows with rules times documents that failed, not with republishing. A rule
+declared again with any member changed starts with only what the server currently holds.
+As data an unknown member is refused, as a `ReadyFailure`'s is. bage
+picks no diagnostic: with none declared, none stops anything. A rule that holds ends `await_ready`
+with `ServerReported` whose `locations` list every selected diagnostic; `method` and `message`
+are the matched notification's, or `textDocument/publishDiagnostics` and the first location's
+message when only a diagnostic rule held.
+`Client::check_failures()` judges the same rules against everything received SO FAR and sends
+nothing, for use after queries: servers keep reporting once they have answered. `Ok` means no
+declared failure has ARRIVED, never that none will; the push model has no "that was all of them",
+so a caller that must cover a server's delay waits that long before asking.
+Real-server proof (`tests/lsp_session.rs`, `BAGE_LSP_REAL_TEST=1`): gopls on a `go.mod` with an
+unclosed `require (` is reported at `go.mod` 5:0 with source `syntax`, and its `go list`
+diagnostic on the opened source file arrives about a second after the gate and is found by
+`check_failures`; undeclared, the same module waits out the deadline on `Refused` probes.
+rust-analyzer on a `Cargo.toml` that does not parse publishes NO diagnostic: it reports
+`Failed to load workspaces.` through its status notification, and the manifest position exists
+only as cargo's text in `stderr` (`Cargo.toml:1:9`), so `locations` is empty there.
+`Client::hover(path, content, line, character) -> Result<Option<Hover>>` asks what the server
+shows for the symbol at a position, a symbol defined outside the workspace included.
+`Hover { text, kind, range }` is the server's text, the `MarkupKind` (`Markdown` or `PlainText`)
+the SERVER says it is in, and the span hovered when the server names one. `None` is a `null`
+answer or one with empty content; it carries no readiness information, so gate with `await_ready`
+first. A server without `hoverProvider` is refused with `Unsupported`, nothing sent. The older
+`MarkedString` shapes are rendered to the markdown the protocol defines them as.
+A position OUTSIDE the text is the server's to judge, and a server that refuses it costs the whole
+`query_deadline` (30 s by default): a refusal is a JSON-RPC error, the same thing a loading server
+sends, so `hover` and `definition` retry it every `query_retry` and return
+`LspError::QueryDeadline { method, path, after, last }` only when the deadline is spent, `last`
+being the server's refusal. Measured: gopls refuses a column past the end of its line (`column is
+beyond end of line`) and a line past the end of the file (`line number 500 out of range 0-10`);
+rust-analyzer refuses the line (`Invalid offset LineCol { line: 500, col: 0 }`) and ANSWERS the
+column at once, `None` for hover and no location for definition. bage checks no position against
+the text itself; a caller that cannot rule such positions out declares a `query_deadline` it can
+afford. Real-server proof at a 1 s deadline: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, gopls
+and rust-analyzer).
+`hover_content_format` is the `textDocument.hover.contentFormat` capability, most wanted first;
+empty omits it. Markdown leads by default because it is the one format in which every server
+measured keeps the signature (a code fence) apart from the documentation: asked for plain text,
+rust-analyzer runs a heading into the code after it and tsc joins the signature to the first
+sentence. With the member omitted gopls answers markdown and rust-analyzer, tsc and pyright plain
+text.
+A server shows only documentation it can read. rust-analyzer reads the standard library from the
+toolchain's `rust-src` component and a dependency from the sources cargo resolved; with no
+standard-library sources a std symbol is unresolved and its hover is `None`, while a dependency's
+is unaffected. gopls reads `GOROOT/src`. tsc reads the `lib.*.d.ts` files it ships and a package's
+declarations under `node_modules`. pyright takes a standard-library signature from the stubs it
+ships and the docstring from the standard library of a Python interpreter on `PATH`: with no
+interpreter it shows the signature alone.
+Real-server proof (`tests/lsp_session.rs`, `BAGE_LSP_REAL_TEST=1`): rust-analyzer on
+`HashMap::insert` and a vendored registry crate, with the no-sources control; gopls on
+`fmt.Println`; `tsc --lsp` on `parseInt` and a `node_modules` package; pyright on `json.dumps`.
 Document sync is public: `Client::did_open(path, text)` (close-then-open on a re-open, per the
 spec's balanced open/close rule) and `Client::did_close(path) -> Result<bool>` (`false`, nothing
 sent, when the document is not open). Real-server proof: `tests/lsp_session.rs`

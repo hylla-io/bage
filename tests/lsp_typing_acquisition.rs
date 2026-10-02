@@ -115,8 +115,21 @@ fn npm_calls_during_session(options: Value, stop_at_first: bool) -> Vec<String> 
         initialization_options: Some(declared),
         ..ClientConfig::default()
     });
+    // The server looks for `lib/tsserver.js` in the declared path, then the
+    // workspace's `node_modules`, then the `typescript` beside its own
+    // install, and refuses to initialize when none has one. Only the operator
+    // knows where a TypeScript that ships it lives, so the failure says how
+    // to declare it.
     c.initialize(&lsp::file_uri(&root.to_string_lossy()).to_string())
-        .expect("initialize");
+        .unwrap_or_else(|e| {
+            panic!(
+                "initialize: {e}\nIf the server found no TypeScript: it needs one that ships \
+                 `lib/tsserver.js`, and the native build (TypeScript 7 and later) ships none. \
+                 Set BAGE_TSSERVER_PATH to the `tsserver.js` of a TypeScript 5 or 6 install \
+                 (now: {:?}).",
+                std::env::var("BAGE_TSSERVER_PATH").ok()
+            )
+        });
     c.did_open(&root.join(PROBE_FILE).to_string_lossy(), PROBE_SOURCE)
         .expect("didOpen");
 
