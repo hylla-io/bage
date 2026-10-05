@@ -19,6 +19,7 @@
 //! sets (the first-drop set); every other [`Lang`] is Unsupported.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node as TsNode, Query, QueryCursor, StreamingIterator};
@@ -147,45 +148,72 @@ pub enum Facts {
 /// [`Facts::Unsupported`] for any language outside the first-drop set (Rust,
 /// TS/TSX/JS, Python, Go), never a guessed fact.
 ///
-/// It RE-PARSES `opened`'s source bytes with a private tree-sitter parser: the
-/// declaration outline's native tree is intentionally not exposed by the parser
-/// port, and queries require native nodes. The re-parse is over the identical
-/// bytes, so facts are consistent with the outline the host anchors on.
+/// It reads the engine tree `opened` was parsed into, so one parse serves the
+/// outline, tier-2 sites, facts and scopes alike, and facts are consistent with
+/// the outline the host anchors on by construction.
 pub fn extract_facts(opened: &OpenedFile) -> Facts {
     let lang = opened.lang;
-    let Some(ts_lang) = grammar(lang) else {
+    let Some(queries) = Queries::of(lang) else {
         return Facts::Unsupported { lang };
     };
     let src = opened.tree.source.as_slice();
-    let mut parser = tree_sitter::Parser::new();
-    // A grammar we registered above must set cleanly; a failure here is a build
-    // bug, not runtime input — fail loud.
-    parser
-        .set_language(&ts_lang)
-        .expect("registered grammar sets");
-    let Some(tree) = parser.parse(src, None) else {
-        // A total parse failure over already-parsed bytes is unreachable in
-        // practice; degrade to empty rather than fabricate.
-        return Facts::Supported {
-            imports: Vec::new(),
-            exports: Vec::new(),
+    with_root(opened, queries.grammar(), |root| {
+        let (imports, exports) = match queries {
+            Queries::Rust { facts, .. } => {
+                let [uses, extern_crates, items] = query_groups(facts, root, src);
+                (
+                    rust_imports(&uses, src),
+                    rust_exports(&uses, &extern_crates, &items, src),
+                )
+            }
+            Queries::Script { facts, .. } => {
+                let [imports, exports] = query_groups(facts, root, src);
+                (ts_imports(&imports, src), ts_exports(&exports, src))
+            }
+            Queries::Python { imports, .. } => (
+                python_imports(&query_nodes(imports, root, src), src),
+                Vec::new(),
+            ),
+            Queries::Go { imports, .. } => (
+                go_imports(&query_nodes(imports, root, src), src),
+                Vec::new(),
+            ),
         };
-    };
-    let root = tree.root_node();
-    let (imports, exports) = match lang {
-        Lang::Rust => (
-            rust_imports(root, src, &ts_lang),
-            rust_exports(root, src, &ts_lang),
-        ),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => (
-            ts_imports(root, src, &ts_lang),
-            ts_exports(root, src, &ts_lang),
-        ),
-        Lang::Python => (python_imports(root, src, &ts_lang), Vec::new()),
-        Lang::Go => (go_imports(root, src, &ts_lang), Vec::new()),
-        _ => (Vec::new(), Vec::new()),
-    };
-    Facts::Supported { imports, exports }
+        Facts::Supported { imports, exports }
+    })
+    // A total parse failure over bytes the outline already parsed is
+    // unreachable in practice; degrade to empty rather than fabricate.
+    .unwrap_or(Facts::Supported {
+        imports: Vec::new(),
+        exports: Vec::new(),
+    })
+}
+
+/// Runs `read` over the engine tree of `opened`. That is the tree it was opened
+/// with whenever that tree was parsed with `grammar`; a tree without one (a
+/// grammar-free tree labelled with a code language, or a tree another grammar
+/// parsed) is parsed here once more, so the answer never depends on which tree
+/// the caller happened to hold. `None` only when that parse returns no tree.
+fn with_root<R>(
+    opened: &OpenedFile,
+    grammar: &tree_sitter::Language,
+    read: impl FnOnce(TsNode<'_>) -> R,
+) -> Option<R> {
+    if let Some(root) = opened
+        .tree
+        .native_root()
+        .filter(|root| &*root.language() == grammar)
+    {
+        return Some(read(root));
+    }
+    let mut parser = tree_sitter::Parser::new();
+    // A grammar this crate registers must set cleanly; a failure here is a
+    // build bug, not runtime input — fail loud.
+    parser
+        .set_language(grammar)
+        .expect("registered grammar sets");
+    let tree = crate::parser::native_parse(&mut parser, &opened.tree.source, None)?;
+    Some(read(tree.root_node()))
 }
 
 /// The tree-sitter grammar for a supported fact language; `None` is the
@@ -202,25 +230,157 @@ fn grammar(lang: Lang) -> Option<tree_sitter::Language> {
     })
 }
 
-/// Runs a single-capture query and returns every captured node, in match
-/// order, at any depth. `query_src` is an authored constant — a compile
-/// failure is a programmer bug, surfaced by panic (fail-loud on our own code).
-fn query_nodes<'t>(
-    query_src: &str,
-    lang: &tree_sitter::Language,
-    root: TsNode<'t>,
-    src: &[u8],
-) -> Vec<TsNode<'t>> {
-    let query = Query::new(lang, query_src).expect("authored query compiles");
-    let mut cursor = QueryCursor::new();
-    let mut out = Vec::new();
-    let mut it = cursor.matches(&query, root, src);
-    while let Some(m) = it.next() {
-        for cap in m.captures() {
-            out.push(cap.node);
+/// One language's fact and scope queries. Compiling a query costs far more
+/// than running it over a typical file, so each set is compiled once per
+/// process (see [`Queries::of`]) and shared by every file and thread. Running
+/// one costs a walk of the tree, so the whole-file facts of a language are one
+/// query of several patterns, read in one walk (see [`query_groups`]).
+enum Queries {
+    Rust {
+        grammar: tree_sitter::Language,
+        /// Every `use` declaration: imports, and re-exports when visible.
+        uses: Query,
+        /// Three patterns: every `use` declaration, every `extern crate`
+        /// declaration, every item kind a `pub` makes an export.
+        facts: Query,
+    },
+    /// TypeScript, TSX and JavaScript, one compiled set per grammar.
+    Script {
+        grammar: tree_sitter::Language,
+        imports: Query,
+        /// Two patterns: every import statement, every export statement.
+        facts: Query,
+    },
+    Python {
+        grammar: tree_sitter::Language,
+        imports: Query,
+        /// Names declared `global` or `nonlocal`.
+        globals: Query,
+    },
+    Go {
+        grammar: tree_sitter::Language,
+        imports: Query,
+    },
+}
+
+impl Queries {
+    /// The compiled set for `lang`, compiled on first use; `None` for a
+    /// language with no fact or scope model.
+    fn of(lang: Lang) -> Option<&'static Queries> {
+        static RUST: OnceLock<Queries> = OnceLock::new();
+        static TYPESCRIPT: OnceLock<Queries> = OnceLock::new();
+        static TSX: OnceLock<Queries> = OnceLock::new();
+        static JAVASCRIPT: OnceLock<Queries> = OnceLock::new();
+        static PYTHON: OnceLock<Queries> = OnceLock::new();
+        static GO: OnceLock<Queries> = OnceLock::new();
+        let cell = match lang {
+            Lang::Rust => &RUST,
+            Lang::TypeScript => &TYPESCRIPT,
+            Lang::Tsx => &TSX,
+            Lang::JavaScript => &JAVASCRIPT,
+            Lang::Python => &PYTHON,
+            Lang::Go => &GO,
+            _ => return None,
+        };
+        Some(cell.get_or_init(|| Queries::compile(lang)))
+    }
+
+    /// Compiles `lang`'s set. Every query is an authored constant, so a
+    /// compile failure is a bug in this file, surfaced by panic.
+    fn compile(lang: Lang) -> Queries {
+        #[cfg(test)]
+        query_count::bump(lang);
+        let grammar = grammar(lang).expect("a language with queries has a grammar");
+        let q = |source: &str| Query::new(&grammar, source).expect("authored query compiles");
+        match lang {
+            Lang::Rust => Queries::Rust {
+                uses: q("(use_declaration) @u"),
+                facts: q("(use_declaration) @u \
+                     (extern_crate_declaration) @e \
+                     [(function_item) (struct_item) (enum_item) (trait_item) \
+                     (const_item) (static_item) (mod_item) (type_item) (union_item)] @item"),
+                grammar,
+            },
+            Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Queries::Script {
+                imports: q("(import_statement) @i"),
+                facts: q("(import_statement) @i (export_statement) @e"),
+                grammar,
+            },
+            Lang::Python => Queries::Python {
+                imports: q("[(import_statement) (import_from_statement)] @i"),
+                globals: q(
+                    "[(global_statement (identifier) @n) (nonlocal_statement (identifier) @n)]",
+                ),
+                grammar,
+            },
+            Lang::Go => Queries::Go {
+                imports: q("(import_spec) @s"),
+                grammar,
+            },
+            _ => unreachable!("Queries::of admits only languages with queries"),
         }
     }
-    out
+
+    fn grammar(&self) -> &tree_sitter::Language {
+        match self {
+            Queries::Rust { grammar, .. }
+            | Queries::Script { grammar, .. }
+            | Queries::Python { grammar, .. }
+            | Queries::Go { grammar, .. } => grammar,
+        }
+    }
+}
+
+/// Runs a single-capture query and returns every captured node, in match
+/// order, at any depth.
+fn query_nodes<'t>(query: &Query, root: TsNode<'t>, src: &[u8]) -> Vec<TsNode<'t>> {
+    let [nodes] = query_groups(query, root, src);
+    nodes
+}
+
+/// Runs a query of `N` single-capture patterns in one walk of the tree and
+/// returns each pattern's captured nodes, in match order: what `N` queries of
+/// one pattern each would return, for one walk instead of `N`.
+fn query_groups<'t, const N: usize>(
+    query: &Query,
+    root: TsNode<'t>,
+    src: &[u8],
+) -> [Vec<TsNode<'t>>; N] {
+    let mut groups: [Vec<TsNode<'t>>; N] = std::array::from_fn(|_| Vec::new());
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(query, root, src);
+    while let Some(m) = it.next() {
+        for cap in m.captures() {
+            groups[m.pattern_index].push(cap.node);
+        }
+    }
+    groups
+}
+
+/// Query-set compilations per language since the process started.
+#[cfg(test)]
+pub(crate) mod query_count {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::parser::Lang;
+
+    static COMPILES: [AtomicUsize; Lang::ALL.len()] =
+        [const { AtomicUsize::new(0) }; Lang::ALL.len()];
+
+    fn slot(lang: Lang) -> usize {
+        Lang::ALL
+            .iter()
+            .position(|l| *l == lang)
+            .expect("every Lang is in ALL")
+    }
+
+    pub(crate) fn bump(lang: Lang) {
+        COMPILES[slot(lang)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(lang: Lang) -> usize {
+        COMPILES[slot(lang)].load(Ordering::Relaxed)
+    }
 }
 
 /// The UTF-8 text of a node, lossy on the rare invalid-UTF-8 slice (matching
@@ -253,9 +413,9 @@ fn string_inner(n: TsNode, src: &[u8]) -> String {
 
 /// Rust imports: every `use_declaration` at any depth (module-nested `use`s
 /// included), classified by its `argument` shape. A `pub use` sets `re_export`.
-fn rust_imports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ImportFact> {
+fn rust_imports(uses: &[TsNode], src: &[u8]) -> Vec<ImportFact> {
     let mut out = Vec::new();
-    for u in query_nodes("(use_declaration) @u", lang, root, src) {
+    for &u in uses {
         let re_export = has_pub_visibility(u, src);
         let Some(arg) = u.child_by_field_name("argument") else {
             continue;
@@ -448,11 +608,16 @@ fn strip_crate_root(source: String) -> String {
 /// and a glob leaf (`pub use crate::a::*` OR nested `crate::{a::*}`) is emitted
 /// as a `glob=true` row (`name = *`, `re_exported_from` = the globbed module) so
 /// a facade glob-re-export beside a same-name own decl reads as AMBIGUOUS.
-fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
+fn rust_exports(
+    uses: &[TsNode],
+    extern_crates: &[TsNode],
+    items: &[TsNode],
+    src: &[u8],
+) -> Vec<ExportFact> {
     let mut out = Vec::new();
     // `use` re-exports: keep `pub` (Public) AND `pub(crate)`/`pub(super)`/
     // `pub(in …)` (Restricted); a visibility-less `use` is a private import.
-    for u in query_nodes("(use_declaration) @u", lang, root, src) {
+    for &u in uses {
         let visibility = match use_visibility(u, src) {
             UseVisibility::Private => continue,
             UseVisibility::Public => ExportVisibility::Public,
@@ -514,7 +679,7 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
     // crate` is a private dependency binding, NOT an export; `pub`/restricted
     // yields a Reexport row (name = crate, source = the crate itself, alias from
     // the `as` clause) so the re-exported name is not hidden (BF4 MAJOR).
-    for e in query_nodes("(extern_crate_declaration) @e", lang, root, src) {
+    for &e in extern_crates {
         let visibility = match use_visibility(e, src) {
             UseVisibility::Private => continue,
             UseVisibility::Public => ExportVisibility::Public,
@@ -534,8 +699,7 @@ fn rust_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<E
         });
     }
     // `pub` item declarations (own decls stay PUBLIC-only).
-    let q = "[(function_item) (struct_item) (enum_item) (trait_item) (const_item) (static_item) (mod_item) (type_item) (union_item)] @item";
-    for item in query_nodes(q, lang, root, src) {
+    for &item in items {
         if !has_pub_visibility(item, src) {
             continue;
         }
@@ -659,9 +823,9 @@ fn has_pub_visibility(n: TsNode, src: &[u8]) -> bool {
 /// TS/JS imports: every `import_statement`. The `import_clause` (when present)
 /// carries a default binding, `named_imports`, or a `namespace_import` (glob);
 /// a clause-less statement is a side-effect import (empty items).
-fn ts_imports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ImportFact> {
+fn ts_imports(imports: &[TsNode], src: &[u8]) -> Vec<ImportFact> {
     let mut out = Vec::new();
-    for stmt in query_nodes("(import_statement) @i", lang, root, src) {
+    for &stmt in imports {
         let source_specifier = stmt
             .child_by_field_name("source")
             .map(|s| string_inner(s, src))
@@ -730,9 +894,9 @@ fn ts_named_imports(group: TsNode, src: &[u8], items: &mut Vec<ImportedItem>) {
 /// TS/JS have no restricted module-export visibility, so every row is `Public`;
 /// TS re-export leaves are already leaf names (no brace-path mangling), so no
 /// leaf-split is needed — only the glob flag and the `* as ns` alias were gaps.
-fn ts_exports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ExportFact> {
+fn ts_exports(exports: &[TsNode], src: &[u8]) -> Vec<ExportFact> {
     let mut out = Vec::new();
-    for stmt in query_nodes("(export_statement) @e", lang, root, src) {
+    for &stmt in exports {
         let source = stmt
             .child_by_field_name("source")
             .map(|s| string_inner(s, src));
@@ -877,10 +1041,9 @@ fn child_of_kind<'t>(n: TsNode<'t>, kind: &str) -> Option<TsNode<'t>> {
 /// Python imports: `import_statement` (one fact per module named) and
 /// `import_from_statement` (`from M import …`, with `*` as glob). Aliases
 /// (`import x as y`, `from m import a as b`) are preserved.
-fn python_imports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ImportFact> {
+fn python_imports(imports: &[TsNode], src: &[u8]) -> Vec<ImportFact> {
     let mut out = Vec::new();
-    let q = "[(import_statement) (import_from_statement)] @i";
-    for stmt in query_nodes(q, lang, root, src) {
+    for &stmt in imports {
         if stmt.kind() == "import_statement" {
             for i in 0..stmt.named_child_count() {
                 let Some(c) = stmt.named_child(i as u32) else {
@@ -956,9 +1119,9 @@ fn python_imports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec
 /// Go imports: each `import_spec` (single `import "x"` or a parenthesized
 /// block). A `package_identifier` name is an alias; a `.` name is a dot import
 /// (`glob`); a `_` blank name is a side-effect import (alias `_`).
-fn go_imports(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> Vec<ImportFact> {
+fn go_imports(specs: &[TsNode], src: &[u8]) -> Vec<ImportFact> {
     let mut out = Vec::new();
-    for spec in query_nodes("(import_spec) @s", lang, root, src) {
+    for &spec in specs {
         let source_specifier = spec
             .child_by_field_name("path")
             .map(|p| string_inner(p, src))
@@ -1177,9 +1340,9 @@ pub enum Scopes {
 
 /// Extracts the lexical [`Scopes`] of a parsed file. Returns
 /// [`Scopes::Unsupported`] for any language outside the first-drop set (Rust,
-/// TS/TSX/JS, Python, Go). Re-parses `opened`'s bytes with a private native
-/// parser (queries/native walking need native nodes the port hides), so scopes
-/// are consistent with the outline the host anchors on.
+/// TS/TSX/JS, Python, Go). It reads the engine tree `opened` was parsed into
+/// (see [`extract_facts`]), so scopes are consistent with the outline the host
+/// anchors on.
 ///
 /// Two passes: (1) a scope-aware walk builds the scope arena, records each
 /// scope's bindings, buffers every identifier occurrence with its enclosing
@@ -1191,29 +1354,18 @@ pub enum Scopes {
 /// `Undecidable` (no file-wide import fallback for body imports).
 pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
     let lang = opened.lang;
-    let Some(ts_lang) = grammar(lang) else {
+    let Some(queries) = Queries::of(lang) else {
         return Scopes::Unsupported { lang };
     };
     let src = opened.tree.source.as_slice();
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&ts_lang)
-        .expect("registered grammar sets");
-    let module_scope = |root: TsNode| Scope {
-        parent: None,
-        kind: ScopeKind::Module,
-        start_byte: root.start_byte(),
-        end_byte: root.end_byte(),
-        start_line: root.start_position().row + 1,
-        end_line: root.end_position().row + 1,
-        bindings: Vec::new(),
-        poison: HashSet::new(),
-        import_bindings: HashSet::new(),
-    };
-    let Some(tree) = parser.parse(src, None) else {
-        // Total parse failure over already-parsed bytes is unreachable in
-        // practice; degrade to a bare module scope rather than fabricate.
-        return Scopes::Supported(ScopeTree {
+    with_root(opened, queries.grammar(), |root| {
+        Scopes::Supported(scope_tree(lang, queries, root, src))
+    })
+    // Total parse failure over bytes the outline already parsed is
+    // unreachable in practice; degrade to a bare module scope rather than
+    // fabricate.
+    .unwrap_or_else(|| {
+        Scopes::Supported(ScopeTree {
             scopes: vec![Scope {
                 parent: None,
                 kind: ScopeKind::Module,
@@ -1226,35 +1378,52 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
                 import_bindings: HashSet::new(),
             }],
             occurrences: Vec::new(),
-        });
+        })
+    })
+}
+
+/// Builds the scope tree of the file under `root` (see [`extract_scopes`]).
+fn scope_tree(lang: Lang, queries: &Queries, root: TsNode, src: &[u8]) -> ScopeTree {
+    let module_scope = |root: TsNode| Scope {
+        parent: None,
+        kind: ScopeKind::Module,
+        start_byte: root.start_byte(),
+        end_byte: root.end_byte(),
+        start_line: root.start_position().row + 1,
+        end_line: root.end_position().row + 1,
+        bindings: Vec::new(),
+        poison: HashSet::new(),
+        import_bindings: HashSet::new(),
     };
-    let root = tree.root_node();
     // Names declared `global`/`nonlocal` anywhere (Python): such names never
     // create a function-scope binding (F6) — an assignment to them targets the
     // module namespace, so a local binding would be a false definite. Computed
     // once, conservatively corpus-wide (over-exclusion only ever demotes to
     // Undecidable, never fabricates a definite).
-    let globals = if matches!(lang, Lang::Python) {
-        python_global_names(root, src, &ts_lang)
-    } else {
-        HashSet::new()
+    let globals = match queries {
+        Queries::Python { globals, .. } => python_global_names(root, src, globals),
+        _ => HashSet::new(),
     };
     let mut scopes = vec![module_scope(root)];
     let mut out = WalkOut {
         occurrences: Vec::new(),
         import_decls: Vec::new(),
+        ancestors: vec![root],
     };
-    for i in 0..root.named_child_count() {
-        if let Some(c) = root.named_child(i as u32) {
-            walk_scopes(lang, c, 0, src, &mut scopes, &mut out, &globals);
-        }
+    for c in root.named_children(&mut root.walk()) {
+        walk_scopes(lang, c, 0, src, &mut scopes, &mut out, &globals);
     }
     // Attach each import declaration's LOCAL names to the scope that contains
     // it (BF2): module root for top-level imports (visible file-wide), the
     // fn/block scope for body imports (visible only down that subtree).
     for (sid, node) in out.import_decls {
-        let names = import_local_names(lang, &imports_of_node(lang, node, src, &ts_lang));
+        let names = import_local_names(lang, &imports_of_node(queries, node, src));
         scopes[sid].import_bindings.extend(names);
+    }
+    // A blank `_` binds nothing (Go `for _, v := range`, `var _ I = T{}`); it
+    // has no occurrence either, so dropping it changes no resolution.
+    for scope in &mut scopes {
+        scope.bindings.retain(|b| !is_blank(lang, &b.name));
     }
     let occurrences = out
         .occurrences
@@ -1271,10 +1440,10 @@ pub fn extract_scopes(opened: &OpenedFile) -> Scopes {
             }
         })
         .collect();
-    Scopes::Supported(ScopeTree {
+    ScopeTree {
         scopes,
         occurrences,
-    })
+    }
 }
 
 /// The output buffers [`walk_scopes`] accumulates over one file: every
@@ -1288,6 +1457,11 @@ struct WalkOut<'t> {
     occurrences: Vec<(String, usize, usize, usize, usize)>,
     /// Import/use statement nodes paired with their lexically-enclosing scope.
     import_decls: Vec<(usize, TsNode<'t>)>,
+    /// The nodes above the one being walked, the root first. Asking the engine
+    /// for a node's parent searches down from the root, so an identifier that
+    /// climbed to the root that way cost the square of its depth; the walk
+    /// already passes through every ancestor and keeps them here instead.
+    ancestors: Vec<TsNode<'t>>,
 }
 
 /// Scope-aware descent. Adds `node`'s enclosing-scope bindings (declaration
@@ -1360,28 +1534,33 @@ fn walk_scopes<'t>(
     // Python attribute/keyword/global-nonlocal, TSX intrinsic tag, TS
     // index-signature param — F4/F6/XH3), which is dropped so it can never coerce
     // a false definite.
-    if kind == "identifier" && !is_non_occurrence(lang, node, src) {
-        out.occurrences.push((
-            ntext(node, src),
-            cur,
-            node.start_byte(),
-            node.end_byte(),
-            node.start_position().row + 1,
-        ));
-    }
-    for i in 0..node.named_child_count() {
-        if let Some(c) = node.named_child(i as u32) {
-            // Rust `if let` else/else-if branch: the let-binding does NOT reach
-            // the alternative, so recurse it under the ENCLOSING scope (never
-            // the if-scope) — prevents a false LocalBinding in the else arm.
-            let into = if is_rust_if_alternative(lang, node, c) {
-                cur
-            } else {
-                child
-            };
-            walk_scopes(lang, c, into, src, scopes, out, globals);
+    if kind == "identifier" && !is_non_occurrence(lang, node, &out.ancestors, src) {
+        let name = ntext(node, src);
+        if !is_blank(lang, &name) {
+            out.occurrences.push((
+                name,
+                cur,
+                node.start_byte(),
+                node.end_byte(),
+                node.start_position().row + 1,
+            ));
         }
     }
+    out.ancestors.push(node);
+    // A cursor steps to each next sibling in constant time; asking for the
+    // i-th child walks the siblings before it, quadratic in a wide node.
+    for c in node.named_children(&mut node.walk()) {
+        // Rust `if let` else/else-if branch: the let-binding does NOT reach
+        // the alternative, so recurse it under the ENCLOSING scope (never
+        // the if-scope) — prevents a false LocalBinding in the else arm.
+        let into = if is_rust_if_alternative(lang, node, c) {
+            cur
+        } else {
+            child
+        };
+        walk_scopes(lang, c, into, src, scopes, out, globals);
+    }
+    out.ancestors.pop();
 }
 
 /// Whether `child` is the `alternative` (else / else-if) branch of a Rust
@@ -1434,10 +1613,9 @@ fn python_nonclass_ancestor(scopes: &[Scope], mut cur: usize) -> usize {
 
 /// Python `global`/`nonlocal` declaration names, gathered corpus-wide. A name
 /// here is never turned into a function-scope binding (F6).
-fn python_global_names(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -> HashSet<String> {
+fn python_global_names(root: TsNode, src: &[u8], globals: &Query) -> HashSet<String> {
     let mut set = HashSet::new();
-    let q = "[(global_statement (identifier) @n) (nonlocal_statement (identifier) @n)]";
-    for n in query_nodes(q, lang, root, src) {
+    for n in query_nodes(globals, root, src) {
         set.insert(ntext(n, src));
     }
     set
@@ -1473,18 +1651,20 @@ fn python_global_names(root: TsNode, src: &[u8], lang: &tree_sitter::Language) -
 ///    element name (`<div>`/`</div>`) is an HTML/SVG intrinsic (an uppercase
 ///    component tag `<Foo/>` IS a reference and stays); `[key: string]: T`'s
 ///    `key` is a type-position placeholder that binds no value.
-fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
+///
+/// `ancestors` are the nodes above `node`, the root first.
+fn is_non_occurrence(lang: Lang, node: TsNode, ancestors: &[TsNode], src: &[u8]) -> bool {
     // (1) Anything inside an import/use declaration span — all grammars.
-    if within_import_decl(lang, node) {
+    if within_import_decl(lang, ancestors) {
         return true;
     }
-    let Some(p) = node.parent() else {
+    let Some(&p) = ancestors.last() else {
         return false;
     };
     // (1b) DEFINITION NAME site — the `name` field of any definition node (BF3):
     // a declaration is not a use. Dropped BEFORE the per-grammar tail so it
     // covers all four grammars uniformly.
-    if is_definition_name(lang, node, p) {
+    if is_definition_name(lang, node, ancestors) {
         return true;
     }
     match lang {
@@ -1493,8 +1673,12 @@ fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
         // are each a `name`). The path HEAD (`T` in `T::default()`, `a` in
         // `a::b`) is the `path` field — a real reference (generic param / module)
         // that STAYS, mirroring the Python attribute-head rule.
+        // (2a') A lifetime (`'a`, `'_`) or a loop label (`'outer`) holds an
+        // identifier that is never a value: a lifetime named like an import
+        // would otherwise resolve to it.
         Lang::Rust => {
-            p.kind() == "scoped_identifier" && p.child_by_field_name("name") == Some(node)
+            (p.kind() == "scoped_identifier" && p.child_by_field_name("name") == Some(node))
+                || matches!(p.kind(), "lifetime" | "label")
         }
         // (2b) Python attribute field / keyword-arg name / global-nonlocal
         // (F4/F6) PLUS `dotted_name` import-path segments.
@@ -1508,7 +1692,7 @@ fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
         // (2c) TS/JS re-export-`from` specifier/namespace name + TSX intrinsic
         // tag name + TS index-signature parameter name.
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
-            within_reexport_from(node)
+            within_reexport_from(ancestors)
                 || is_tsx_intrinsic_tag(p, node, src)
                 || is_ts_index_signature_param(p, node)
         }
@@ -1535,13 +1719,16 @@ fn is_non_occurrence(lang: Lang, node: TsNode, src: &[u8]) -> bool {
 /// collides with an imported name (`use origin::helper;` + `fn helper()`)
 /// resolves a false `ImportedName` and emits a phantom `Extracted` edge. A body
 /// USE of the same spelling is NOT a `name` field and is unaffected.
-fn is_definition_name(lang: Lang, node: TsNode, p: TsNode) -> bool {
+fn is_definition_name(lang: Lang, node: TsNode, ancestors: &[TsNode]) -> bool {
+    let Some(&p) = ancestors.last() else {
+        return false;
+    };
     // Go func-TYPE parameter names (`type F func(helper int)`) are declaration
     // positions inside a `function_type` that open no scope and bind nothing —
     // left in the stream they resolve a colliding import to a false
     // `ImportedName`. A REAL func/method/literal param binds (LocalBinding) and
     // stays; discriminated by the enclosing owner kind (see helper).
-    if lang == Lang::Go && is_go_func_type_param(node, p) {
+    if lang == Lang::Go && is_go_func_type_param(node, ancestors) {
         return true;
     }
     let is_def_parent = match lang {
@@ -1600,31 +1787,23 @@ fn is_definition_name(lang: Lang, node: TsNode, p: TsNode) -> bool {
 /// edge). A REAL parameter lives under a `function_declaration`/
 /// `method_declaration`/`func_literal` `parameter_list` — its owner is NOT
 /// `function_type`, so it is left to bind (LocalBinding) and stay.
-fn is_go_func_type_param(node: TsNode, p: TsNode) -> bool {
-    if p.kind() != "parameter_declaration" || p.child_by_field_name("name") != Some(node) {
-        return false;
-    }
-    let Some(plist) = p.parent() else {
+fn is_go_func_type_param(node: TsNode, ancestors: &[TsNode]) -> bool {
+    // The parameter, its list, and the list's owner, nearest first.
+    let mut up = ancestors.iter().rev();
+    let (Some(p), Some(_plist), Some(owner)) = (up.next(), up.next(), up.next()) else {
         return false;
     };
-    plist
-        .parent()
-        .is_some_and(|owner| owner.kind() == "function_type")
+    p.kind() == "parameter_declaration"
+        && p.child_by_field_name("name") == Some(node)
+        && owner.kind() == "function_type"
 }
 
-/// Whether `node` lies anywhere inside an import/use/from-import declaration.
-/// Climbs ancestors (import decls are statements whose subtree holds only path/
-/// list/alias nodes, so an import identifier reaches its decl in a few hops
-/// before any non-import identifier climbs to the root).
-fn within_import_decl(lang: Lang, node: TsNode) -> bool {
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        if is_import_decl_kind(lang, n.kind()) {
-            return true;
-        }
-        cur = n.parent();
-    }
-    false
+/// Whether a node under `ancestors` (root first) lies anywhere inside an
+/// import/use/from-import declaration.
+fn within_import_decl(lang: Lang, ancestors: &[TsNode]) -> bool {
+    ancestors
+        .iter()
+        .any(|n| is_import_decl_kind(lang, n.kind()))
 }
 
 /// The per-grammar import/use declaration node kinds whose contained
@@ -1673,18 +1852,15 @@ fn is_import_stmt_kind(lang: Lang, kind: &str) -> bool {
 /// module's binding, never a local value use, so buffering one coerced a false
 /// `ImportedName` on a same-spelling import collision (the XH3 residual class).
 /// A SOURCELESS `export {x}` re-exports a LOCAL binding, so its `x` IS a real
-/// reference and stays (this helper returns `false` — no `source` field). Climbs
-/// ancestors; export statements do not nest, so the FIRST `export_statement`
-/// hit decides.
-fn within_reexport_from(node: TsNode) -> bool {
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        if n.kind() == "export_statement" {
-            return n.child_by_field_name("source").is_some();
-        }
-        cur = n.parent();
-    }
-    false
+/// reference and stays (this helper returns `false` — no `source` field). Reads
+/// `ancestors` (root first) nearest first; export statements do not nest, so
+/// the FIRST `export_statement` hit decides.
+fn within_reexport_from(ancestors: &[TsNode]) -> bool {
+    ancestors
+        .iter()
+        .rev()
+        .find(|n| n.kind() == "export_statement")
+        .is_some_and(|n| n.child_by_field_name("source").is_some())
 }
 
 /// Whether `node` (parent `p`) is a lowercase JSX element name — an HTML/SVG
@@ -2708,9 +2884,7 @@ fn import_local_names(lang: Lang, imports: &[ImportFact]) -> HashSet<String> {
             } else {
                 last_segment(&imp.source_specifier)
             };
-            if let Some(seg) = seg {
-                set.insert(seg);
-            }
+            set.extend(seg.filter(|s| !is_blank(lang, s)));
             continue;
         }
         for it in &imp.items {
@@ -2718,9 +2892,7 @@ fn import_local_names(lang: Lang, imports: &[ImportFact]) -> HashSet<String> {
             if local == "*" || local.ends_with("::*") || local.ends_with('*') {
                 continue;
             }
-            if let Some(seg) = last_segment(&local) {
-                set.insert(seg);
-            }
+            set.extend(last_segment(&local).filter(|s| !is_blank(lang, s)));
         }
     }
     set
@@ -2732,19 +2904,22 @@ fn import_local_names(lang: Lang, imports: &[ImportFact]) -> HashSet<String> {
 /// names then bind to the scope the statement sits in. Unhandled kinds (Rust
 /// `extern_crate_declaration`, Python `future_import_statement`) yield none,
 /// preserving pre-BF2 behavior (their names were never resolvable imports).
-fn imports_of_node(
-    lang: Lang,
-    node: TsNode,
-    src: &[u8],
-    ts_lang: &tree_sitter::Language,
-) -> Vec<ImportFact> {
-    match lang {
-        Lang::Rust => rust_imports(node, src, ts_lang),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => ts_imports(node, src, ts_lang),
-        Lang::Python => python_imports(node, src, ts_lang),
-        Lang::Go => go_imports(node, src, ts_lang),
-        _ => Vec::new(),
+fn imports_of_node(queries: &Queries, node: TsNode, src: &[u8]) -> Vec<ImportFact> {
+    match queries {
+        Queries::Rust { uses, .. } => rust_imports(&query_nodes(uses, node, src), src),
+        Queries::Script { imports, .. } => ts_imports(&query_nodes(imports, node, src), src),
+        Queries::Python { imports, .. } => python_imports(&query_nodes(imports, node, src), src),
+        Queries::Go { imports, .. } => go_imports(&query_nodes(imports, node, src), src),
     }
+}
+
+/// Whether `name` is the blank identifier: in Rust and Go `_` names nothing
+/// (`use T as _;` brings a trait into scope anonymously, `import _ "embed"` runs
+/// a package for its side effects, `_ = x` discards), so it is never a binding,
+/// an import name or a use. In JavaScript, TypeScript and Python `_` is an
+/// ordinary name (lodash, gettext) and stays one.
+fn is_blank(lang: Lang, name: &str) -> bool {
+    name == "_" && matches!(lang, Lang::Rust | Lang::Go)
 }
 
 /// The final path segment of an import name/specifier (`a::b::C` → `C`,
@@ -5440,6 +5615,205 @@ mod tests {
             !t.occurrences.iter().any(|o| o.name == "key"),
             "index-signature param `key` is not an occurrence: {:?}",
             t.occurrences
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_once_tests {
+    use super::*;
+    use crate::inspect::{parse_health, read_blocks, tier2_sites};
+    use crate::parser::{Adapter, ParserPort, parse_count};
+
+    fn opened(path: &str, src: &[u8]) -> OpenedFile {
+        let lang = Lang::for_path(path);
+        OpenedFile {
+            path: path.to_string(),
+            lang,
+            tree: Adapter::new().parse(lang, src).unwrap(),
+        }
+    }
+
+    fn tree_of(path: &str, src: &[u8]) -> ScopeTree {
+        match extract_scopes(&opened(path, src)) {
+            Scopes::Supported(t) => t,
+            Scopes::Unsupported { lang } => panic!("no scope model for {lang}"),
+        }
+    }
+
+    const RUST: &[u8] = b"use a::b;\nuse c::{d, e as f};\npub use g::H;\n\
+        extern crate k;\nfn x() { let y = b(); d(f); }\n";
+
+    #[test]
+    fn one_parse_feeds_every_read_only_surface() {
+        for (path, src) in [
+            ("m.rs", RUST),
+            (
+                "m.go",
+                b"package m\nimport \"fmt\"\nfunc F() { fmt.Println(1) }\n".as_slice(),
+            ),
+            ("m.py", b"import os\ndef f():\n    return os.sep\n"),
+            ("m.ts", b"import { a } from './a';\nexport const b = a();\n"),
+            ("m.tsx", b"import A from './a';\nconst E = () => <A />;\n"),
+            (
+                "m.js",
+                b"import a from './a';\nexport function f() { return a; }\n",
+            ),
+        ] {
+            let before = parse_count::get();
+            let file = opened(path, src);
+            let _ = read_blocks(&file, false);
+            let _ = tier2_sites(&file);
+            let _ = extract_facts(&file);
+            let _ = extract_scopes(&file);
+            let _ = parse_health(&file);
+            assert_eq!(
+                parse_count::get() - before,
+                1,
+                "{path}: every surface must read the one tree it was opened with"
+            );
+        }
+    }
+
+    #[test]
+    fn queries_compile_once_per_language_per_process() {
+        for (path, lang, src) in [
+            ("m.rs", Lang::Rust, RUST),
+            (
+                "m.go",
+                Lang::Go,
+                b"package m\nimport (\n\t\"fmt\"\n\t_ \"embed\"\n)\n".as_slice(),
+            ),
+            (
+                "m.py",
+                Lang::Python,
+                b"import os\nfrom a import b\nglobal_x = 1\n",
+            ),
+            (
+                "m.ts",
+                Lang::TypeScript,
+                b"import { a } from './a';\nexport * from './b';\n",
+            ),
+        ] {
+            let file = opened(path, src);
+            let _ = extract_facts(&file);
+            let _ = extract_scopes(&file);
+            let first = query_count::get(lang);
+            for _ in 0..20 {
+                let _ = extract_facts(&file);
+                let _ = extract_scopes(&file);
+            }
+            assert_eq!(first, 1, "{lang}: one compiled query set per process");
+            assert_eq!(query_count::get(lang), 1, "{lang}: no compile per file");
+        }
+    }
+
+    /// The opening of `crates/hylla-agent-skill/src/lib.rs` in Hylla, byte for
+    /// byte through its first function's header: `use std::fmt::Write as _;`
+    /// and the elided lifetime in `&[SkillTool<'_>]`.
+    const AGENT_SKILL_HEADER: &[u8] = include_bytes!("../testdata/readiness/agent_skill_header.rs");
+
+    #[test]
+    fn rust_underscore_import_binds_no_name_and_lifetimes_are_not_uses() {
+        let t = tree_of("lib.rs", AGENT_SKILL_HEADER);
+        assert!(
+            t.scopes.iter().all(|s| !s.import_bindings.contains("_")),
+            "`as _` binds no local name"
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "_"),
+            "no `_` occurrence: {:?}",
+            t.occurrences
+                .iter()
+                .filter(|o| o.name == "_")
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !t.occurrences
+                .iter()
+                .any(|o| o.resolution == Resolution::ImportedName),
+            "nothing here uses an imported name"
+        );
+        let (imports, _) = match extract_facts(&opened("lib.rs", AGENT_SKILL_HEADER)) {
+            Facts::Supported { imports, exports } => (imports, exports),
+            Facts::Unsupported { lang } => panic!("{lang}"),
+        };
+        assert!(
+            imports
+                .iter()
+                .flat_map(|i| &i.items)
+                .all(|it| it.name != "_"),
+            "no import is named `_`: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn rust_lifetimes_and_labels_never_resolve_to_imports() {
+        let src = b"use m::a;\nuse m::outer;\nextern crate z as _;\n\
+            fn f<'a>(v: &'a str) -> usize { 'outer: loop { break 'outer v.len(); } }\n\
+            fn g() { a(); }\n";
+        let t = tree_of("m.rs", src);
+        let imported: Vec<&str> = t
+            .occurrences
+            .iter()
+            .filter(|o| o.resolution == Resolution::ImportedName)
+            .map(|o| o.name.as_str())
+            .collect();
+        assert_eq!(imported, ["a"], "only the call `a()` uses an import");
+        assert!(
+            !t.occurrences
+                .iter()
+                .any(|o| o.name == "_" || o.name == "outer")
+        );
+    }
+
+    #[test]
+    fn go_blank_import_and_blank_assignment_bind_and_use_nothing() {
+        let src = b"package main\n\nimport (\n\t_ \"embed\"\n\t\"fmt\"\n)\n\n\
+            //go:embed hello.txt\nvar greeting string\n\nvar _ fmt.Stringer = nil\n\n\
+            func main() {\n\tx := fmt.Sprint(greeting)\n\t_ = x\n\
+            \tfor _, c := range x {\n\t\tfmt.Println(c)\n\t}\n}\n";
+        let t = tree_of("main.go", src);
+        assert!(
+            t.scopes.iter().all(|s| !s.import_bindings.contains("_")),
+            "`import _` binds no local name"
+        );
+        assert!(
+            t.scopes
+                .iter()
+                .all(|s| s.bindings.iter().all(|b| b.name != "_")),
+            "`_` is never a binding"
+        );
+        assert!(
+            !t.occurrences.iter().any(|o| o.name == "_"),
+            "`_` is never an occurrence"
+        );
+        let first = t
+            .occurrences
+            .iter()
+            .find(|o| o.resolution == Resolution::ImportedName)
+            .expect("fmt is used");
+        assert_eq!(first.name, "fmt");
+    }
+
+    #[test]
+    fn js_and_python_underscore_stays_a_real_name() {
+        let t = tree_of("m.js", b"import _ from 'lodash';\n_.map([], f);\n");
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "_" && o.resolution == Resolution::ImportedName),
+            "lodash's `_` is a real binding in JavaScript"
+        );
+        let t = tree_of(
+            "m.py",
+            b"from gettext import gettext as _\nprint(_('hi'))\n",
+        );
+        assert!(
+            t.occurrences
+                .iter()
+                .any(|o| o.name == "_" && o.resolution == Resolution::ImportedName),
+            "gettext's `_` is a real binding in Python"
         );
     }
 }

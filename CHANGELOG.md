@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — one parse per file, positions without text scans, `_` names nothing, open once
+
+`Block`, every fact and scope shape, and `region_hash` are unchanged. **Three source breaks for a
+v0.14.0 caller**, each needing nothing unless the caller builds or exhaustively matches the type.
+
+### Source breaks, and the fix for each
+
+- **`inspect::Symbol` has three new fields**: `start_point`, `end_point`, `name_range`. A struct
+  literal adds them.
+- **`lsp::ProbeAnswer` has a new variant**, `SameFile { locations }`. An exhaustive match adds it.
+- **`lsp::LspError` has three new variants**: `ReadyProbesDeadline`, `NoReadyProbe`,
+  `BlankProbe`. An exhaustive match adds them.
+
+### Added
+
+- `inspect::read_placed_blocks` and `PlacedBlock`: each block with tree-sitter's start and end
+  points and the byte range of its name node.
+- `inspect::open_bytes`: the one parse a file needs, from bytes the caller holds.
+- `region::LineIndex::point_for_byte`: a zero-based point by binary search.
+- `lsp::TextIndex`: one file indexed for LSP positions; `position_at` and `byte_offset` by binary
+  search, agreeing exactly with the walking functions of the same names.
+- `lsp::Client::ensure_open`, and `Client::await_ready_by` with `ReadyProbe`: ready only on a
+  definition in another file, or on any location while every declared ready signal holds; a
+  candidate on `_` is refused before anything is sent.
+
+### Behaviour changes
+
+- **`extract_facts` and `extract_scopes` parse nothing**: they read the tree the file was opened
+  with (a tree without one is still parsed once more). Their queries compile once per process and
+  language, and a language's whole-file facts run as one query. Scopes no longer ask the engine
+  for parents, which it finds by searching down from the root.
+- **`_` names nothing in Rust and Go**: never an import name, binding or occurrence. A Rust
+  lifetime or loop label is never an occurrence.
+- **A query no longer re-opens its document.** Every query, `rename` and its priming open a
+  document only when the server does not already hold it with the same text; `diagnostics` still
+  re-opens, because it needs a fresh publish.
+- **`reparse` places an edit from one line table** instead of three scans of the text.
+- **The tree-sitter DTO is built with a cursor**, linear in a node's width.
+- **Test builds are optimised** (`[profile.test] opt-level = 1`, dependencies at 2), so the timed
+  tests measure bage rather than the build mode.
+
 ## 0.14.0 — LSP: kept diagnostics, failure rules, hover (source breaks)
 
 **Every change is in `bage::lsp`** (SPEC §12.6). Parsing, names and `region_hash` are unchanged.

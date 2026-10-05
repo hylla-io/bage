@@ -1576,3 +1576,108 @@ fn pyright_hover_shows_stdlib_docs() {
     }
     hover_proof(&py_hover_case());
 }
+
+/// The opening of Hylla's `crates/hylla-agent-skill/src/lib.rs`, byte for byte
+/// (`use std::fmt::Write as _;`, then `SkillTool<'_>`), the file whose `'_`
+/// once became a readiness probe rust-analyzer can never resolve.
+const AGENT_SKILL_HEADER: &str = include_str!("../testdata/readiness/agent_skill_header.rs");
+
+#[test]
+fn rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_ones() {
+    if !real_servers(
+        "rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_ones",
+    ) {
+        return;
+    }
+    let lib = format!(
+        "{AGENT_SKILL_HEADER}\npub mod util;\nuse util::helper;\n\
+         pub fn uses() -> usize {{ helper() }}\n\
+         pub fn local() -> String {{ render_agent_protocol_skill(&[], SkillHarness::Omp) }}\n"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    fs::create_dir_all(root.join("src")).expect("src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"skill\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
+    fs::write(root.join("src/lib.rs"), &lib).expect("lib");
+    fs::write(root.join("src/util.rs"), "pub fn helper() -> usize { 1 }\n").expect("util");
+    let path = root.join("src/lib.rs");
+    let path = path.to_str().expect("utf-8");
+
+    // The candidate a host takes from the scope facts: the first use of an
+    // imported name. The `_` of `as _` and of `'_` is never one.
+    let opened = bage::inspect::open_bytes(&bage::parser::Adapter::new(), path, lib.as_bytes())
+        .expect("parse");
+    let bage::inspect::Scopes::Supported(scopes) = bage::inspect::extract_scopes(&opened) else {
+        panic!("rust has a scope model");
+    };
+    let first = scopes
+        .occurrences
+        .iter()
+        .find(|o| o.resolution == bage::inspect::Resolution::ImportedName)
+        .expect("a use of an imported name");
+    assert_eq!(first.name, "helper");
+    let index = lsp::TextIndex::new(lib.as_bytes());
+    let at = |byte: usize| {
+        let (line, character) = index.position_at(byte).expect("position");
+        lsp::ReadyProbe {
+            path,
+            content: &lib,
+            line,
+            character,
+        }
+    };
+    let cross_file = at(first.start_byte);
+    let in_file = at(lib.rfind("render_agent_protocol_skill(").expect("call"));
+    let blank = at(lib.find("as _").expect("as _") + 3);
+
+    let mut c = Client::new_stdio(&["rust-analyzer".to_string()]).expect("spawn rust-analyzer");
+    c.configure(ClientConfig {
+        initialize_timeout: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(30),
+        ready_deadline: Duration::from_secs(120),
+        ready_retry: Duration::from_millis(250),
+        ..ClientConfig::default()
+    });
+    c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
+        .expect("initialize");
+    assert!(
+        matches!(
+            c.await_ready_by(&[cross_file, blank]),
+            Err(LspError::BlankProbe { .. })
+        ),
+        "a candidate on `_` is refused before anything is sent"
+    );
+    let started = Instant::now();
+    assert_eq!(
+        c.await_ready_by(&[in_file, cross_file]).expect("ready"),
+        1,
+        "only the definition in another file shows the server ready"
+    );
+    eprintln!("ready by the cross-file probe in {:?}", started.elapsed());
+
+    // Loaded or not, an answer inside the probed file never counts. What the
+    // server last said is its own business: the in-file location, or, while
+    // it reloads after `cargo check`, a "content modified" refusal.
+    let mut cfg = c.config();
+    cfg.ready_deadline = Duration::from_secs(3);
+    c.configure(cfg);
+    match c.await_ready_by(&[in_file]) {
+        Err(LspError::ReadyProbesDeadline { probes, .. }) => {
+            eprintln!("in-file probe, last answer: {}", probes[0].last);
+            assert!(
+                matches!(
+                    probes[0].last,
+                    ProbeAnswer::SameFile { .. } | ProbeAnswer::Refused { .. }
+                ),
+                "{:?}",
+                probes[0].last
+            );
+        }
+        other => panic!("an in-file answer was taken as ready: {other:?}"),
+    }
+    c.close().expect("close");
+}
