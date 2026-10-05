@@ -34,7 +34,7 @@
 //! reached with [`Client::pull_diagnostics`], whose answer lands in the same
 //! store.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -276,10 +276,11 @@ pub struct DiagnosticFailure {
     /// holds a match of THIS rule and replaces them. A declaration silent
     /// about it is `Latest`.
     ///
-    /// The choice matters more than it looks: every query re-opens its
-    /// document, a server that diagnoses only open documents then withdraws
-    /// and later re-sends that document's diagnostics, and a `Latest` rule
-    /// read inside that gap sees none.
+    /// The choice matters more than it looks: [`Client::diagnostics`], and a
+    /// query sent with new text, re-open their document; a server that
+    /// diagnoses only open documents then withdraws and later re-sends that
+    /// document's diagnostics, and a `Latest` rule read inside that gap sees
+    /// none.
     #[serde(default)]
     pub mode: ReadyMode,
 }
@@ -877,6 +878,13 @@ pub enum ProbeAnswer {
         /// How long the probe waited.
         after: Duration,
     },
+    /// The server answered with locations, every one in the probed file: a
+    /// server still loading the rest of the workspace answers so, so it is
+    /// no evidence the server can see past that file.
+    SameFile {
+        /// How many locations it gave.
+        locations: usize,
+    },
 }
 
 impl std::fmt::Display for ProbeAnswer {
@@ -885,7 +893,52 @@ impl std::fmt::Display for ProbeAnswer {
             ProbeAnswer::Empty => f.write_str("empty result"),
             ProbeAnswer::Refused { message } => write!(f, "refused: {message}"),
             ProbeAnswer::NoResponse { after } => write!(f, "no response after {after:?}"),
+            ProbeAnswer::SameFile { locations } => {
+                write!(f, "{locations} location(s), all in the probed file")
+            }
         }
+    }
+}
+
+/// One position [`Client::await_ready_by`] may probe: a use, in `path`, of a
+/// name the workspace defines in ANOTHER file — an import's use, a call into
+/// another module. `line` and `character` are zero-based, the character in
+/// UTF-16 code units; `content` is the document's authoritative text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadyProbe<'a> {
+    /// The probed document.
+    pub path: &'a str,
+    /// Its text, sent to the server when it does not already hold it.
+    pub content: &'a str,
+    /// Zero-based line.
+    pub line: u32,
+    /// Zero-based character, in UTF-16 code units.
+    pub character: u32,
+}
+
+/// A candidate of a readiness wait that ran out, with the server's last
+/// answer to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeTried {
+    /// The probed document.
+    pub path: String,
+    /// Zero-based line.
+    pub line: u32,
+    /// Zero-based character, in UTF-16 code units.
+    pub character: u32,
+    /// What the last probe at this position came back with.
+    pub last: ProbeAnswer,
+}
+
+/// Prints each candidate on its own line, positions zero-based as sent.
+struct Tried<'a>(&'a [ProbeTried]);
+
+impl std::fmt::Display for Tried<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for t in self.0 {
+            write!(f, "\n  {}:{}:{}: {}", t.path, t.line, t.character, t.last)?;
+        }
+        Ok(())
     }
 }
 
@@ -1036,6 +1089,40 @@ pub enum LspError {
         /// The server's recent stderr.
         stderr: StderrTail,
     },
+    /// [`Client::await_ready_by`] probed for its whole deadline, every
+    /// declared signal holding, and no candidate was ever answered with a
+    /// definition in another file (nor, under a declared signal, with any
+    /// location), so the server is not ready to be queried.
+    #[error(
+        "lsp: not ready: no probe resolved past its own file within {after:?}:{}{stderr}",
+        Tried(.probes)
+    )]
+    ReadyProbesDeadline {
+        /// Every candidate and the server's last answer to it, in the order
+        /// given.
+        probes: Vec<ProbeTried>,
+        /// The configured readiness deadline.
+        after: Duration,
+        /// The server's recent stderr.
+        stderr: StderrTail,
+    },
+    /// [`Client::await_ready_by`] was given no candidate, so nothing could
+    /// ever show the server ready.
+    #[error("lsp: not ready: no readiness probe was given")]
+    NoReadyProbe,
+    /// A readiness candidate sits on the blank name `_`, which names nothing
+    /// a server can resolve (`use T as _`, Go's `import _`, the lifetime
+    /// `'_`): probing it would wait out the whole deadline. Refused before
+    /// anything is sent.
+    #[error("lsp: readiness probe {path:?}:{line}:{character} is on `_`, which names nothing")]
+    BlankProbe {
+        /// The probed document.
+        path: String,
+        /// Zero-based line.
+        line: u32,
+        /// Zero-based character, in UTF-16 code units.
+        character: u32,
+    },
     /// The server said the project did not load: a declared [`ReadyFailure`]
     /// or [`DiagnosticFailure`] holds. Returned by [`Client::await_ready`],
     /// which stops at once rather than probing a server that has given up,
@@ -1131,6 +1218,10 @@ fn content_hash(bytes: &[u8]) -> u64 {
 /// (the terminating '\n' is never crossed). The only rejected input is a
 /// malformed UTF-8 sequence encountered while consuming characters on the
 /// target line.
+///
+/// Each call walks the text from its start: it converts ONE position. A
+/// caller converting several positions in one file builds one [`TextIndex`]
+/// and asks it, or the walks add up to the square of the file's size.
 pub fn byte_offset(src: &[u8], line: u32, character: u32) -> Result<usize, LspError> {
     // Phase 1: walk to the start byte of the target line by counting newlines.
     let mut line_start = 0usize;
@@ -1171,6 +1262,9 @@ pub fn byte_offset(src: &[u8], line: u32, character: u32) -> Result<usize, LspEr
 /// a multi-byte char rounds DOWN to that char's position: a position must name
 /// a whole character, and rounding down keeps a symbol's start byte naming the
 /// symbol rather than the character after it.
+///
+/// Each call walks the text from its start: it converts ONE position; see
+/// [`TextIndex`] for many.
 pub fn position_at(src: &[u8], byte: usize) -> Result<(u32, u32), LspError> {
     let target = byte.min(src.len());
     let mut line = 0u32;
@@ -1193,6 +1287,186 @@ pub fn position_at(src: &[u8], byte: usize) -> Result<(u32, u32), LspError> {
         offset += size;
     }
     Ok((line, character))
+}
+
+/// One file's text indexed for LSP positions, built in one pass: where each
+/// line starts, every char whose UTF-16 width differs from its UTF-8 width,
+/// and every malformed UTF-8 sequence. [`TextIndex::position_at`] and
+/// [`TextIndex::byte_offset`] then answer by binary search and agree exactly
+/// with [`position_at`] and [`byte_offset`], which walk the text for each call
+/// — a cost a caller converting many positions in one file pays once here
+/// instead. A long line costs no more than a short one, so a minified file
+/// with millions of positions on its single line stays linear.
+#[derive(Debug, Clone)]
+pub struct TextIndex {
+    /// Byte offset where each zero-based line starts; `[0]` is 0.
+    line_starts: Vec<usize>,
+    /// Every non-ASCII char in source order: its UTF-8 bytes always outnumber
+    /// its UTF-16 units.
+    wide: Vec<WideChar>,
+    /// Where each malformed UTF-8 sequence starts, in source order.
+    malformed: Vec<usize>,
+    /// The text's length in bytes.
+    len: usize,
+}
+
+/// A non-ASCII char of a [`TextIndex`]ed text.
+#[derive(Debug, Clone, Copy)]
+struct WideChar {
+    /// Its first byte.
+    start: usize,
+    /// Its width in UTF-8 bytes (2 to 4).
+    bytes: u8,
+    /// Its width in UTF-16 code units (1 or 2).
+    units: u8,
+    /// Bytes minus units over every wide char before this one.
+    excess_before: usize,
+}
+
+impl TextIndex {
+    /// Indexes `src`. Never fails: a malformed sequence is recorded, and the
+    /// queries that would have to read through it report it as
+    /// [`LspError::MalformedUtf8`], as the walking functions do.
+    pub fn new(src: &[u8]) -> TextIndex {
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            src.iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        let mut wide = Vec::new();
+        let mut malformed = Vec::new();
+        let mut excess = 0usize;
+        let mut at = 0usize;
+        for chunk in src.utf8_chunks() {
+            let valid = chunk.valid();
+            for (i, c) in valid.char_indices().filter(|(_, c)| !c.is_ascii()) {
+                let (bytes, units) = (c.len_utf8(), c.len_utf16());
+                wide.push(WideChar {
+                    start: at + i,
+                    bytes: bytes as u8,
+                    units: units as u8,
+                    excess_before: excess,
+                });
+                excess += bytes - units;
+            }
+            at += valid.len();
+            if !chunk.invalid().is_empty() {
+                malformed.push(at);
+                at += chunk.invalid().len();
+            }
+        }
+        TextIndex {
+            line_starts,
+            wide,
+            malformed,
+            len: src.len(),
+        }
+    }
+
+    /// [`position_at`] by binary search.
+    pub fn position_at(&self, byte: usize) -> Result<(u32, u32), LspError> {
+        let target = byte.min(self.len);
+        let line = self.line_starts.partition_point(|&s| s <= target) - 1;
+        let base = self.line_starts[line];
+        if let Some(m) = self.first_malformed_from(base).filter(|&m| m < target) {
+            return Err(LspError::MalformedUtf8(m));
+        }
+        // An offset inside a char names that char: round down to its start.
+        let k = self.wide.partition_point(|w| w.start < target);
+        let target = match k.checked_sub(1).map(|i| self.wide[i]) {
+            Some(w) if w.start >= base && w.start + usize::from(w.bytes) > target => w.start,
+            _ => target,
+        };
+        Ok((line as u32, self.units_between(base, target) as u32))
+    }
+
+    /// [`byte_offset`] by binary search.
+    pub fn byte_offset(&self, line: u32, character: u32) -> Result<usize, LspError> {
+        let line = line as usize;
+        let Some(&base) = self.line_starts.get(line) else {
+            return Ok(self.len);
+        };
+        // The line's own end: its `\n`, or the end of the text.
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .map_or(self.len, |next| next - 1);
+        let character = character as usize;
+        let mut limit = end;
+        if let Some(m) = self.first_malformed_from(base).filter(|&m| m < end) {
+            if self.units_between(base, m) < character {
+                return Err(LspError::MalformedUtf8(m));
+            }
+            limit = m;
+        }
+        // The wide chars of this line ahead of `limit`; the walk consumes
+        // every one that starts before `character` units are spent.
+        let first = self.wide.partition_point(|w| w.start < base);
+        let last = self.wide.partition_point(|w| w.start < limit);
+        let consumed = self.wide[first..last]
+            .partition_point(|w| self.units_between(base, w.start) < character);
+        let Some(w) = consumed.checked_sub(1).map(|i| self.wide[first + i]) else {
+            return Ok((base + character).min(limit));
+        };
+        let after = w.start + usize::from(w.bytes);
+        let spent = self.units_between(base, w.start) + usize::from(w.units);
+        if spent >= character {
+            return Ok(after);
+        }
+        Ok((after + (character - spent)).min(limit))
+    }
+
+    /// UTF-16 units between two char boundaries of one line, `from <= to`,
+    /// with no malformed sequence between them.
+    fn units_between(&self, from: usize, to: usize) -> usize {
+        let excess_at = |at: usize| {
+            let k = self.wide.partition_point(|w| w.start < at);
+            match k.checked_sub(1).map(|i| self.wide[i]) {
+                Some(w) => w.excess_before + usize::from(w.bytes - w.units),
+                None => 0,
+            }
+        };
+        (to - from) - (excess_at(to) - excess_at(from))
+    }
+
+    /// The first malformed sequence starting at or after `from`.
+    fn first_malformed_from(&self, from: usize) -> Option<usize> {
+        let k = self.malformed.partition_point(|&m| m < from);
+        self.malformed.get(k).copied()
+    }
+}
+
+/// Whether the word at `probe`'s position is the blank name `_`: the run of
+/// identifier characters around it is exactly one underscore.
+fn on_blank_name(probe: &ReadyProbe<'_>) -> bool {
+    let text = probe.content.as_bytes();
+    let Ok(at) = TextIndex::new(text).byte_offset(probe.line, probe.character) else {
+        return false;
+    };
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_' || !b.is_ascii();
+    let start = text[..at]
+        .iter()
+        .rposition(|b| !word(b))
+        .map_or(0, |i| i + 1);
+    let end = text[at..]
+        .iter()
+        .position(|b| !word(b))
+        .map_or(text.len(), |i| at + i);
+    &text[start..end] == b"_"
+}
+
+/// Whether a location's `path` names the same file as `probed`: equal as
+/// written once both are spelled as a URI would spell them, or equal once
+/// the filesystem resolves both (a symlinked root, another letter case).
+fn same_file(path: &str, probed: &str) -> bool {
+    let probed = uri_to_path(&file_uri(probed));
+    path == probed
+        || matches!(
+            (fs::canonicalize(path), fs::canonicalize(&probed)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Decodes the first UTF-8 char in `bytes`, returning it with its byte width,
@@ -1224,7 +1498,9 @@ pub fn workspace_edit_to_file_edits(
     mut read: impl FnMut(&str) -> io::Result<Vec<u8>>,
 ) -> Result<Vec<FileEdit>, LspError> {
     let mut out: Vec<FileEdit> = Vec::new();
-    let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
+    // One position index per file: a rename can touch a file in thousands of
+    // places, and each edit converts two positions.
+    let mut cache: HashMap<String, TextIndex> = HashMap::new();
 
     let mut convert =
         |path: &str, edits: &[lt::TextEdit], out: &mut Vec<FileEdit>| -> Result<(), LspError> {
@@ -1233,12 +1509,12 @@ pub fn workspace_edit_to_file_edits(
                     path: path.to_string(),
                     source,
                 })?;
-                cache.insert(path.to_string(), bytes);
+                cache.insert(path.to_string(), TextIndex::new(&bytes));
             }
-            let src = &cache[path];
+            let index = &cache[path];
             for e in edits {
-                let start = byte_offset(src, e.range.start.line, e.range.start.character)?;
-                let end = byte_offset(src, e.range.end.line, e.range.end.character)?;
+                let start = index.byte_offset(e.range.start.line, e.range.start.character)?;
+                let end = index.byte_offset(e.range.end.line, e.range.end.character)?;
                 out.push(FileEdit {
                     path: path.to_string(),
                     start_byte: start,
@@ -2061,10 +2337,11 @@ pub struct Client {
     /// Workspace root recorded at initialize — the base directory workspace
     /// priming walks before a rename.
     root: Option<PathBuf>,
-    /// URIs currently `didOpen` on the server. On warm reuse a re-open of an
-    /// already-open doc `didClose`s first, so a pooled server never receives a
-    /// spec-illegal duplicate `didOpen`.
-    open_docs: HashSet<String>,
+    /// Documents currently `didOpen` on the server, by URI, with the text
+    /// each was opened with. A query on a document already open with the same
+    /// text sends nothing; a re-open `didClose`s first, so a pooled server
+    /// never receives a spec-illegal duplicate `didOpen`.
+    open_docs: HashMap<String, String>,
     /// A compile_commands.json bage generated for clangd (path + content
     /// fingerprint at creation), removed again on close/Drop ONLY if the file
     /// still matches — never clobber a caller's replacement. `None` when the
@@ -2210,7 +2487,7 @@ impl Client {
             child: None,
             command: Vec::new(),
             root: None,
-            open_docs: HashSet::new(),
+            open_docs: HashMap::new(),
             created_compile_commands: None,
             server_capabilities: None,
             rename_deadline: DEFAULT_RENAME_DEADLINE,
@@ -2478,11 +2755,11 @@ impl Client {
     ///
     /// Public so a consumer drives document sync itself — e.g. opening the
     /// files a server only considers once open, or serving content that is not
-    /// on disk. The query methods call this for their own file, so a document
-    /// opened here and then queried is re-opened with the query's content.
+    /// on disk. The query methods open their own file only when it is not
+    /// already open with the query's content (see [`Client::ensure_open`]).
     pub fn did_open(&mut self, path: &str, content: &str) -> Result<(), LspError> {
         let uri = file_uri(path).to_string();
-        if self.open_docs.contains(&uri) {
+        if self.open_docs.contains_key(&uri) {
             self.did_close_uri(&uri)?;
         }
         self.ver += 1;
@@ -2497,8 +2774,22 @@ impl Client {
                 },
             }),
         )?;
-        self.open_docs.insert(uri);
+        self.open_docs.insert(uri, content.to_string());
         Ok(())
+    }
+
+    /// Makes the server hold `path` open with exactly `content`: sends
+    /// nothing when it already does, and otherwise opens it, closing a stale
+    /// copy first. Every query goes through here, so a session opens each
+    /// document once however many questions it asks about it; re-opening
+    /// before each one made a server re-read, and for some re-analyse, the
+    /// whole document per question.
+    pub fn ensure_open(&mut self, path: &str, content: &str) -> Result<(), LspError> {
+        let uri = file_uri(path).to_string();
+        if self.open_docs.get(&uri).is_some_and(|held| held == content) {
+            return Ok(());
+        }
+        self.did_open(path, content)
     }
 
     /// Closes `path` via `textDocument/didClose`, handing the document's truth
@@ -2508,7 +2799,7 @@ impl Client {
     /// `false` tells the caller its own bookkeeping disagreed.
     pub fn did_close(&mut self, path: &str) -> Result<bool, LspError> {
         let uri = file_uri(path).to_string();
-        if !self.open_docs.contains(&uri) {
+        if !self.open_docs.contains_key(&uri) {
             return Ok(false);
         }
         self.did_close_uri(&uri)?;
@@ -2554,7 +2845,7 @@ impl Client {
         col: u32,
         new_name: &str,
     ) -> Result<lt::WorkspaceEdit, LspError> {
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         self.prime_workspace(path);
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
@@ -2620,7 +2911,7 @@ impl Client {
             let Ok(text) = fs::read_to_string(&p) else {
                 continue;
             };
-            let _ = self.did_open(&ps, &text);
+            let _ = self.ensure_open(&ps, &text);
         }
     }
 
@@ -2794,8 +3085,8 @@ impl Client {
         }
     }
 
-    /// Opens `path` (didOpen with `content`, so the server holds the
-    /// authoritative text) and runs a goto-style query at the zero-based
+    /// Holds `path` open with `content` ([`Client::ensure_open`], so the
+    /// server reads the authoritative text) and runs a goto-style query at the zero-based
     /// (line, UTF-16 col) position, decoding the three spec-legal response
     /// shapes into locations.
     fn goto(
@@ -2806,7 +3097,7 @@ impl Client {
         line: u32,
         col: u32,
     ) -> Result<Vec<SymbolLocation>, LspError> {
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
@@ -2865,7 +3156,7 @@ impl Client {
         col: u32,
     ) -> Result<(), LspError> {
         const METHOD: &str = "textDocument/definition";
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
@@ -2939,6 +3230,128 @@ impl Client {
         }
     }
 
+    /// [`Client::await_ready`] with a stricter rule for when an answer shows
+    /// the server ready, over several candidates. Returns the index of the
+    /// candidate whose answer passed.
+    ///
+    /// AN ANSWER INSIDE THE PROBED FILE PROVES NOTHING. A server resolves a
+    /// name to its own file long before it has loaded the rest of the
+    /// workspace: rust-analyzer answers a local name at once and every
+    /// cross-crate one empty for tens of seconds after. So an answer counts
+    /// only when it carries a location in ANOTHER file, or — when the caller
+    /// declared [`ClientConfig::ready_signals`] and every one holds — when it
+    /// carries any location at all: the server's own word that it is loaded,
+    /// backed by a name it resolved.
+    ///
+    /// Each round, once every declared signal holds, asks `textDocument/definition`
+    /// at every candidate in order, and stops at the first that passes; the
+    /// rounds repeat every `ready_retry` until `ready_deadline`. On running out,
+    /// [`LspError::ReadyProbesDeadline`] names every candidate with the
+    /// server's last answer to it, or [`LspError::ReadySignalDeadline`] the
+    /// signal that never held. Declared failures end the wait at once, as in
+    /// [`Client::await_ready`].
+    ///
+    /// A candidate on the blank name `_` is refused before anything is sent
+    /// ([`LspError::BlankProbe`]), and an empty list is [`LspError::NoReadyProbe`]:
+    /// neither could ever pass. Every candidate's document is held open with
+    /// its content ([`Client::ensure_open`]).
+    pub fn await_ready_by(&mut self, probes: &[ReadyProbe<'_>]) -> Result<usize, LspError> {
+        const METHOD: &str = "textDocument/definition";
+        if probes.is_empty() {
+            return Err(LspError::NoReadyProbe);
+        }
+        if let Some(p) = probes.iter().find(|p| on_blank_name(p)) {
+            return Err(LspError::BlankProbe {
+                path: p.path.to_string(),
+                line: p.line,
+                character: p.character,
+            });
+        }
+        for p in probes {
+            self.ensure_open(p.path, p.content)?;
+        }
+        let signalled = !lock(&self.status).signals.is_empty();
+        let deadline = Instant::now() + self.ready_deadline;
+        let mut last: Vec<Option<ProbeAnswer>> = vec![None; probes.len()];
+        loop {
+            self.check_failures()?;
+            let mut unmet = lock(&self.status).unmet_signal();
+            if unmet.is_some() && self.dead.load(Ordering::Acquire) {
+                return Err(LspError::Closed {
+                    method: METHOD.to_string(),
+                });
+            }
+            if unmet.is_none() {
+                for (i, p) in probes.iter().enumerate() {
+                    let params = json!({
+                        "textDocument": {"uri": file_uri(p.path)},
+                        "position": {"line": p.line, "character": p.character},
+                    });
+                    let answer = match self.call(METHOD, params, self.call_timeout) {
+                        Ok(v) => {
+                            let found = decode_goto(METHOD, v)?;
+                            let elsewhere = found.iter().any(|l| !same_file(&l.path, p.path));
+                            if elsewhere || (signalled && !found.is_empty()) {
+                                // The reader stores a status sent ahead of this
+                                // answer before delivering it: a reload the
+                                // server announced mid-probe voids the answer.
+                                unmet = lock(&self.status).unmet_signal();
+                                if unmet.is_none() {
+                                    return Ok(i);
+                                }
+                                break;
+                            }
+                            match found.len() {
+                                0 => ProbeAnswer::Empty,
+                                locations => ProbeAnswer::SameFile { locations },
+                            }
+                        }
+                        Err(LspError::Rpc { message, .. }) => ProbeAnswer::Refused { message },
+                        Err(LspError::Timeout { after, .. }) => ProbeAnswer::NoResponse { after },
+                        // Anything else means the transport is gone.
+                        Err(e) => return Err(e),
+                    };
+                    last[i] = Some(answer);
+                }
+            }
+            self.check_failures()?;
+            if Instant::now() > deadline {
+                let (after, stderr) = (self.ready_deadline, self.stderr_tail());
+                // A round that ran without a signal turning un-met asked every
+                // candidate, so each has an answer.
+                let tried = || {
+                    probes
+                        .iter()
+                        .zip(&last)
+                        .map(|(p, a)| {
+                            Some(ProbeTried {
+                                path: p.path.to_string(),
+                                line: p.line,
+                                character: p.character,
+                                last: a.clone()?,
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                };
+                return Err(match (unmet, tried()) {
+                    (None, Some(probes)) => LspError::ReadyProbesDeadline {
+                        probes,
+                        after,
+                        stderr,
+                    },
+                    (Some((signal, latest)), _) => LspError::ReadySignalDeadline {
+                        signal: Box::new(signal),
+                        latest: latest.map(Box::new),
+                        after,
+                        stderr,
+                    },
+                    (None, None) => unreachable!("an unbroken round answers every candidate"),
+                });
+            }
+            thread::sleep(self.ready_retry);
+        }
+    }
+
     /// Judges the declared [`ClientConfig::ready_failures`] and
     /// [`ClientConfig::diagnostic_failures`] against everything the server
     /// has said SO FAR, and returns [`LspError::ServerReported`] when one
@@ -2981,13 +3394,13 @@ impl Client {
     /// This is a reading of what has ARRIVED, with the timing limits of
     /// [`Client::check_failures`]: a server diagnoses on its own schedule,
     /// many only for documents that are open, and re-opening a document (as
-    /// every query does) can make a server withdraw and later re-send that
+    /// [`Client::diagnostics`] does) can make a server withdraw and later re-send that
     /// document's diagnostics.
     pub fn published_diagnostics(&self) -> Vec<PublishedDiagnostic> {
         lock(&self.status).published()
     }
 
-    /// Opens `path` (didOpen with `content`) and ASKS the server for that
+    /// Holds `path` open with `content` and ASKS the server for that
     /// document's diagnostics with `textDocument/diagnostic` (LSP 3.17),
     /// returning them and storing them as that document's current
     /// diagnostics, exactly as a publish would.
@@ -3009,7 +3422,7 @@ impl Client {
     ) -> Result<Vec<PublishedDiagnostic>, LspError> {
         const METHOD: &str = "textDocument/diagnostic";
         self.require_capability(METHOD, "diagnosticProvider")?;
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let uri = file_uri(path).to_string();
         let params = json!({"textDocument": {"uri": uri}});
         let report = self.query_with_retry(METHOD, path, params)?;
@@ -3075,7 +3488,7 @@ impl Client {
     ) -> Result<Option<Hover>, LspError> {
         const METHOD: &str = "textDocument/hover";
         self.require_capability(METHOD, "hoverProvider")?;
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": character},
@@ -3153,7 +3566,7 @@ impl Client {
         col: u32,
     ) -> Result<Vec<CallTarget>, LspError> {
         const METHOD: &str = "textDocument/prepareCallHierarchy";
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
@@ -3251,7 +3664,7 @@ impl Client {
     ) -> Result<Vec<TypeTarget>, LspError> {
         const METHOD: &str = "textDocument/prepareTypeHierarchy";
         self.require_capability(METHOD, "typeHierarchyProvider")?;
-        self.did_open(path, content)?;
+        self.ensure_open(path, content)?;
         let params = json!({
             "textDocument": {"uri": file_uri(path)},
             "position": {"line": line, "character": col},
@@ -4092,6 +4505,7 @@ fn read_loop(
 mod tests {
     use super::*;
     use crate::edit::splice_edits;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     // ---- byte_offset (Go convert_test.go TestByteOffset) ----
@@ -6162,10 +6576,10 @@ mod tests {
 
     #[test]
     fn warm_reuse_closes_before_reopen() {
-        // MIN (duplicate didOpen): the second rename of the SAME file through
-        // one warm pooled server must `didClose` the target before re-opening
-        // it (LSP forbids a duplicate didOpen). Pre-fix sent a second didOpen
-        // with no intervening didClose.
+        // MIN (duplicate didOpen): a rename of the SAME file with new text
+        // through one warm pooled server must `didClose` the target before
+        // re-opening it (LSP forbids a duplicate didOpen); a rename with the
+        // text the server already holds sends neither.
         let log: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let l = Arc::clone(&log);
         let spawn = move || -> Result<Client, LspError> {
@@ -6174,10 +6588,15 @@ mod tests {
             Ok(test_client(client_conn))
         };
         let pool = LspPool::from_spawn(Box::new(spawn), Duration::from_secs(60), 8);
-        // Two renames of the same file → same warm server (/work, rust).
-        for nn in ["a", "b"] {
+        // Three renames of the same file → same warm server (/work, rust);
+        // the file's text changes once, between the first two.
+        for (nn, text) in [
+            ("a", "fn main() {}\n"),
+            ("b", "fn main() { }\n"),
+            ("c", "fn main() { }\n"),
+        ] {
             pool.with_client(Path::new("/work"), "rust", |c| {
-                c.rename("/work/main.rs", "fn main() {}\n", 0, 3, nn)
+                c.rename("/work/main.rs", text, 0, 3, nn)
             })
             .expect("warm rename");
         }
@@ -6195,10 +6614,73 @@ mod tests {
             .filter(|(_, (m, u))| m == "didClose" && *u == target)
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(opens.len(), 2, "two renames = two didOpens: {events:?}");
+        assert_eq!(opens.len(), 2, "two texts = two didOpens: {events:?}");
+        assert_eq!(closes.len(), 1, "one re-open = one didClose: {events:?}");
         assert!(
             closes.iter().any(|&c| c > opens[0] && c < opens[1]),
             "a didClose must sit between the two didOpens: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_opens_each_document_once_however_many_queries_ask_about_it() {
+        // Priming reads NO_PRIME_ENV, which another test sets.
+        let _guard = PRIME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // A real root, so a rename primes the siblings on disk: `b.rs` with
+        // the text the session already holds, `c.rs` that no query names.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (text_a, text_b, text_c) = ("fn a() { b(); }\n", "pub fn b() {}\n", "fn c() {}\n");
+        for (name, text) in [("a.rs", text_a), ("b.rs", text_b), ("c.rs", text_c)] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let (a, b, c_rs) = (
+            root.join("a.rs").to_string_lossy().into_owned(),
+            root.join("b.rs").to_string_lossy().into_owned(),
+            root.join("c.rs").to_string_lossy().into_owned(),
+        );
+        let (a, b) = (a.as_str(), b.as_str());
+
+        let (client_conn, server_conn) = conn_pair();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        spawn_open_close_recorder(server_conn, Arc::clone(&log));
+        let mut c = test_client(client_conn);
+        c.initialize(&file_uri(root.to_str().unwrap()).to_string())
+            .unwrap();
+        let probe = ReadyProbe {
+            path: a,
+            content: text_a,
+            line: 0,
+            character: 9,
+        };
+        for _ in 0..3 {
+            c.definition(a, text_a, 0, 9).unwrap();
+            c.type_definition(a, text_a, 0, 9).unwrap();
+            c.prepare_call_hierarchy(a, text_a, 0, 3).unwrap();
+            c.prepare_type_hierarchy(a, text_a, 0, 3).unwrap();
+            c.await_ready(a, text_a, 0, 9).unwrap();
+            assert_eq!(c.await_ready_by(&[probe]).unwrap(), 0);
+            c.hover(b, text_b, 0, 7).unwrap();
+            c.implementation(b, text_b, 0, 7).unwrap();
+            c.definition(b, text_b, 0, 7).unwrap();
+            // Pull diagnostics HOLD the document open: the answer is bound to
+            // the request, so no fresh publish is needed and none is sent.
+            c.pull_diagnostics(b, text_b).unwrap();
+            // Priming opens `c.rs` once; `b.rs` is already held with its disk
+            // text, so priming sends nothing for it.
+            c.rename(a, text_a, 0, 3, "renamed").unwrap();
+        }
+        // The shutdown round-trip orders after every notification above.
+        c.close().unwrap();
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                ("didOpen".to_string(), file_uri(a).to_string()),
+                ("didOpen".to_string(), file_uri(b).to_string()),
+                ("didOpen".to_string(), file_uri(&c_rs).to_string()),
+            ],
+            "one didOpen per document per session, and no didClose"
         );
     }
 
@@ -6265,7 +6747,19 @@ mod tests {
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
                 match method {
-                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "initialize" => reply_ok(
+                        &mut w,
+                        &id,
+                        json!({"capabilities": {
+                            "hoverProvider": true,
+                            "implementationProvider": true,
+                            "typeHierarchyProvider": true,
+                            "diagnosticProvider": {
+                                "interFileDependencies": false,
+                                "workspaceDiagnostics": false,
+                            },
+                        }}),
+                    ),
                     "textDocument/didOpen" | "textDocument/didClose" => {
                         if let Some(uri) = msg
                             .pointer("/params/textDocument/uri")
@@ -6276,6 +6770,27 @@ mod tests {
                         }
                     }
                     "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
+                    // A location in a file no query opens, so a readiness
+                    // probe passes on its first answer.
+                    "textDocument/definition" => reply_ok(
+                        &mut w,
+                        &id,
+                        json!({
+                            "uri": "file:///elsewhere/z.rs",
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                        }),
+                    ),
+                    "textDocument/diagnostic" => {
+                        reply_ok(&mut w, &id, json!({"kind": "full", "items": []}))
+                    }
+                    "textDocument/typeDefinition"
+                    | "textDocument/implementation"
+                    | "textDocument/hover"
+                    | "textDocument/prepareCallHierarchy"
+                    | "textDocument/prepareTypeHierarchy" => reply_ok(&mut w, &id, Value::Null),
                     "shutdown" => reply_ok(&mut w, &id, Value::Null),
                     "exit" => break,
                     _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
@@ -6522,8 +7037,9 @@ mod tests {
             vec!["boom"],
             "cold open returns the real error"
         );
-        // Interleaved rename re-opens (its didClose emits clear #1).
-        let _ = c.rename("/work/main.rs", "x\n", 0, 0, "renamed").unwrap();
+        // Interleaved rename with new text re-opens (its didClose emits
+        // clear #1).
+        let _ = c.rename("/work/main.rs", "y\n", 0, 0, "renamed").unwrap();
         // Warm re-open: its didClose emits clear #2. TWO clears now precede
         // "boom". Order-based drain must return "boom", never a false-clean [].
         let warm = c
@@ -7013,6 +7529,100 @@ mod tests {
         }
     }
 
+    /// Both answers as comparable text: a value, or the malformed byte.
+    fn shown<T: std::fmt::Debug>(r: Result<T, LspError>) -> String {
+        match r {
+            Ok(v) => format!("{v:?}"),
+            Err(LspError::MalformedUtf8(at)) => format!("malformed@{at}"),
+            Err(e) => panic!("unexpected error {e}"),
+        }
+    }
+
+    #[test]
+    fn text_index_agrees_with_the_walking_conversions_on_any_bytes() {
+        // Pieces covering every width a position counts differently in UTF-8
+        // and UTF-16, line breaks, and the malformed shapes: a lone
+        // continuation byte, a truncated sequence, a byte UTF-8 never uses.
+        let pieces: [&[u8]; 9] = [
+            b"a",
+            b"xyz",
+            b"\n",
+            "é".as_bytes(),
+            "中".as_bytes(),
+            "😀".as_bytes(),
+            b"\x80",
+            b"\xE2\x82",
+            b"\xFF",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..400 {
+            let mut src = Vec::new();
+            for _ in 0..next() % 24 {
+                src.extend_from_slice(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            // Half the rounds stay valid UTF-8, so the error-free paths are
+            // exercised as often as the error paths.
+            if round % 2 == 0 {
+                src = String::from_utf8_lossy(&src).into_owned().into_bytes();
+            }
+            let index = TextIndex::new(&src);
+            for byte in 0..=src.len() + 2 {
+                assert_eq!(
+                    shown(index.position_at(byte)),
+                    shown(position_at(&src, byte)),
+                    "position_at({byte}) over {src:?}"
+                );
+            }
+            let lines = src.iter().filter(|b| **b == b'\n').count() as u32;
+            for line in 0..=lines + 1 {
+                for character in 0..=src.len() as u32 + 3 {
+                    assert_eq!(
+                        shown(index.byte_offset(line, character)),
+                        shown(byte_offset(&src, line, character)),
+                        "byte_offset({line}, {character}) over {src:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_index_places_every_position_of_a_long_line_in_linear_time() {
+        // One 5 MB line with a wide char every 64 bytes: the walking
+        // conversion would read up to the whole line per position.
+        let unit = format!("{}é", "x".repeat(62));
+        let line = unit.repeat(5_000_000 / unit.len());
+        let started = std::time::Instant::now();
+        let index = TextIndex::new(line.as_bytes());
+        let mut last = 0;
+        for byte in (0..line.len()).step_by(61) {
+            let (row, character) = index.position_at(byte).unwrap();
+            assert_eq!(row, 0);
+            assert!(character >= last);
+            last = character;
+            assert_eq!(
+                index.byte_offset(row, character).unwrap(),
+                if line.is_char_boundary(byte) {
+                    byte
+                } else {
+                    byte - 1
+                }
+            );
+        }
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "{} positions on one 5 MB line took {took:?}",
+            line.len() / 61
+        );
+    }
+
     #[test]
     fn definition_returns_array_locations() {
         let (client_conn, server_conn) = conn_pair();
@@ -7199,6 +7809,203 @@ mod tests {
         c.ready_retry = Duration::from_secs(2);
         c.ready_deadline = Duration::from_secs(10);
         c
+    }
+
+    /// A server whose `textDocument/definition` answers by the probed line: 0
+    /// with a location in the probed file, 1 with one in another file, any
+    /// other with `[]`. Sends `statuses` once initialized. Returns how many
+    /// definitions it was asked.
+    fn spawn_located_server(
+        server_conn: (PipeReader, PipeWriter),
+        statuses: Vec<(String, Value)>,
+    ) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&asked);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let at = |uri: &str| {
+                json!([{
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 7},
+                    },
+                }])
+            };
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "initialized" => {
+                        for (method, params) in &statuses {
+                            write_frame(
+                                &mut w,
+                                &json!({"jsonrpc": "2.0", "method": method, "params": params}),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    "textDocument/definition" => {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let probed = msg
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let answer =
+                            match msg.pointer("/params/position/line").and_then(Value::as_u64) {
+                                Some(0) => at(&probed),
+                                Some(1) => at("file:///work/dep.rs"),
+                                _ => json!([]),
+                            };
+                        reply_ok(&mut w, &id, answer);
+                    }
+                    "shutdown" => reply_ok(&mut w, &id, Value::Null),
+                    "exit" => break,
+                    _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
+                    _ => {}
+                }
+            }
+        });
+        asked
+    }
+
+    const PROBED: &str = "use dep::helper;\nfn main() { helper(); }\nfn idle() {}\n";
+
+    fn probe_at(line: u32) -> ReadyProbe<'static> {
+        ReadyProbe {
+            path: "/work/main.rs",
+            content: PROBED,
+            line,
+            character: 3,
+        }
+    }
+
+    /// A client gated by `signals`, with a short readiness deadline, against
+    /// a [`spawn_located_server`] sending `statuses`.
+    fn located_client(
+        statuses: Vec<(String, Value)>,
+        signals: Vec<ReadySignal>,
+    ) -> (Client, Arc<AtomicUsize>) {
+        let (client_conn, server_conn) = conn_pair();
+        let asked = spawn_located_server(server_conn, statuses);
+        let mut c = ready_client(client_conn);
+        c.ready_retry = Duration::from_millis(5);
+        c.ready_deadline = Duration::from_millis(150);
+        let mut cfg = c.config();
+        cfg.ready_signals = signals;
+        c.configure(cfg);
+        c.initialize("file:///work").unwrap();
+        round_trip(&mut c);
+        (c, asked)
+    }
+
+    #[test]
+    fn an_answer_only_inside_the_probed_file_never_shows_the_server_ready() {
+        let (mut c, asked) = located_client(Vec::new(), Vec::new());
+        let got = c.await_ready_by(&[probe_at(0), probe_at(2)]);
+        match &got {
+            Err(LspError::ReadyProbesDeadline { probes, after, .. }) => {
+                assert_eq!(*after, Duration::from_millis(150));
+                let lasts: Vec<_> = probes.iter().map(|p| (p.line, p.last.clone())).collect();
+                assert_eq!(
+                    lasts,
+                    [
+                        (0, ProbeAnswer::SameFile { locations: 1 }),
+                        (2, ProbeAnswer::Empty),
+                    ]
+                );
+                let shown = got.as_ref().unwrap_err().to_string();
+                assert!(
+                    shown.contains("/work/main.rs:0:3: 1 location(s), all in the probed file")
+                        && shown.contains("/work/main.rs:2:3: empty result"),
+                    "the refusal names every candidate and its last answer: {shown}"
+                );
+            }
+            other => panic!("an in-file answer was taken as ready: {other:?}"),
+        }
+        assert!(
+            asked.load(Ordering::SeqCst) > 2,
+            "it kept asking until the deadline"
+        );
+        // The old gate takes the same in-file answer as ready.
+        c.await_ready("/work/main.rs", PROBED, 0, 3).unwrap();
+    }
+
+    #[test]
+    fn an_answer_in_another_file_shows_the_server_ready() {
+        let (mut c, _) = located_client(Vec::new(), Vec::new());
+        assert_eq!(
+            c.await_ready_by(&[probe_at(0), probe_at(2), probe_at(1)])
+                .unwrap(),
+            2,
+            "the candidate that resolved elsewhere is named"
+        );
+    }
+
+    #[test]
+    fn under_a_met_ready_signal_any_location_shows_the_server_ready() {
+        let (mut c, _) = located_client(
+            vec![server_status("ok", true, "")],
+            vec![quiescent_signal()],
+        );
+        assert_eq!(c.await_ready_by(&[probe_at(2), probe_at(0)]).unwrap(), 1);
+        // The signal alone, with only empty answers, is not enough.
+        let (mut c, _) = located_client(
+            vec![server_status("ok", true, "")],
+            vec![quiescent_signal()],
+        );
+        assert!(matches!(
+            c.await_ready_by(&[probe_at(2)]),
+            Err(LspError::ReadyProbesDeadline { .. })
+        ));
+        // An un-met signal still holds every probe.
+        let (mut c, asked) = located_client(
+            vec![server_status("ok", false, "loading")],
+            vec![quiescent_signal()],
+        );
+        assert!(matches!(
+            c.await_ready_by(&[probe_at(1)]),
+            Err(LspError::ReadySignalDeadline { .. })
+        ));
+        round_trip(&mut c);
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_blank_name_or_no_candidate_is_refused_before_anything_is_sent() {
+        let (mut c, asked) = located_client(Vec::new(), Vec::new());
+        let text = "use std::fmt::Write as _;\nfn f(s: &'_ str) {}\nfn g() { let _ = 1; }\n";
+        for (line, character) in [(0, 23), (1, 10), (2, 13)] {
+            let probe = ReadyProbe {
+                path: "/work/lib.rs",
+                content: text,
+                line,
+                character,
+            };
+            assert!(
+                matches!(
+                    c.await_ready_by(&[probe_at(1), probe]),
+                    Err(LspError::BlankProbe { line: l, character: ch, .. }) if l == line && ch == character
+                ),
+                "({line}, {character}) is on `_`"
+            );
+        }
+        assert!(matches!(c.await_ready_by(&[]), Err(LspError::NoReadyProbe)));
+        round_trip(&mut c);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing was probed");
+        // A name that merely contains `_` is a name.
+        let named = ReadyProbe {
+            path: "/work/main.rs",
+            content: "fn a_b() {}\n",
+            line: 0,
+            character: 4,
+        };
+        assert!(!on_blank_name(&named));
     }
 
     #[test]

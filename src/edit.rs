@@ -149,9 +149,23 @@ pub fn point_at(src: &[u8], byte_offset: usize) -> Point {
     p
 }
 
+/// The point reached by writing `text` from `from`.
+fn advance(from: Point, text: &[u8]) -> Point {
+    match text.iter().rposition(|&b| b == b'\n') {
+        Some(last) => Point {
+            row: from.row + text.iter().filter(|&&b| b == b'\n').count(),
+            col: text.len() - last - 1,
+        },
+        None => Point {
+            row: from.row,
+            col: from.col + text.len(),
+        },
+    }
+}
+
 /// Splices `edits` into `old` and reparses the result. For a single edit and
-/// a reusable `old_tree` it builds an [`InputEdit`] from [`point_at`] over
-/// the old and new bytes and parses incrementally. Otherwise (`old_tree`
+/// a reusable `old_tree` it builds an [`InputEdit`] — the points [`point_at`]
+/// would give, from one line table — and parses incrementally. Otherwise (`old_tree`
 /// `None`, or a multi-edit batch where a single `InputEdit` cannot describe
 /// the change) it does a full reparse. Returns the spliced bytes and the new
 /// tree.
@@ -174,13 +188,17 @@ pub fn reparse(
 
     let e = &edits[0];
     let new_end_byte = e.start_byte + e.new_text.len();
+    // One line table for the old bytes places both old points; the new end
+    // follows from the start point and the inserted text alone.
+    let lines = crate::region::LineIndex::new(old);
+    let start_point = lines.point_for_byte(e.start_byte);
     let input = InputEdit {
         start_byte: e.start_byte,
         old_end_byte: e.end_byte,
         new_end_byte,
-        start_point: point_at(old, e.start_byte),
-        old_end_point: point_at(old, e.end_byte),
-        new_end_point: point_at(&new_bytes, new_end_byte),
+        start_point,
+        old_end_point: lines.point_for_byte(e.end_byte),
+        new_end_point: advance(start_point, e.new_text.as_bytes()),
     };
     let tree = p.parse_incremental(lang, &new_bytes, old_tree, input)?;
     Ok((new_bytes, tree))
@@ -276,6 +294,34 @@ mod tests {
         assert_eq!(point_at(src, 3), Point { row: 1, col: 0 });
         assert_eq!(point_at(src, 5), Point { row: 1, col: 2 });
         assert_eq!(point_at(src, 999), Point { row: 2, col: 0 });
+    }
+
+    #[test]
+    fn line_table_points_match_point_at_for_every_edit_shape() {
+        let old = b"ab\ncd\n\nefg";
+        let lines = crate::region::LineIndex::new(old);
+        for byte in 0..=old.len() + 2 {
+            assert_eq!(
+                lines.point_for_byte(byte),
+                point_at(old, byte),
+                "byte {byte}"
+            );
+        }
+        for (start, end, text) in [
+            (0, 0, ""),
+            (1, 4, "x"),
+            (2, 2, "\n\n"),
+            (3, 7, "yy\nz"),
+            (9, 10, "\n"),
+            (10, 10, "tail"),
+        ] {
+            let new = splice_edits(old, &[fe(start, end, text)]).unwrap();
+            assert_eq!(
+                advance(lines.point_for_byte(start), text.as_bytes()),
+                point_at(&new, start + text.len()),
+                "edit [{start}, {end}) <- {text:?}"
+            );
+        }
     }
 
     #[test]

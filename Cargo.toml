@@ -35,3 +35,13 @@ xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Timed tests prove that parsing and placing a large file stays linear, against
+# the time a consumer's optimised build takes. Unoptimised, the grammars' C and
+# bage's own loops run several times slower and the tests would measure the
+# build mode instead of bage. Debug assertions and overflow checks stay on.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 1

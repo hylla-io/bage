@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::Node as TsNode;
 
 use crate::hashing::{self, Hasher};
-use crate::parser::{Adapter, Lang, Node, ParserPort, Tree};
+use crate::parser::{Adapter, ByteRange, Lang, Node, ParserPort, Point, Tree};
 use crate::region::{self, LINE_SENTINEL, LineIndex, Region};
 
 // The tier-2 analysis substrate is a sibling read-only surface over an
@@ -76,14 +76,29 @@ pub fn open_file(path: &str) -> Result<OpenedFile, InspectError> {
         path: path.to_string(),
         source: e,
     })?;
+    open_bytes(&Adapter::new(), path, &src)
+}
+
+/// Parses `src` as the bytes of `path` with `parser`, the language chosen by
+/// [`Lang::for_path`] as [`open_file`] chooses it. Where the bytes come from
+/// is the caller's: a git blob, a buffer not yet written.
+///
+/// The one parse a file needs. [`read_blocks`], [`read_placed_blocks`],
+/// [`tier2_sites`], [`extract_facts`], [`extract_scopes`] and
+/// [`parse_health`] all read the tree it returns and parse nothing more, and
+/// an [`OpenedFile`] is `Send` and `Sync`, so a host can parse on a worker
+/// thread and read every surface wherever it likes.
+pub fn open_bytes(
+    parser: &dyn ParserPort,
+    path: &str,
+    src: &[u8],
+) -> Result<OpenedFile, InspectError> {
     let lang = Lang::for_path(path);
-    let tree = Adapter::new()
-        .parse(lang, &src)
-        .map_err(|e| InspectError::Parse {
-            path: path.to_string(),
-            lang,
-            source: e,
-        })?;
+    let tree = parser.parse(lang, src).map_err(|e| InspectError::Parse {
+        path: path.to_string(),
+        lang,
+        source: e,
+    })?;
     Ok(OpenedFile {
         path: path.to_string(),
         lang,
@@ -112,6 +127,15 @@ pub struct Symbol {
     pub start_line: usize,
     /// 1-based end line of the node.
     pub end_line: usize,
+    /// Zero-based row and byte column of `start_byte`, as tree-sitter reports
+    /// it: a host needs no scan of the text to place the node.
+    pub start_point: Point,
+    /// Zero-based row and byte column of `end_byte`.
+    pub end_point: Point,
+    /// The bytes of the declared name, read from the grammar node that names
+    /// the declaration; `None` when `name` is empty or is no single node's
+    /// text.
+    pub name_range: Option<ByteRange>,
 }
 
 /// Returns a documentSymbol-like listing of a parsed tree: every named
@@ -132,15 +156,10 @@ pub fn outline(tree: &Tree, lang: Lang) -> Vec<Symbol> {
     };
     let mut out = Vec::new();
     let misread = native.is_error();
-    walk_decls(
-        &tree.root,
-        Some(native),
-        misread,
-        &tree.source,
-        lang,
-        0,
-        &mut out,
-    );
+    // A data grammar names its blocks from the materialized tree alone, so
+    // walking the engine tree beside it would only cost time.
+    let twin = data_decl_kinds(lang).is_none().then_some(native);
+    walk_decls(&tree.root, twin, misread, &tree.source, lang, 0, &mut out);
     out
 }
 
@@ -182,13 +201,17 @@ fn walk_decls(
         // is read once, where the walk enters the item.
         let misread = misread || tc.is_none_or(|t| depth == 0 && t.has_error());
         if c.named && is_outline_kind(lang, &c.kind, depth) {
+            let (name, name_range) = symbol_name(lang, c, tc.filter(|_| !misread), src);
             out.push(Symbol {
                 kind: c.kind.clone(),
-                name: symbol_name(lang, c, tc.filter(|_| !misread), src),
+                name,
                 start_byte: c.start_byte,
                 end_byte: c.end_byte,
                 start_line: c.start_point.row + 1,
                 end_line: c.end_point.row + 1,
+                start_point: c.start_point,
+                end_point: c.end_point,
+                name_range,
             });
         }
         walk_decls(c, tc, misread, src, lang, depth + 1, out);
@@ -262,6 +285,23 @@ fn decl_name(n: &Node, src: &[u8]) -> String {
     String::new()
 }
 
+/// The node [`decl_name`] reads its name from.
+fn decl_name_node<'n>(n: &'n Node, src: &[u8]) -> Option<&'n Node> {
+    direct_name_node(n, src).or_else(|| {
+        n.children
+            .iter()
+            .filter(|c| c.named)
+            .find_map(|c| direct_name_node(c, src))
+    })
+}
+
+/// The node [`direct_name`] reads its name from.
+fn direct_name_node<'n>(n: &'n Node, src: &[u8]) -> Option<&'n Node> {
+    n.children.iter().find(|c| {
+        c.named && is_name_kind(&c.kind) && c.end_byte >= c.start_byte && c.end_byte <= src.len()
+    })
+}
+
 /// The text of `n`'s first direct named identifier-kind child, or empty if
 /// none. Slice bounds are guarded.
 fn direct_name(n: &Node, src: &[u8]) -> String {
@@ -317,26 +357,61 @@ fn is_outline_kind(lang: Lang, kind: &str, depth: usize) -> bool {
 /// them — a keyword, a macro, a parameter, a callee — and no field-based
 /// rule tells those from a name without inventing a guess per shape. Keeping
 /// the old name there changes nothing a host already relied on.
-fn symbol_name(lang: Lang, n: &Node, tn: Option<TsNode>, src: &[u8]) -> String {
-    match lang {
-        Lang::Json => json_key_name(n, src),
-        Lang::Yaml | Lang::Toml => first_named_child_text(n, src),
-        Lang::Xml => tag_name(n, src, "Name"),
-        Lang::Html => tag_name(n, src, "tag_name"),
-        Lang::Css => child_kind_text(n, src, "selectors").trim().to_string(),
+///
+/// Alongside the name comes the byte range of the node it was read from —
+/// `None` when the name is empty or is no single node's text — so a host
+/// asks a language server about the name itself and never searches the text
+/// for it, which a decorator, a receiver or a comment holding the same word
+/// would mislead.
+fn symbol_name(
+    lang: Lang,
+    n: &Node,
+    tn: Option<TsNode>,
+    src: &[u8],
+) -> (String, Option<ByteRange>) {
+    let at = |c: &Node| ByteRange {
+        start: c.start_byte,
+        end: c.end_byte,
+    };
+    let (name, range) = match lang {
+        Lang::Json => (json_key_name(n, src), json_key_node(n).map(at)),
+        Lang::Yaml | Lang::Toml => (
+            first_named_child_text(n, src),
+            n.children.iter().find(|c| c.named).map(at),
+        ),
+        Lang::Xml => (tag_name(n, src, "Name"), tag_name_node(n, "Name").map(at)),
+        Lang::Html => (
+            tag_name(n, src, "tag_name"),
+            tag_name_node(n, "tag_name").map(at),
+        ),
+        Lang::Css => (
+            child_kind_text(n, src, "selectors").trim().to_string(),
+            n.children.iter().find(|c| c.kind == "selectors").map(at),
+        ),
         _ => match tn {
-            None => decl_name(n, src),
-            Some(_) if is_body_kind(&n.kind) => String::new(),
+            None => (decl_name(n, src), decl_name_node(n, src).map(at)),
+            Some(_) if is_body_kind(&n.kind) => (String::new(), None),
             Some(t) => {
-                let name = field_name(lang, t, src).unwrap_or_else(|| decl_name(n, src));
+                let (name, range) = match field_name(lang, t, src) {
+                    Some(name) => (
+                        name,
+                        field_name_node(lang, t, src).map(|x| ByteRange {
+                            start: x.start_byte(),
+                            end: x.end_byte(),
+                        }),
+                    ),
+                    None => (decl_name(n, src), decl_name_node(n, src).map(at)),
+                };
                 if is_c_family(lang) {
-                    one_line(&name)
+                    (one_line(&name), range)
                 } else {
-                    name
+                    (name, range)
                 }
             }
         },
-    }
+    };
+    let range = range.filter(|_| !name.is_empty());
+    (name, range)
 }
 
 /// C and C++, where declarations are named by following declarators.
@@ -629,6 +704,120 @@ fn field_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
     Some(declarator_name(lang, declarator, false, src).unwrap_or_default())
 }
 
+/// The node [`field_name`] reads a declaration's name from, so a host can ask
+/// a language server about the name itself rather than search the text for
+/// it. `None` where [`field_name`] falls back to [`decl_name`], and where the
+/// name is no node's text (a TypeScript construct signature's `new()`, a C#
+/// indexer's `this`).
+fn field_name_node<'t>(lang: Lang, n: TsNode<'t>, src: &[u8]) -> Option<TsNode<'t>> {
+    match (lang, n.kind()) {
+        (Lang::Python, "decorated_definition") => {
+            return field_name_node(lang, n.child_by_field_name("definition")?, src);
+        }
+        (Lang::Cpp, "template_declaration" | "friend_declaration") => {
+            let inner = n.named_children(&mut n.walk()).find(|c| {
+                !matches!(
+                    c.kind(),
+                    "template_parameter_list" | "requires_clause" | "comment"
+                )
+            })?;
+            let is_type = matches!(
+                inner.kind(),
+                "type_identifier" | "template_type" | "qualified_identifier"
+            );
+            if is_type {
+                return declarator_target(lang, inner, false, src);
+            }
+            return field_name_node(lang, inner, src)
+                .or_else(|| declarator_target(lang, inner, false, src));
+        }
+        (Lang::TypeScript | Lang::Tsx, "construct_signature") => return None,
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, kind)
+            if JS_EXPRESSION_KINDS.contains(&kind) =>
+        {
+            return js_expression_name_node(n);
+        }
+        (Lang::Rust, "impl_item") => return n.child_by_field_name("type"),
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, kind)
+            if JS_MEMBER_KINDS.contains(&kind) =>
+        {
+            return n
+                .child_by_field_name("name")
+                .or_else(|| n.child_by_field_name("property"));
+        }
+        (Lang::CSharp, "field_declaration" | "event_field_declaration") => {
+            let decl = n
+                .named_children(&mut n.walk())
+                .find(|c| c.kind() == "variable_declaration")?;
+            return field_name_node(lang, decl, src);
+        }
+        (Lang::CSharp, "variable_declaration") => {
+            let first = n
+                .named_children(&mut n.walk())
+                .find(|c| c.kind() == "variable_declarator")?;
+            return first.child_by_field_name("name");
+        }
+        (Lang::CSharp, "operator_declaration") => return n.child_by_field_name("operator"),
+        (Lang::CSharp, "conversion_operator_declaration") => return n.child_by_field_name("type"),
+        (Lang::CSharp, "indexer_declaration") => return None,
+        _ => {}
+    }
+    if let Some(name) = n.child_by_field_name("name") {
+        return Some(name);
+    }
+    if is_c_family(lang)
+        && n.child_by_field_name("type").is_some_and(|t| {
+            let word = ts_text(t, src);
+            is_word(t) && is_reserved(lang, &word) && !TYPE_KEYWORDS.contains(&word.as_str())
+        })
+    {
+        return None;
+    }
+    let decl = declarator_child(n)?;
+    if is_c_family(lang)
+        && n.kind() == "function_definition"
+        && decl.kind() == "parenthesized_declarator"
+    {
+        return n.child_by_field_name("type").filter(|t| is_word(*t));
+    }
+    let builtin_ok = is_c_family(lang) && n.kind() == "type_definition";
+    declarator_target(lang, decl, builtin_ok, src)
+}
+
+/// The node [`js_expression_name`] reads its name from.
+fn js_expression_name_node(n: TsNode<'_>) -> Option<TsNode<'_>> {
+    let own = || n.child_by_field_name("name");
+    let mut held = n;
+    let mut parent = n.parent();
+    while let Some(p) = parent.filter(|p| JS_TRANSPARENT_KINDS.contains(&p.kind())) {
+        if p.named_child(0) != Some(held) {
+            return own();
+        }
+        held = p;
+        parent = p.parent();
+    }
+    let Some(p) = parent else { return own() };
+    let holds = |field: &str| p.child_by_field_name(field) == Some(held);
+    let bound = match p.kind() {
+        "variable_declarator" if holds("value") => p
+            .child_by_field_name("name")
+            .filter(|t| t.kind() == "identifier"),
+        "assignment_expression" | "augmented_assignment_expression" if holds("right") => p
+            .child_by_field_name("left")
+            .and_then(|left| match left.kind() {
+                "identifier" => Some(left),
+                "member_expression" => left.child_by_field_name("property"),
+                _ => None,
+            }),
+        "pair" if holds("value") => p.child_by_field_name("key"),
+        "public_field_definition" | "field_definition" if holds("value") => p
+            .child_by_field_name("name")
+            .or_else(|| p.child_by_field_name("property")),
+        _ => None,
+    };
+    bound.or_else(own)
+}
+
 /// A C or C++ declaration's name: the `name` field kept whole, else the
 /// declarator chain down to the declared identifier. A typedef may define a
 /// builtin type spelling (`typedef _Bool bool;`); no other declaration may.
@@ -873,25 +1062,42 @@ fn declarator_child(n: TsNode) -> Option<TsNode> {
 /// the chain ends without a name, on a keyword, or on a builtin type: a word
 /// spelled as one always, a `primitive_type` unless `builtin_ok` (a typedef
 /// may define one: `typedef _Bool bool;` files `bool` as a `primitive_type`).
-fn declarator_name(lang: Lang, mut d: TsNode, builtin_ok: bool, src: &[u8]) -> Option<String> {
+fn declarator_name(lang: Lang, d: TsNode, builtin_ok: bool, src: &[u8]) -> Option<String> {
+    let target = declarator_target(lang, d, builtin_ok, src)?;
+    Some(match target.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "primitive_type" => {
+            ts_text(target, src)
+        }
+        "qualified_identifier" => qualified_name(target, src),
+        "operator_cast" => conversion_name(target, target, src),
+        _ => uncommented_text(target, target.start_byte(), target.end_byte(), src),
+    })
+}
+
+/// The node [`declarator_name`] reads the declared name from, following the
+/// same chain and refusing the same keywords and builtin types.
+fn declarator_target<'t>(
+    lang: Lang,
+    mut d: TsNode<'t>,
+    builtin_ok: bool,
+    src: &[u8],
+) -> Option<TsNode<'t>> {
     loop {
         match d.kind() {
             "identifier" | "field_identifier" | "type_identifier" => {
                 let text = ts_text(d, src);
                 let builtin = is_c_family(lang) && BUILTIN_TYPES.contains(&text.as_str());
-                return (!builtin && !is_reserved(lang, &text)).then_some(text);
+                return (!builtin && !is_reserved(lang, &text)).then_some(d);
             }
-            "primitive_type" => return builtin_ok.then(|| ts_text(d, src)),
+            "primitive_type" => return builtin_ok.then_some(d),
             "operator_name"
             | "destructor_name"
             | "template_function"
             | "template_method"
             | "template_type"
-            | "structured_binding_declarator" => {
-                return Some(uncommented_text(d, d.start_byte(), d.end_byte(), src));
-            }
-            "qualified_identifier" => return Some(qualified_name(d, src)),
-            "operator_cast" => return Some(conversion_name(d, d, src)),
+            | "structured_binding_declarator"
+            | "qualified_identifier"
+            | "operator_cast" => return Some(d),
             // A parenthesized declarator may open with a calling convention;
             // an attributed one carries its attributes after the declarator.
             "parenthesized_declarator" | "reference_declarator" | "attributed_declarator" => {
@@ -1038,6 +1244,25 @@ fn json_key_name(n: &Node, src: &[u8]) -> String {
     node_text(key, src).trim_matches('"').to_string()
 }
 
+/// The node [`json_key_name`] reads its key from: the unquoted content, or
+/// the whole key when it has none.
+fn json_key_node(n: &Node) -> Option<&Node> {
+    let key = n.children.iter().find(|c| c.named)?;
+    Some(
+        key.children
+            .iter()
+            .find(|c| c.kind == "string_content")
+            .unwrap_or(key),
+    )
+}
+
+/// The node [`tag_name`] reads an element's tag name from.
+fn tag_name_node<'n>(n: &'n Node, name_kind: &str) -> Option<&'n Node> {
+    n.children
+        .iter()
+        .find_map(|c| c.children.iter().find(|g| g.kind == name_kind))
+}
+
 /// An XML/HTML element's tag name: the first direct child (start tag,
 /// self-closing tag, or empty-element tag) carrying a `name_kind` child
 /// supplies it. Empty when no tag name is found.
@@ -1070,6 +1295,15 @@ fn outline_lines(src: &[u8]) -> Vec<Symbol> {
             end_byte: i, // exclude the '\n'
             start_line: row,
             end_line: row,
+            start_point: Point {
+                row: row - 1,
+                col: 0,
+            },
+            end_point: Point {
+                row: row - 1,
+                col: i - line_start,
+            },
+            name_range: None,
         });
         row += 1;
         line_start = i + 1;
@@ -1082,6 +1316,15 @@ fn outline_lines(src: &[u8]) -> Vec<Symbol> {
             end_byte: src.len(),
             start_line: row,
             end_line: row,
+            start_point: Point {
+                row: row - 1,
+                col: 0,
+            },
+            end_point: Point {
+                row: row - 1,
+                col: src.len() - line_start,
+            },
+            name_range: None,
         });
     }
     out
@@ -1125,6 +1368,31 @@ pub struct Block {
 /// bytes for its range (bounds-guarded); when false content stays empty so
 /// callers can list structure cheaply.
 pub fn read_blocks(opened: &OpenedFile, include_content: bool) -> Vec<Block> {
+    read_placed_blocks(opened, include_content)
+        .into_iter()
+        .map(|placed| placed.block)
+        .collect()
+}
+
+/// A [`Block`] with where it sits in rows and columns and where its name is,
+/// all read off the parse tree: what a host needs to place a node or ask a
+/// language server about it without scanning the file's text. The [`Block`]
+/// itself keeps its wire shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlacedBlock {
+    /// The block, exactly as [`read_blocks`] returns it.
+    pub block: Block,
+    /// Zero-based row and byte column of `block.start_byte`.
+    pub start_point: Point,
+    /// Zero-based row and byte column of `block.end_byte`.
+    pub end_point: Point,
+    /// The bytes of the declared name; see [`Symbol::name_range`].
+    pub name_range: Option<ByteRange>,
+}
+
+/// [`read_blocks`] with each block's points and name range (see
+/// [`PlacedBlock`]), from the one walk that finds the blocks.
+pub fn read_placed_blocks(opened: &OpenedFile, include_content: bool) -> Vec<PlacedBlock> {
     let src = &opened.tree.source;
     outline(&opened.tree, opened.lang)
         .into_iter()
@@ -1135,15 +1403,20 @@ pub fn read_blocks(opened: &OpenedFile, include_content: bool) -> Vec<Block> {
                 } else {
                     String::new()
                 };
-            Block {
-                region_hash: region::hash_region(src, sym.start_byte, sym.end_byte),
-                kind: sym.kind,
-                name: sym.name,
-                start_line: sym.start_line,
-                end_line: sym.end_line,
-                start_byte: sym.start_byte,
-                end_byte: sym.end_byte,
-                content,
+            PlacedBlock {
+                block: Block {
+                    region_hash: region::hash_region(src, sym.start_byte, sym.end_byte),
+                    kind: sym.kind,
+                    name: sym.name,
+                    start_line: sym.start_line,
+                    end_line: sym.end_line,
+                    start_byte: sym.start_byte,
+                    end_byte: sym.end_byte,
+                    content,
+                },
+                start_point: sym.start_point,
+                end_point: sym.end_point,
+                name_range: sym.name_range,
             }
         })
         .collect()
@@ -1595,6 +1868,228 @@ mod tests {
         assert!(names.contains(&("type_declaration", "T")), "{names:?}");
         assert!(names.contains(&("method_declaration", "M")), "{names:?}");
         assert!(names.contains(&("function_declaration", "F")), "{names:?}");
+    }
+
+    /// Parses `src` as `path` and places every block and its name the way a
+    /// host does: rows and columns from the tree, one LSP position per name
+    /// from one index. Returns the block count and the time taken.
+    fn place_every_block(path: &str, src: &[u8]) -> (usize, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let lang = Lang::for_path(path);
+        let opened = OpenedFile {
+            path: path.to_string(),
+            lang,
+            tree: Adapter::new().parse(lang, src).unwrap(),
+        };
+        let blocks = read_placed_blocks(&opened, false);
+        let index = crate::lsp::TextIndex::new(src);
+        for b in &blocks {
+            let at = b.name_range.map_or(b.block.start_byte, |r| r.start);
+            let (row, _) = index.position_at(at).unwrap();
+            assert!(row as usize >= b.start_point.row);
+        }
+        (blocks.len(), started.elapsed())
+    }
+
+    /// The fastest of three runs of [`place_every_block`]: the one least
+    /// disturbed by whatever else the machine is doing.
+    fn fastest(path: &str, src: &[u8]) -> (usize, std::time::Duration) {
+        (0..3)
+            .map(|_| place_every_block(path, src))
+            .min_by_key(|(_, took)| *took)
+            .expect("three runs")
+    }
+
+    /// A minified registry document of about `size` bytes on one line — the
+    /// shape that took Hylla's ingest eighteen minutes — and the same document
+    /// with one version per line.
+    fn registry_json(size: usize) -> (String, String) {
+        let mut json = String::from("{\"name\":\"pkg\",\"versions\":{");
+        let mut i = 0;
+        while json.len() < size {
+            json.push_str(&format!(
+                "\"1.{i}.0\":{{\"name\":\"pkg\",\"version\":\"1.{i}.0\",\"dist\":{{\
+                 \"integrity\":\"sha512-{i:064x}\",\
+                 \"tarball\":\"https://registry.example/pkg/-/pkg-1.{i}.0.tgz\"}},\
+                 \"engines\":{{\"node\":\">=18\"}},\"deprecated\":false}},"
+            ));
+            i += 1;
+        }
+        json.push_str("\"end\":{}}}");
+        let broken = json.replace("},\"1.", "},\n\"1.");
+        (json, broken)
+    }
+
+    /// A text file of `n` short lines.
+    fn text_lines(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("q{i} 0 doc{i} 1 0.5 run\n"))
+            .collect()
+    }
+
+    /// Fails unless placing every block of the one-line document costs about
+    /// what the many-line one does (a scan back to each block's line start
+    /// costs a whole line per block on one line), and ten times the lines
+    /// cost about ten times as much (a scan from byte 0 costs the square).
+    /// Comparing two runs on the same machine holds under load, where an
+    /// absolute bound would not; the sizes are the caller's.
+    fn assert_linear(json_size: usize, lines: usize) -> [std::time::Duration; 2] {
+        let (one, many) = registry_json(json_size);
+        assert!(!one.contains('\n'), "one line");
+        let (blocks, one_line) = fastest("data.json", one.as_bytes());
+        let (same, many_lines) = fastest("data.json", many.as_bytes());
+        assert!(blocks > json_size / 40, "every pair is a block: {blocks}");
+        assert_eq!(blocks, same, "a line break moves no block");
+        eprintln!("{json_size} B JSON: one line {one_line:?}, one version per line {many_lines:?}");
+        let slack = std::time::Duration::from_millis(50);
+        assert!(
+            one_line < many_lines * 2 + slack,
+            "one line {one_line:?} against {many_lines:?} on many: a per-block scan"
+        );
+        let (blocks, big) = fastest("run.trec", text_lines(lines).as_bytes());
+        let (_, small) = fastest("run.trec", text_lines(lines / 10).as_bytes());
+        assert_eq!(blocks, lines, "one block per line");
+        eprintln!("text: {lines} lines {big:?}, a tenth {small:?}");
+        assert!(
+            big < small * 25 + slack,
+            "ten times the lines took {big:?} against {small:?}: not linear"
+        );
+        [one_line, big]
+    }
+
+    #[test]
+    fn placing_every_block_of_a_one_line_5mb_json_and_a_200k_line_file_stays_linear() {
+        // A tenth of the size first: a quadratic regression fails here in
+        // seconds instead of running for hours at full size.
+        assert_linear(500_000, 20_000);
+        let [json, text] = assert_linear(5_000_000, 200_000);
+        // The comparisons above hold on a loaded machine; this bound only
+        // catches a collapse. The absolute figures are measured in a release
+        // build and recorded with the change.
+        for took in [json, text] {
+            assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        }
+    }
+
+    #[test]
+    fn one_opened_file_crosses_threads_and_serves_every_surface_from_one_parse() {
+        fn send_and_sync<T: Send + Sync>() {}
+        send_and_sync::<OpenedFile>();
+        let before = crate::parser::parse_count::get();
+        let opened = open_bytes(
+            &Adapter::new(),
+            "src/lib.rs",
+            b"use a::b;\npub fn f() -> u8 { b() }\n",
+        )
+        .unwrap();
+        assert_eq!(opened.lang, Lang::Rust);
+        assert_eq!(crate::parser::parse_count::get() - before, 1, "one parse");
+        let reader = std::thread::scope(|s| {
+            s.spawn(|| {
+                let before = crate::parser::parse_count::get();
+                let blocks = read_placed_blocks(&opened, false).len();
+                let facts = matches!(extract_facts(&opened), Facts::Supported { .. });
+                let scopes = matches!(extract_scopes(&opened), Scopes::Supported(_));
+                (
+                    blocks,
+                    facts && scopes,
+                    crate::parser::parse_count::get() - before,
+                )
+            })
+            .join()
+            .unwrap()
+        });
+        // The `use` declaration and the function.
+        assert_eq!(reader, (2, true, 0), "the reading thread parsed nothing");
+    }
+
+    #[test]
+    fn placed_blocks_carry_tree_points_and_the_name_node() {
+        let src = "use std::fmt;\n\n#[derive(Debug)]\npub struct Écrit { n: u8 }\n\n\
+                   impl fmt::Display for Écrit {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"{}\", self.n)\n    }\n}\n";
+        let opened = OpenedFile {
+            path: "m.rs".into(),
+            lang: Lang::Rust,
+            tree: Adapter::new().parse(Lang::Rust, src.as_bytes()).unwrap(),
+        };
+        let placed = read_placed_blocks(&opened, false);
+        let blocks = read_blocks(&opened, false);
+        assert_eq!(
+            placed.iter().map(|p| p.block.clone()).collect::<Vec<_>>(),
+            blocks,
+            "a placed block is the block read_blocks returns"
+        );
+        let lines = region::LineIndex::new(src.as_bytes());
+        for p in &placed {
+            assert_eq!(p.start_point, lines.point_for_byte(p.block.start_byte));
+            assert_eq!(p.end_point, lines.point_for_byte(p.block.end_byte));
+        }
+        let named = |kind: &str| {
+            placed
+                .iter()
+                .find(|p| p.block.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind}"))
+        };
+        for kind in ["struct_item", "function_item"] {
+            let p = named(kind);
+            let r = p.name_range.expect("a named item has a name node");
+            assert_eq!(&src[r.start..r.end], p.block.name, "{kind}");
+        }
+        let imp = named("impl_item");
+        let r = imp.name_range.expect("an impl is named by its type");
+        assert_eq!(&src[r.start..r.end], "Écrit");
+        assert_eq!(imp.block.name, "<Écrit as fmt::Display>");
+    }
+
+    #[test]
+    fn name_ranges_point_at_the_name_in_every_mvp_language() {
+        let cases: &[(&str, &str, &str)] = &[
+            // A decorator naming the function first: a text search finds it.
+            (
+                "m.py",
+                "@register(\"handle\")\ndef handle(x):\n    return x\n",
+                "handle",
+            ),
+            // A receiver spelled like the method.
+            (
+                "m.go",
+                "package m\n\nfunc (Get T) Get() int { return 0 }\n",
+                "Get",
+            ),
+            // A doc comment naming the function first.
+            (
+                "m.ts",
+                "/** run calls run */\nexport function run(): void {}\n",
+                "run",
+            ),
+            ("m.tsx", "const View = () => <div />;\n", "View"),
+            ("m.js", "class Run { run() {} }\n", "run"),
+        ];
+        for (path, src, name) in cases {
+            let lang = Lang::for_path(path);
+            let opened = OpenedFile {
+                path: (*path).into(),
+                lang,
+                tree: Adapter::new().parse(lang, src.as_bytes()).unwrap(),
+            };
+            let placed = read_placed_blocks(&opened, false);
+            let p = placed
+                .iter()
+                .rev()
+                .find(|p| p.block.name == *name)
+                .unwrap_or_else(|| panic!("{path}: no block named {name}: {placed:?}"));
+            let r = p.name_range.expect("named");
+            assert_eq!(&src[r.start..r.end], *name, "{path}");
+            let first_text_hit = src.find(name).unwrap();
+            // An arrow function's name is the binding that holds it, outside
+            // the function's own bytes: exactly what a text search inside the
+            // span could never find.
+            let inside = r.start >= p.block.start_byte && r.end <= p.block.end_byte;
+            assert_eq!(inside, *path != "m.tsx", "{path}: where the name sits");
+            if *path != "m.tsx" && *path != "m.js" {
+                assert_ne!(r.start, first_text_hit, "{path}: not the first text match");
+            }
+        }
     }
 
     #[test]

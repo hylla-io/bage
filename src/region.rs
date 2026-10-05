@@ -370,6 +370,14 @@ impl LineIndex {
         (line, off - self.line_starts[line - 1])
     }
 
+    /// The zero-based row and byte column of `off`, in tree-sitter's point
+    /// convention; an offset past the end clamps to the end. A binary search,
+    /// so placing every byte range of a file costs no scan of its text.
+    pub fn point_for_byte(&self, off: usize) -> crate::parser::Point {
+        let (line, col) = self.position_for_byte(off);
+        crate::parser::Point { row: line - 1, col }
+    }
+
     /// Populates `r`'s line/col fields from its byte range (1-based lines,
     /// 0-based byte cols) and returns the updated region. The end position
     /// is the point AT `end_byte` (the exclusive boundary), matching

@@ -357,13 +357,45 @@ impl Adapter {
     }
 }
 
+/// Every tree-sitter parse in the crate goes through here, so a test can count
+/// them: a file is parsed once and every read-only surface reads that tree.
+pub(crate) fn native_parse(
+    p: &mut ts::Parser,
+    src: &[u8],
+    old: Option<&ts::Tree>,
+) -> Option<ts::Tree> {
+    #[cfg(test)]
+    parse_count::bump();
+    p.parse(src, old)
+}
+
+/// Native parses made on the current thread. Tests run one per thread, so a
+/// test reads only its own parses.
+#[cfg(test)]
+pub(crate) mod parse_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PARSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        PARSES.with(|n| n.set(n.get() + 1));
+    }
+
+    /// The parses made on this thread so far.
+    pub(crate) fn get() -> usize {
+        PARSES.with(Cell::get)
+    }
+}
+
 impl ParserPort for Adapter {
     fn parse(&self, lang: Lang, src: &[u8]) -> Result<Tree, ParseError> {
         if lang == Lang::Text {
             return Ok(text_tree(src));
         }
         let mut p = self.new_parser(lang)?;
-        let tree = p.parse(src, None).ok_or(ParseError::NoTree { lang })?;
+        let tree = native_parse(&mut p, src, None).ok_or(ParseError::NoTree { lang })?;
         Ok(Tree {
             root: convert(tree.root_node()),
             source: src.to_vec(),
@@ -386,9 +418,7 @@ impl ParserPort for Adapter {
         let mut p = self.new_parser(lang)?;
         let old_ts = old.native.as_mut().ok_or(ParseError::NoNativeHandle)?;
         old_ts.edit(&to_ts_input_edit(edit));
-        let tree = p
-            .parse(src, Some(old_ts))
-            .ok_or(ParseError::NoTree { lang })?;
+        let tree = native_parse(&mut p, src, Some(old_ts)).ok_or(ParseError::NoTree { lang })?;
         Ok(Tree {
             root: convert(tree.root_node()),
             source: src.to_vec(),
@@ -500,46 +530,39 @@ fn text_end_point(src: &[u8]) -> Point {
 }
 
 /// Eagerly materializes a native node and its descendants into the
-/// engine-independent [`Node`] DTO so the result outlives the native tree. It
-/// walks with an explicit stack rather than recursion, so a deeply nested
-/// tree cannot exhaust the thread stack.
+/// engine-independent [`Node`] DTO so the result outlives the native tree.
+///
+/// One pre-order pass with a tree cursor, which steps to a first child, a
+/// next sibling or a parent in constant time; indexing children by position
+/// would cost a walk along the siblings per child, quadratic in a wide node
+/// such as a long JSON array. `open` holds the nodes whose children are still
+/// being read, so depth costs heap, never thread stack.
 fn convert(root: ts::Node<'_>) -> Node {
-    // Pass 1: flatten to a preorder arena of (node, parent index) with an
-    // explicit stack; children are pushed in reverse so they pop — and land
-    // in the arena — in source order. Every descendant therefore sits at a
-    // higher index than its parent.
-    let mut arena: Vec<(Node, Option<usize>)> = Vec::new();
-    let mut stack: Vec<(ts::Node<'_>, Option<usize>)> = vec![(root, None)];
-    while let Some((n, parent)) = stack.pop() {
-        let idx = arena.len();
-        arena.push((new_node(&n), parent));
-        for i in (0..n.child_count()).rev() {
-            if let Some(c) = n.child(i) {
-                stack.push((c, Some(idx)));
-            }
+    let mut cursor = root.walk();
+    let mut open = vec![new_node(&root)];
+    let mut descend = true;
+    loop {
+        if descend && cursor.goto_first_child() {
+            open.push(new_node(&cursor.node()));
+            continue;
+        }
+        // The cursor's node is complete: a leaf, or every child attached.
+        if open.len() == 1 {
+            break;
+        }
+        let done = open.pop().expect("a child is open");
+        open.last_mut()
+            .expect("its parent is open")
+            .children
+            .push(done);
+        descend = cursor.goto_next_sibling();
+        if descend {
+            open.push(new_node(&cursor.node()));
+        } else {
+            cursor.goto_parent();
         }
     }
-    // Pass 2: stitch bottom-up. Sweeping indices in reverse hands each node
-    // to its parent's accumulator only after the node's own children are
-    // attached; the reverse sweep collects each parent's children in reverse
-    // source order, so one iterative Vec::reverse per node restores order —
-    // no recursion anywhere, so tree depth cannot exhaust the thread stack.
-    let mut acc: Vec<Vec<Node>> = arena.iter().map(|_| Vec::new()).collect();
-    for i in (0..arena.len()).rev() {
-        let (node_slot, parent) = &mut arena[i];
-        let mut node = std::mem::take(node_slot);
-        let mut kids = std::mem::take(&mut acc[i]);
-        kids.reverse();
-        node.children = kids;
-        match parent {
-            Some(p) => {
-                let p = *p;
-                acc[p].push(node);
-            }
-            None => return node,
-        }
-    }
-    unreachable!("arena root returns from the reverse sweep")
+    open.pop().expect("the root stays open")
 }
 
 /// Builds a childless [`Node`] DTO from a native node.
@@ -552,7 +575,7 @@ fn new_node(n: &ts::Node<'_>) -> Node {
         end_point: to_point(n.end_position()),
         named: n.is_named(),
         missing: n.is_missing(),
-        children: Vec::new(),
+        children: Vec::with_capacity(n.child_count() as usize),
     }
 }
 
@@ -733,6 +756,56 @@ mod tests {
             }
         });
         assert!(found, "broken source surfaces ERROR/MISSING nodes");
+    }
+
+    /// Reads a native node child by child, recursively: the plain reading
+    /// the cursor pass in [`convert`] must reproduce exactly.
+    fn read_by_index(n: ts::Node<'_>) -> Node {
+        let mut node = new_node(&n);
+        node.children = (0..n.child_count())
+            .filter_map(|i| n.child(i))
+            .map(read_by_index)
+            .collect();
+        node
+    }
+
+    #[test]
+    fn cursor_conversion_matches_reading_child_by_child() {
+        let a = Adapter::new();
+        let cases: &[(Lang, &[u8])] = &[
+            (
+                Lang::Rust,
+                b"fn main() { let v = vec![1, 2]; /* c */ }\nmod m { pub use a::{b, c as d}; }\n",
+            ),
+            (Lang::Go, b"package main\n\nfunc main() {\n"),
+            (
+                Lang::Tsx,
+                b"const e = <div a={1}>{x ? <b/> : null}</div>;\n",
+            ),
+            (
+                Lang::Python,
+                b"@d\ndef f(x, *a, **k):\n    return [y for y in x if y]\n",
+            ),
+            (Lang::Json, b"[{\"a\": [1, 2, {\"b\": null}]}, true, \"s\"]"),
+            (
+                Lang::Markdown,
+                b"# T\n\n- a\n- b\n\n```rs\nfn x() {}\n```\n",
+            ),
+            (
+                Lang::Cpp,
+                b"template <class T> struct S { operator bool() const; };\n",
+            ),
+            (Lang::Yaml, b"a: [1, 2]\nb:\n  - {c: d}\n"),
+        ];
+        for (lang, src) in cases {
+            let mut p = a.new_parser(*lang).unwrap();
+            let tree = p.parse(src, None).unwrap();
+            assert_eq!(
+                convert(tree.root_node()),
+                read_by_index(tree.root_node()),
+                "{lang}"
+            );
+        }
     }
 
     #[test]
