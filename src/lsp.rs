@@ -6624,19 +6624,51 @@ mod tests {
 
     #[test]
     fn a_session_opens_each_document_once_however_many_queries_ask_about_it() {
+        // Priming reads NO_PRIME_ENV, which another test sets.
+        let _guard = PRIME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // A real root, so a rename primes the siblings on disk: `b.rs` with
+        // the text the session already holds, `c.rs` that no query names.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (text_a, text_b, text_c) = ("fn a() { b(); }\n", "pub fn b() {}\n", "fn c() {}\n");
+        for (name, text) in [("a.rs", text_a), ("b.rs", text_b), ("c.rs", text_c)] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        let (a, b, c_rs) = (
+            root.join("a.rs").to_string_lossy().into_owned(),
+            root.join("b.rs").to_string_lossy().into_owned(),
+            root.join("c.rs").to_string_lossy().into_owned(),
+        );
+        let (a, b) = (a.as_str(), b.as_str());
+
         let (client_conn, server_conn) = conn_pair();
         let log = Arc::new(Mutex::new(Vec::new()));
         spawn_open_close_recorder(server_conn, Arc::clone(&log));
         let mut c = test_client(client_conn);
-        let (a, b) = ("/work/a.rs", "/work/b.rs");
-        let (text_a, text_b) = ("fn a() { b(); }\n", "pub fn b() {}\n");
+        c.initialize(&file_uri(root.to_str().unwrap()).to_string())
+            .unwrap();
+        let probe = ReadyProbe {
+            path: a,
+            content: text_a,
+            line: 0,
+            character: 9,
+        };
         for _ in 0..3 {
             c.definition(a, text_a, 0, 9).unwrap();
             c.type_definition(a, text_a, 0, 9).unwrap();
             c.prepare_call_hierarchy(a, text_a, 0, 3).unwrap();
+            c.prepare_type_hierarchy(a, text_a, 0, 3).unwrap();
+            c.await_ready(a, text_a, 0, 9).unwrap();
+            assert_eq!(c.await_ready_by(&[probe]).unwrap(), 0);
             c.hover(b, text_b, 0, 7).unwrap();
             c.implementation(b, text_b, 0, 7).unwrap();
             c.definition(b, text_b, 0, 7).unwrap();
+            // Pull diagnostics HOLD the document open: the answer is bound to
+            // the request, so no fresh publish is needed and none is sent.
+            c.pull_diagnostics(b, text_b).unwrap();
+            // Priming opens `c.rs` once; `b.rs` is already held with its disk
+            // text, so priming sends nothing for it.
+            c.rename(a, text_a, 0, 3, "renamed").unwrap();
         }
         // The shutdown round-trip orders after every notification above.
         c.close().unwrap();
@@ -6646,6 +6678,7 @@ mod tests {
             vec![
                 ("didOpen".to_string(), file_uri(a).to_string()),
                 ("didOpen".to_string(), file_uri(b).to_string()),
+                ("didOpen".to_string(), file_uri(&c_rs).to_string()),
             ],
             "one didOpen per document per session, and no didClose"
         );
@@ -6714,7 +6747,19 @@ mod tests {
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
                 let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
                 match method {
-                    "initialize" => reply_ok(&mut w, &id, json!({"capabilities": {}})),
+                    "initialize" => reply_ok(
+                        &mut w,
+                        &id,
+                        json!({"capabilities": {
+                            "hoverProvider": true,
+                            "implementationProvider": true,
+                            "typeHierarchyProvider": true,
+                            "diagnosticProvider": {
+                                "interFileDependencies": false,
+                                "workspaceDiagnostics": false,
+                            },
+                        }}),
+                    ),
                     "textDocument/didOpen" | "textDocument/didClose" => {
                         if let Some(uri) = msg
                             .pointer("/params/textDocument/uri")
@@ -6725,11 +6770,27 @@ mod tests {
                         }
                     }
                     "textDocument/rename" => reply_ok(&mut w, &id, ready_rename_edit()),
-                    "textDocument/definition"
-                    | "textDocument/typeDefinition"
+                    // A location in a file no query opens, so a readiness
+                    // probe passes on its first answer.
+                    "textDocument/definition" => reply_ok(
+                        &mut w,
+                        &id,
+                        json!({
+                            "uri": "file:///elsewhere/z.rs",
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1},
+                            },
+                        }),
+                    ),
+                    "textDocument/diagnostic" => {
+                        reply_ok(&mut w, &id, json!({"kind": "full", "items": []}))
+                    }
+                    "textDocument/typeDefinition"
                     | "textDocument/implementation"
                     | "textDocument/hover"
-                    | "textDocument/prepareCallHierarchy" => reply_ok(&mut w, &id, Value::Null),
+                    | "textDocument/prepareCallHierarchy"
+                    | "textDocument/prepareTypeHierarchy" => reply_ok(&mut w, &id, Value::Null),
                     "shutdown" => reply_ok(&mut w, &id, Value::Null),
                     "exit" => break,
                     _ if !id.is_null() => reply_err(&mut w, &id, "method not found"),
