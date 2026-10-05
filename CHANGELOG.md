@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — one parse per file, positions without text scans, `_` names nothing, open once
+## 0.15.0 — one parse per file, positions without text scans, `_` names nothing, open once (source breaks)
 
 `Block`, every fact and scope shape, and `region_hash` are unchanged. **Three source breaks for a
 v0.14.0 caller**, each needing nothing unless the caller builds or exhaustively matches the type.
