@@ -1,9 +1,11 @@
 //! Starting a server in its workspace, and pipelined call-hierarchy batches,
 //! through the crate's public API only.
 //!
-//! The working-directory tests spawn `sh` and always run. The rust-analyzer
-//! comparison runs only with `BAGE_LSP_REAL_TEST=1` and prints a loud SKIP
-//! line otherwise; under the opt-in a missing server FAILS.
+//! The working-directory tests spawn `sh` and always run. The rustup and
+//! rust-analyzer cases are `#[ignore]`d, so a default run REPORTS them as
+//! ignored rather than passed; run them with
+//! `BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored`, under
+//! which a missing server, or the opt-in left unset, FAILS.
 
 use std::fs;
 use std::num::NonZeroUsize;
@@ -40,6 +42,16 @@ fn first_stderr_line(c: &Client) -> String {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The real-server cases are `#[ignore]`d, so reaching one means the operator
+/// selected it on purpose; without the opt-in that is a mistake to see, not
+/// one to swallow into a green result.
+fn require_real_tier() {
+    assert!(
+        std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1"),
+        "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and rustup and rust-analyzer on PATH)"
+    );
 }
 
 fn quick_close(mut c: Client) {
@@ -104,15 +116,10 @@ fn new_stdio_in_refuses_a_directory_that_is_not_one() {
 /// whose `rust-analyzer` only says where it came from.
 #[cfg(unix)]
 #[test]
+#[ignore = "real rustup: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored"]
 fn rustup_starts_the_toolchain_the_workspace_names() {
     use std::os::unix::fs::PermissionsExt;
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP rustup_starts_the_toolchain_the_workspace_names: \
-             set BAGE_LSP_REAL_TEST=1 to run (needs rustup)"
-        );
-        return;
-    }
+    require_real_tier();
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonical");
     let bin = root.join("toolchain/bin");
@@ -135,12 +142,13 @@ fn rustup_starts_the_toolchain_the_workspace_names() {
     )
     .expect("toolchain file");
     // rustup ranks `RUSTUP_TOOLCHAIN` above any toolchain file, and its cargo
-    // proxy sets it for everything cargo runs — this test included — so the
-    // command clears it, as a caller started under cargo must.
-    let command: Vec<String> = ["env", "-u", "RUSTUP_TOOLCHAIN", "rust-analyzer"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // proxy sets it for everything cargo runs — this test included — so this
+    // passes only because the workspace spawn drops the inherited one.
+    assert!(
+        std::env::var_os("RUSTUP_TOOLCHAIN").is_some(),
+        "precondition: run under rustup's cargo, which sets RUSTUP_TOOLCHAIN"
+    );
+    let command = vec!["rust-analyzer".to_string()];
     let c = Client::new_stdio_in(&command, &workspace)
         .unwrap_or_else(|e| panic!("spawn the rust-analyzer proxy: {e}"));
     assert_eq!(first_stderr_line(&c), "the workspace's toolchain");
@@ -213,14 +221,9 @@ fn target_key(t: &CallTarget) -> (String, SymbolLocation) {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored"]
 fn pipelined_call_hierarchy_equals_one_at_a_time_against_rust_analyzer() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP pipelined_call_hierarchy_equals_one_at_a_time_against_rust_analyzer: \
-             set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let dir = tempfile::tempdir().expect("tempdir");
     let root: PathBuf = dir.path().canonicalize().expect("canonical root");
     write_fixture(&root);

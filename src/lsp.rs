@@ -35,6 +35,7 @@
 //! store.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -2512,7 +2513,7 @@ impl Client {
     /// The server inherits this process's working directory; see
     /// [`Client::new_stdio_in`] to start it in the workspace instead.
     pub fn new_stdio(command: &[String]) -> Result<Client, LspError> {
-        Client::spawn(command, None)
+        Client::spawn(command, None, &[])
     }
 
     /// [`Client::new_stdio`], with the server started in `dir` — normally the
@@ -2523,34 +2524,74 @@ impl Client {
     /// from there and hands that choice to every cargo the server runs.
     /// Started elsewhere, the server builds the workspace with whatever
     /// toolchain the caller's directory names, and a project that toolchain
-    /// cannot build answers with edges missing rather than an error. The
-    /// server inherits this process's environment unchanged, and rustup ranks
-    /// an inherited `RUSTUP_TOOLCHAIN` above every toolchain file — rustup's
-    /// cargo proxy sets it for each process cargo runs.
+    /// cannot build answers with edges missing rather than an error.
+    ///
+    /// So the server inherits this process's environment WITHOUT
+    /// `RUSTUP_TOOLCHAIN`: rustup ranks that variable above every toolchain
+    /// file, and rustup's cargo proxy sets it for each process cargo runs, so
+    /// a caller started by `cargo run` or `cargo test` would otherwise hand
+    /// the server cargo's toolchain instead of the workspace's.
     ///
     /// A `dir` that is not a directory is refused with
     /// [`LspError::WorkingDir`] before anything is started.
     pub fn new_stdio_in(command: &[String], dir: &Path) -> Result<Client, LspError> {
-        let not_dir = || io::Error::new(io::ErrorKind::NotADirectory, "not a directory");
-        match fs::metadata(dir) {
-            Ok(meta) if meta.is_dir() => Client::spawn(command, Some(dir)),
-            Ok(_) => Err(LspError::WorkingDir {
-                dir: dir.to_path_buf(),
-                source: not_dir(),
-            }),
-            Err(source) => Err(LspError::WorkingDir {
-                dir: dir.to_path_buf(),
-                source,
-            }),
-        }
+        Client::new_stdio_in_with_env(command, dir, std::iter::empty::<(&OsStr, &OsStr)>())
     }
 
-    fn spawn(command: &[String], dir: Option<&Path>) -> Result<Client, LspError> {
+    /// [`Client::new_stdio_in`], with each of `envs` set in the server's
+    /// environment on top of what it inherits — for a server whose per-user
+    /// state, such as a cache under its home directory, the caller decides.
+    /// A `RUSTUP_TOOLCHAIN` named here is set: only an inherited one is
+    /// dropped.
+    ///
+    /// A `dir` that is not a directory is refused with
+    /// [`LspError::WorkingDir`] before anything is started.
+    pub fn new_stdio_in_with_env<I, K, V>(
+        command: &[String],
+        dir: &Path,
+        envs: I,
+    ) -> Result<Client, LspError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let not_dir = || io::Error::new(io::ErrorKind::NotADirectory, "not a directory");
+        match fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(LspError::WorkingDir {
+                    dir: dir.to_path_buf(),
+                    source: not_dir(),
+                });
+            }
+            Err(source) => {
+                return Err(LspError::WorkingDir {
+                    dir: dir.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        let envs: Vec<(OsString, OsString)> = envs
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned()))
+            .collect();
+        Client::spawn(command, Some(dir), &envs)
+    }
+
+    fn spawn(
+        command: &[String],
+        dir: Option<&Path>,
+        envs: &[(OsString, OsString)],
+    ) -> Result<Client, LspError> {
         let (program, args) = command.split_first().ok_or(LspError::EmptyCommand)?;
         let mut cmd = Command::new(program);
         if let Some(dir) = dir {
-            cmd.current_dir(dir);
+            // The directory decides the toolchain only when nothing outranks
+            // it; see `new_stdio_in`.
+            cmd.current_dir(dir).env_remove("RUSTUP_TOOLCHAIN");
         }
+        cmd.envs(envs.iter().map(|(k, v)| (k, v)));
         let mut child = cmd
             .args(args)
             .stdin(Stdio::piped())
@@ -7005,19 +7046,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --lib -- --ignored"]
     fn warm_real_server_double_rename() {
-        // Env-gated real-server tier (rust-analyzer): render two renames
-        // through ONE pooled server, proving the warm-reuse didOpen/didClose
-        // handshake keeps a real server usable. Loud SKIP when rust-analyzer
-        // is absent or the tier is not opted in — never a false pass.
-        if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-            eprintln!("SKIP warm_real_server_double_rename: set BAGE_LSP_REAL_TEST=1 to run");
-            return;
-        }
-        if !command_on_path("rust-analyzer") {
-            eprintln!("SKIP warm_real_server_double_rename: rust-analyzer not on PATH");
-            return;
-        }
+        // Real-server tier (rust-analyzer): render two renames through ONE
+        // pooled server, proving the warm-reuse didOpen/didClose handshake
+        // keeps a real server usable. `#[ignore]`d, so a default run reports
+        // it as ignored; selected, a missing opt-in or server FAILS.
+        assert!(
+            std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1"),
+            "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and rust-analyzer on PATH)"
+        );
+        assert!(
+            command_on_path("rust-analyzer"),
+            "the real-server tier needs rust-analyzer on PATH"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(

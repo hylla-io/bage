@@ -10,13 +10,25 @@
 
 - `lsp::Client::new_stdio_in(command, dir)`: starts the server in `dir`, so a toolchain manager's
   proxy (rustup) reads the workspace's `rust-toolchain.toml`. A `dir` that is not a directory is
-  refused with `LspError::WorkingDir` before anything starts. An inherited `RUSTUP_TOOLCHAIN` still
-  outranks the file — rustup's cargo proxy sets it for every process cargo runs.
+  refused with `LspError::WorkingDir` before anything starts. The server does not inherit
+  `RUSTUP_TOOLCHAIN`: rustup ranks it above every toolchain file, and rustup's cargo proxy sets it
+  for every process cargo runs, so a caller under `cargo run` or `cargo test` would otherwise hand
+  the server cargo's toolchain.
+- `lsp::Client::new_stdio_in_with_env(command, dir, envs)`: `new_stdio_in`, with `envs` set on top
+  of the inherited environment — for a server whose per-user state, such as a cache under its home
+  directory, the caller decides. A `RUSTUP_TOOLCHAIN` named in `envs` is set.
 - `lsp::Client::prepare_call_hierarchy_many(queries, in_flight)` with `lsp::PositionQuery`, and
   `lsp::Client::outgoing_calls_many(targets, in_flight)`: up to `in_flight` requests outstanding on
   one server, answers matched to questions by request id, one outcome per input in input order,
   each with the single call's retry and error discipline. Changing an open document's text waits
   until every earlier request is answered.
+
+### Tests
+
+- The real-server tier is `#[ignore]`d: a plain `cargo test` reports those cases as `ignored`
+  instead of passing them after an early return. Run them with `BAGE_LSP_REAL_TEST=1 cargo test
+  --lib --test lsp_session --test lsp_hierarchy --test lsp_pipeline --test lsp_typing_acquisition
+  -- --ignored`; selected without the variable or a server, they fail.
 
 ## 0.15.0 — one parse per file, positions without text scans, `_` names nothing, open once (source breaks)
 
