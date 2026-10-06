@@ -14,11 +14,12 @@
 //!
 //! `npmLocation` (a declaration too) points the server at a counting shim, so
 //! nothing is installed and the count is exact. Run with `HOME` pointed at a
-//! scratch directory: the server creates its typings cache under it, and the
-//! spawn seam takes no declared environment.
+//! scratch directory: the server creates its typings cache under it.
 //!
-//! Runs only with `BAGE_LSP_REAL_TEST=1` and prints a loud SKIP line
-//! otherwise; under the opt-in a missing server FAILS rather than skipping,
+//! `#[ignore]`d, so a default run REPORTS it as ignored rather than passed.
+//! Run it with
+//! `BAGE_LSP_REAL_TEST=1 cargo test --test lsp_typing_acquisition -- --ignored`;
+//! a missing server, or the opt-in left unset, FAILS rather than skipping,
 //! because the operator asked for that tier. `BAGE_TSSERVER_PATH` names a
 //! `tsserver.js` for a host whose TypeScript is the native build, which ships
 //! none — itself declared through `initializationOptions`.
@@ -40,8 +41,14 @@ const ATA_WINDOW: Duration = Duration::from_secs(45);
 const PROBE_FILE: &str = "index.js";
 const PROBE_SOURCE: &str = "const _ = require(\"lodash\");\nmodule.exports = _.size([1]);\n";
 
-fn real_enabled() -> bool {
-    std::env::var("BAGE_LSP_REAL_TEST").is_ok_and(|v| v == "1")
+/// Reaching the `#[ignore]`d case means the operator selected it on purpose;
+/// without the opt-in that is a mistake to see, not one to swallow into a
+/// green result.
+fn require_real_tier() {
+    assert!(
+        std::env::var("BAGE_LSP_REAL_TEST").is_ok_and(|v| v == "1"),
+        "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and its servers on PATH)"
+    );
 }
 
 /// A fixture whose dependency has no bundled types, which is what sends the
@@ -146,11 +153,9 @@ fn npm_calls_during_session(options: Value, stop_at_first: bool) -> Vec<String> 
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_typing_acquisition -- --ignored"]
 fn a_declared_switch_stops_the_server_reaching_for_npm() {
-    if !real_enabled() {
-        println!("SKIP lsp_typing_acquisition: set BAGE_LSP_REAL_TEST=1 to run");
-        return;
-    }
+    require_real_tier();
 
     let control = npm_calls_during_session(json!({}), true);
     println!("control arm npm calls: {control:?}");

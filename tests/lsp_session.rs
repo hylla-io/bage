@@ -7,9 +7,11 @@
 //! it never answers `initialize` or `shutdown` and never exits on `exit`, which
 //! is exactly the server a declared bound must cut short.
 //!
-//! The real-server cases run only with `BAGE_LSP_REAL_TEST=1` and print a loud
-//! SKIP line otherwise; a missing server under the opt-in FAILS rather than
-//! skipping, because the operator asked for that tier.
+//! The real-server cases are `#[ignore]`d, so a default run REPORTS them as
+//! ignored rather than passed. Run them with
+//! `BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored`; a missing
+//! server, or the opt-in left unset, FAILS rather than skipping, because the
+//! operator asked for that tier.
 
 use std::fs;
 use std::path::Path;
@@ -444,13 +446,9 @@ fn run_real_case(case: &RealCase) {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn did_open_buffer_is_what_a_real_server_resolves_against() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP did_open_buffer_is_what_a_real_server_resolves_against: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     for case in REAL_CASES {
         eprintln!("real-server case: {}", case.name);
         run_real_case(case);
@@ -534,13 +532,9 @@ fn assert_prints_stderr(err: &LspError, stderr: &lsp::StderrTail) {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_reported_failure_stops_readiness_at_once() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP rust_analyzer_reported_failure_stops_readiness_at_once: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let declared = ClientConfig {
         initialize_timeout: Duration::from_secs(60),
         call_timeout: Duration::from_secs(30),
@@ -606,13 +600,9 @@ fn rust_analyzer_reported_failure_stops_readiness_at_once() {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_quiescent_signal_gates_the_probe() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP rust_analyzer_quiescent_signal_gates_the_probe: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let declared = ClientConfig {
         initialize_timeout: Duration::from_secs(60),
         call_timeout: Duration::from_secs(30),
@@ -656,13 +646,9 @@ const HEALTHY_GO_MODULE: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn gopls_once_signal_outlives_the_messages_that_follow_it() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP gopls_once_signal_outlives_the_messages_that_follow_it: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonical root");
     for (rel, content) in HEALTHY_GO_MODULE {
@@ -766,13 +752,9 @@ const MALFORMED_GO_MODULE: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn gopls_malformed_go_mod_is_reported_where_it_is() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP gopls_malformed_go_mod_is_reported_where_it_is: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let declared = |diagnostic_failures: Vec<DiagnosticFailure>, ready_deadline| ClientConfig {
         initialize_timeout: Duration::from_secs(60),
         call_timeout: Duration::from_secs(60),
@@ -926,13 +908,9 @@ const MALFORMED_CARGO_TOML: &[(&str, &str)] = &[
 ];
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_locates_a_malformed_cargo_toml_only_on_stderr() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP rust_analyzer_locates_a_malformed_cargo_toml_only_on_stderr: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    require_real_tier();
     let deadline = Duration::from_secs(120);
     // Every diagnostic on every document is declared a failure, so an empty
     // `locations` below means the server published none at all.
@@ -1142,13 +1120,14 @@ fn hover_case(case: &HoverCase, formats: &[MarkupKind]) -> Vec<lsp::Hover> {
     got
 }
 
-/// Whether the real-server tier was asked for; says so loudly when not.
-fn real_servers(test: &str) -> bool {
-    let asked = std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1");
-    if !asked {
-        eprintln!("SKIP {test}: set BAGE_LSP_REAL_TEST=1 to run");
-    }
-    asked
+/// The real-server cases are `#[ignore]`d, so reaching one means the operator
+/// selected it on purpose; without the opt-in that is a mistake to see, not
+/// one to swallow into a green result.
+fn require_real_tier() {
+    assert!(
+        std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1"),
+        "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and its servers on PATH)"
+    );
 }
 
 /// A crate depending on a registry crate that is served from a vendored
@@ -1217,18 +1196,16 @@ fn rust_hover_case() -> HoverCase {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_hover_shows_std_and_dependency_docs() {
-    if !real_servers("rust_analyzer_hover_shows_std_and_dependency_docs") {
-        return;
-    }
+    require_real_tier();
     hover_proof(&rust_hover_case());
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_hover_needs_the_standard_library_sources() {
-    if !real_servers("rust_analyzer_hover_needs_the_standard_library_sources") {
-        return;
-    }
+    require_real_tier();
     // rust-analyzer's own setting for where the standard library's sources
     // are, pointed at a directory holding none: a toolchain installed
     // without its `rust-src` component.
@@ -1309,10 +1286,9 @@ fn go_hover_case() -> HoverCase {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn gopls_hover_shows_stdlib_docs() {
-    if !real_servers("gopls_hover_shows_stdlib_docs") {
-        return;
-    }
+    require_real_tier();
     hover_proof(&go_hover_case());
 }
 
@@ -1407,10 +1383,9 @@ fn hover_content(case: &HoverCase) -> &'static str {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn gopls_position_outside_the_text_is_retried_to_the_query_deadline() {
-    if !real_servers("gopls_position_outside_the_text_is_retried_to_the_query_deadline") {
-        return;
-    }
+    require_real_tier();
     let case = go_hover_case();
     let (_dir, path, mut c) = refused_outside_the_text(
         &case,
@@ -1437,10 +1412,9 @@ fn gopls_position_outside_the_text_is_retried_to_the_query_deadline() {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_line_outside_the_text_is_retried_to_the_query_deadline() {
-    if !real_servers("rust_analyzer_line_outside_the_text_is_retried_to_the_query_deadline") {
-        return;
-    }
+    require_real_tier();
     let case = rust_hover_case();
     let (_dir, path, mut c) = refused_outside_the_text(
         &case,
@@ -1533,10 +1507,9 @@ fn ts_hover_case() -> HoverCase {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn tsc_hover_shows_lib_and_node_modules_docs() {
-    if !real_servers("tsc_hover_shows_lib_and_node_modules_docs") {
-        return;
-    }
+    require_real_tier();
     hover_proof(&ts_hover_case());
 }
 
@@ -1570,10 +1543,9 @@ fn py_hover_case() -> HoverCase {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn pyright_hover_shows_stdlib_docs() {
-    if !real_servers("pyright_hover_shows_stdlib_docs") {
-        return;
-    }
+    require_real_tier();
     hover_proof(&py_hover_case());
 }
 
@@ -1583,12 +1555,9 @@ fn pyright_hover_shows_stdlib_docs() {
 const AGENT_SKILL_HEADER: &str = include_str!("../testdata/readiness/agent_skill_header.rs");
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
 fn rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_ones() {
-    if !real_servers(
-        "rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_ones",
-    ) {
-        return;
-    }
+    require_real_tier();
     let lib = format!(
         "{AGENT_SKILL_HEADER}\npub mod util;\nuse util::helper;\n\
          pub fn uses() -> usize {{ helper() }}\n\

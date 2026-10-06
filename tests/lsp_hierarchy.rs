@@ -1,8 +1,9 @@
 //! `textDocument/implementation` and the type hierarchy against REAL language
 //! servers, through the crate's public API only.
 //!
-//! Runs only with `BAGE_LSP_REAL_TEST=1` and prints a loud SKIP line
-//! otherwise; under the opt-in a missing server FAILS rather than skipping,
+//! `#[ignore]`d, so a default run REPORTS it as ignored rather than passed.
+//! Run it with `BAGE_LSP_REAL_TEST=1 cargo test --test lsp_hierarchy -- --ignored`;
+//! a missing server, or the opt-in left unset, FAILS rather than skipping,
 //! because the operator asked for that tier.
 //!
 //! Which server advertises what is itself asserted: a server that does not
@@ -334,13 +335,14 @@ fn run_case(case: &Case) {
 }
 
 #[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_hierarchy -- --ignored"]
 fn implementation_and_type_hierarchy_against_real_servers() {
-    if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-        eprintln!(
-            "SKIP implementation_and_type_hierarchy_against_real_servers: set BAGE_LSP_REAL_TEST=1 to run"
-        );
-        return;
-    }
+    // Reaching this `#[ignore]`d case means the operator selected it on
+    // purpose; without the opt-in that is a mistake to see, not a green run.
+    assert!(
+        std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1"),
+        "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and its servers on PATH)"
+    );
     for case in CASES {
         eprintln!("real-server case: {}", case.name);
         run_case(case);

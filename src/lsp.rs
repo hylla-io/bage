@@ -35,9 +35,11 @@
 //! store.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -990,6 +992,16 @@ pub enum LspError {
         /// The program that failed to start.
         command: String,
         /// The underlying spawn error.
+        source: io::Error,
+    },
+    /// The directory [`Client::new_stdio_in`] was asked to start the server
+    /// in is not a readable directory. Separate from [`LspError::Spawn`],
+    /// whose "not found" means the server program itself is missing.
+    #[error("lsp: start in {dir:?}: {source}")]
+    WorkingDir {
+        /// The directory the server was to start in.
+        dir: PathBuf,
+        /// Why it cannot be used.
         source: io::Error,
     },
     /// The server answered a request with a JSON-RPC error.
@@ -2179,6 +2191,79 @@ fn goto_locations(resp: lt::GotoDefinitionResponse) -> Vec<SymbolLocation> {
     }
 }
 
+const PREPARE_CALL_HIERARCHY: &str = "textDocument/prepareCallHierarchy";
+const OUTGOING_CALLS: &str = "callHierarchy/outgoingCalls";
+
+/// One position question in a batch: the arguments the single-position
+/// query takes, for [`Client::prepare_call_hierarchy_many`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionQuery<'a> {
+    /// The document's path.
+    pub path: &'a str,
+    /// The document's authoritative text, sent via didOpen.
+    pub content: &'a str,
+    /// Zero-based line.
+    pub line: u32,
+    /// Zero-based character, in UTF-16 code units.
+    pub character: u32,
+}
+
+/// The `TextDocumentPositionParams` for a zero-based (line, UTF-16 col).
+fn position_params(path: &str, line: u32, col: u32) -> Value {
+    json!({
+        "textDocument": {"uri": file_uri(path)},
+        "position": {"line": line, "character": col},
+    })
+}
+
+/// Decodes a `CallHierarchyItem[] | null` response.
+fn decode_call_targets(v: Value) -> Result<Vec<CallTarget>, LspError> {
+    let items = serde_json::from_value::<Option<Vec<lt::CallHierarchyItem>>>(v).map_err(|e| {
+        LspError::Rpc {
+            method: PREPARE_CALL_HIERARCHY.to_string(),
+            message: format!("decode response: {e}"),
+        }
+    })?;
+    items
+        .unwrap_or_default()
+        .iter()
+        .map(to_call_target)
+        .collect()
+}
+
+/// Decodes a `CallHierarchyOutgoingCall[] | null` response to `target`.
+fn decode_outgoing_calls(target: &CallTarget, v: Value) -> Result<Vec<OutgoingCall>, LspError> {
+    let calls =
+        serde_json::from_value::<Option<Vec<lt::CallHierarchyOutgoingCall>>>(v).map_err(|e| {
+            LspError::Rpc {
+                method: OUTGOING_CALLS.to_string(),
+                message: format!("decode response: {e}"),
+            }
+        })?;
+    calls
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            Ok(OutgoingCall {
+                to: to_call_target(&c.to)?,
+                // `fromRanges` are spans in the CALLER's file, so they take
+                // the caller's path — the callee's would misattribute them.
+                call_sites: c
+                    .from_ranges
+                    .iter()
+                    .map(|r| SymbolLocation {
+                        path: target.location.path.clone(),
+                        start_line: r.start.line,
+                        start_char: r.start.character,
+                        end_line: r.end.line,
+                        end_char: r.end.character,
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// Flattens a `CallHierarchyItem` into a [`CallTarget`], retaining the raw
 /// item for the follow-up request.
 fn to_call_target(item: &lt::CallHierarchyItem) -> Result<CallTarget, LspError> {
@@ -2287,8 +2372,33 @@ enum RpcOutcome {
     Closed,
 }
 
-/// The table of in-flight requests, keyed by request id.
-type PendingMap = Arc<Mutex<HashMap<u64, Sender<RpcOutcome>>>>;
+/// One request of a pipelined batch (see `Client::query_many`).
+struct Ask<'a> {
+    /// The file a [`LspError::QueryDeadline`] names.
+    path: &'a str,
+    /// The document (path, text) held open before the request is written.
+    open: Option<(&'a str, &'a str)>,
+    params: Value,
+}
+
+/// The typed result a waiting call reports for `outcome`.
+fn outcome_result(method: &str, outcome: RpcOutcome) -> Result<Value, LspError> {
+    match outcome {
+        RpcOutcome::Ok(v) => Ok(v),
+        RpcOutcome::Err(message) => Err(LspError::Rpc {
+            method: method.to_string(),
+            message,
+        }),
+        RpcOutcome::Closed => Err(LspError::Closed {
+            method: method.to_string(),
+        }),
+    }
+}
+
+/// The table of in-flight requests, keyed by request id. Each outcome is sent
+/// with its id, so several requests can share one channel and a pipelined
+/// batch still knows which question an answer belongs to.
+type PendingMap = Arc<Mutex<HashMap<u64, Sender<(u64, RpcOutcome)>>>>;
 
 /// A thin synchronous LSP client over a spawned language-server subprocess
 /// (or any Read/Write pair via [`Client::from_conn`]). It exposes only the
@@ -2399,9 +2509,90 @@ impl Client {
     /// incoming server-to-client requests are answered with method-not-found,
     /// sufficient for the rename path. Call [`Client::close`] to release the
     /// subprocess (Drop kills it as a backstop).
+    ///
+    /// The server inherits this process's working directory; see
+    /// [`Client::new_stdio_in`] to start it in the workspace instead.
     pub fn new_stdio(command: &[String]) -> Result<Client, LspError> {
+        Client::spawn(command, None, &[])
+    }
+
+    /// [`Client::new_stdio`], with the server started in `dir` — normally the
+    /// workspace root it will be initialized on.
+    ///
+    /// A toolchain manager's proxy chooses its toolchain from the directory
+    /// it starts in: rustup reads the nearest `rust-toolchain.toml` upward
+    /// from there and hands that choice to every cargo the server runs.
+    /// Started elsewhere, the server builds the workspace with whatever
+    /// toolchain the caller's directory names, and a project that toolchain
+    /// cannot build answers with edges missing rather than an error.
+    ///
+    /// So the server inherits this process's environment WITHOUT
+    /// `RUSTUP_TOOLCHAIN`: rustup ranks that variable above every toolchain
+    /// file, and rustup's cargo proxy sets it for each process cargo runs, so
+    /// a caller started by `cargo run` or `cargo test` would otherwise hand
+    /// the server cargo's toolchain instead of the workspace's.
+    ///
+    /// A `dir` that is not a directory is refused with
+    /// [`LspError::WorkingDir`] before anything is started.
+    pub fn new_stdio_in(command: &[String], dir: &Path) -> Result<Client, LspError> {
+        Client::new_stdio_in_with_env(command, dir, std::iter::empty::<(&OsStr, &OsStr)>())
+    }
+
+    /// [`Client::new_stdio_in`], with each of `envs` set in the server's
+    /// environment on top of what it inherits — for a server whose per-user
+    /// state, such as a cache under its home directory, the caller decides.
+    /// A `RUSTUP_TOOLCHAIN` named here is set: only an inherited one is
+    /// dropped.
+    ///
+    /// A `dir` that is not a directory is refused with
+    /// [`LspError::WorkingDir`] before anything is started.
+    pub fn new_stdio_in_with_env<I, K, V>(
+        command: &[String],
+        dir: &Path,
+        envs: I,
+    ) -> Result<Client, LspError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        let not_dir = || io::Error::new(io::ErrorKind::NotADirectory, "not a directory");
+        match fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(LspError::WorkingDir {
+                    dir: dir.to_path_buf(),
+                    source: not_dir(),
+                });
+            }
+            Err(source) => {
+                return Err(LspError::WorkingDir {
+                    dir: dir.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        let envs: Vec<(OsString, OsString)> = envs
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned()))
+            .collect();
+        Client::spawn(command, Some(dir), &envs)
+    }
+
+    fn spawn(
+        command: &[String],
+        dir: Option<&Path>,
+        envs: &[(OsString, OsString)],
+    ) -> Result<Client, LspError> {
         let (program, args) = command.split_first().ok_or(LspError::EmptyCommand)?;
-        let mut child = Command::new(program)
+        let mut cmd = Command::new(program);
+        if let Some(dir) = dir {
+            // The directory decides the toolchain only when nothing outranks
+            // it; see `new_stdio_in`.
+            cmd.current_dir(dir).env_remove("RUSTUP_TOOLCHAIN");
+        }
+        cmd.envs(envs.iter().map(|(k, v)| (k, v)));
+        let mut child = cmd
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2597,6 +2788,31 @@ impl Client {
 
     /// Sends one request and blocks for its response (bounded by `timeout`).
     fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, LspError> {
+        let (tx, rx) = mpsc::channel();
+        let id = self.send_request(method, params, tx)?;
+        match rx.recv_timeout(timeout) {
+            Ok((_, outcome)) => outcome_result(method, outcome),
+            Err(RecvTimeoutError::Disconnected) => Err(LspError::Closed {
+                method: method.to_string(),
+            }),
+            Err(RecvTimeoutError::Timeout) => {
+                lock(&self.pending).remove(&id);
+                Err(LspError::Timeout {
+                    method: method.to_string(),
+                    after: timeout,
+                })
+            }
+        }
+    }
+
+    /// Writes one request whose outcome will arrive on `tx`, tagged with the
+    /// returned id. Fails without writing when the connection is gone.
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        tx: Sender<(u64, RpcOutcome)>,
+    ) -> Result<u64, LspError> {
         // Reader dead: the read loop already exited, so no response can ever
         // arrive. Writing + blocking would burn the full `timeout` and return a
         // non-fatal `Timeout` (the half-dead escape). Fail FATAL now so the
@@ -2608,7 +2824,6 @@ impl Client {
         }
         self.next_id += 1;
         let id = self.next_id;
-        let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(id, tx);
         // TOCTOU re-check (DL-64 #2): the reader may have hit EOF — setting `dead`
         // and DRAINING the pending map — AFTER the top-of-fn check but BEFORE this
@@ -2631,24 +2846,7 @@ impl Client {
             lock(&self.pending).remove(&id);
             return Err(LspError::Io(e));
         }
-
-        match rx.recv_timeout(timeout) {
-            Ok(RpcOutcome::Ok(v)) => Ok(v),
-            Ok(RpcOutcome::Err(message)) => Err(LspError::Rpc {
-                method: method.to_string(),
-                message,
-            }),
-            Ok(RpcOutcome::Closed) | Err(RecvTimeoutError::Disconnected) => Err(LspError::Closed {
-                method: method.to_string(),
-            }),
-            Err(RecvTimeoutError::Timeout) => {
-                lock(&self.pending).remove(&id);
-                Err(LspError::Timeout {
-                    method: method.to_string(),
-                    after: timeout,
-                })
-            }
-        }
+        Ok(id)
     }
 
     /// Sends one notification (no response expected).
@@ -3065,24 +3263,166 @@ impl Client {
         path: &str,
         params: Value,
     ) -> Result<Value, LspError> {
-        let deadline = Instant::now() + self.query_deadline;
-        let mut last: String;
+        let ask = Ask {
+            path,
+            open: None,
+            params,
+        };
+        let mut answers = self.query_many(method, vec![ask], NonZeroUsize::MIN);
+        answers.pop().expect("one outcome per ask")
+    }
+
+    /// [`Client::query_with_retry`] for many requests of one `method`, with up
+    /// to `in_flight` of them sent and unanswered at once. Returns one outcome
+    /// per ask, in the order given.
+    ///
+    /// LSP lets a client send a request before the previous one is answered,
+    /// and a server free to work on several at once then does; one at a time
+    /// leaves it idle for a round trip per question. Each answer is matched to
+    /// its question by request id, never by arrival order, which a server may
+    /// change.
+    ///
+    /// Each ask keeps the single query's discipline: a refusal or an
+    /// unanswered request (after `call_timeout`, counted from when it was
+    /// sent) is retried, without holding up the others, until
+    /// `query_deadline` from its first send; a fatal transport error is that
+    /// ask's final outcome, and every ask still to be sent then fails fast on
+    /// the dead connection with its own error.
+    ///
+    /// Document sync stays in request order. An ask's document is opened just
+    /// before its request is written, so the server sees every question after
+    /// the text it asks about. Changing the text of a document the server
+    /// already holds waits until nothing is outstanding or due a retry, so no
+    /// earlier question is answered — or retried — against text it did not
+    /// ask about.
+    fn query_many(
+        &mut self,
+        method: &str,
+        asks: Vec<Ask<'_>>,
+        in_flight: NonZeroUsize,
+    ) -> Vec<Result<Value, LspError>> {
+        let (tx, rx) = mpsc::channel();
+        let mut answers: Vec<Option<Result<Value, LspError>>> = asks.iter().map(|_| None).collect();
+        // When each ask was first sent: the start of its `query_deadline`.
+        let mut first_sent: Vec<Option<Instant>> = vec![None; asks.len()];
+        // Request id → (ask index, when its `call_timeout` runs out).
+        let mut outstanding: HashMap<u64, (usize, Instant)> = HashMap::new();
+        // (when it may go again, ask index), for asks a server refused.
+        let mut retries: Vec<(Instant, usize)> = Vec::new();
+        let mut next = 0;
         loop {
-            match self.call(method, params.clone(), self.call_timeout) {
-                Ok(v) => return Ok(v),
-                Err(e) if is_fatal_transport(&e) => return Err(e),
-                Err(e) => last = e.to_string(),
+            // Fill the window: a due retry first, then the next unsent ask.
+            while outstanding.len() < in_flight.get() {
+                let now = Instant::now();
+                let idx = if let Some(pos) = retries.iter().position(|(due, _)| *due <= now) {
+                    retries.swap_remove(pos).1
+                } else if next < asks.len()
+                    && !(self.would_change_open_text(&asks[next])
+                        && (!outstanding.is_empty() || !retries.is_empty()))
+                {
+                    next += 1;
+                    next - 1
+                } else {
+                    break;
+                };
+                let ask = &asks[idx];
+                let sent = match ask.open {
+                    Some((path, content)) => self.ensure_open(path, content),
+                    None => Ok(()),
+                }
+                .and_then(|()| self.send_request(method, ask.params.clone(), tx.clone()));
+                match sent {
+                    Ok(id) => {
+                        let at = Instant::now();
+                        first_sent[idx].get_or_insert(at);
+                        outstanding.insert(id, (idx, at + self.call_timeout));
+                    }
+                    Err(e) => answers[idx] = Some(Err(e)),
+                }
             }
-            if Instant::now() > deadline {
-                return Err(LspError::QueryDeadline {
-                    method: method.to_string(),
-                    path: path.to_string(),
-                    after: self.query_deadline,
-                    last,
-                });
+            if outstanding.is_empty() && retries.is_empty() && next >= asks.len() {
+                break;
             }
-            thread::sleep(self.query_retry);
+            // Sleep until the next answer, the next request to run out, or —
+            // when the window has room for it — the next retry falls due.
+            let room = outstanding.len() < in_flight.get();
+            let wake = outstanding
+                .values()
+                .map(|(_, expires)| *expires)
+                .chain(retries.iter().filter(|_| room).map(|(due, _)| *due))
+                .min();
+            let wait = wake.map_or(Duration::ZERO, |at| {
+                at.saturating_duration_since(Instant::now())
+            });
+            let failed: Vec<(usize, LspError)> = match rx.recv_timeout(wait) {
+                Ok((id, outcome)) => match outstanding.remove(&id) {
+                    Some((idx, _)) => match outcome_result(method, outcome) {
+                        Ok(v) => {
+                            answers[idx] = Some(Ok(v));
+                            Vec::new()
+                        }
+                        Err(e) => vec![(idx, e)],
+                    },
+                    // The answer to a request already given up on.
+                    None => Vec::new(),
+                },
+                Err(_) => {
+                    let now = Instant::now();
+                    let expired: Vec<u64> = outstanding
+                        .iter()
+                        .filter(|(_, (_, expires))| *expires <= now)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    expired
+                        .into_iter()
+                        .filter_map(|id| {
+                            lock(&self.pending).remove(&id);
+                            outstanding.remove(&id)
+                        })
+                        .map(|(idx, _)| {
+                            let e = LspError::Timeout {
+                                method: method.to_string(),
+                                after: self.call_timeout,
+                            };
+                            (idx, e)
+                        })
+                        .collect()
+                }
+            };
+            for (idx, e) in failed {
+                if is_fatal_transport(&e) {
+                    answers[idx] = Some(Err(e));
+                    continue;
+                }
+                let started = first_sent[idx].unwrap_or_else(Instant::now);
+                if Instant::now() > started + self.query_deadline {
+                    answers[idx] = Some(Err(LspError::QueryDeadline {
+                        method: method.to_string(),
+                        path: asks[idx].path.to_string(),
+                        after: self.query_deadline,
+                        last: e.to_string(),
+                    }));
+                } else {
+                    retries.push((Instant::now() + self.query_retry, idx));
+                }
+            }
         }
+        // The loop ends only once every ask is sent and none is outstanding or
+        // due a retry, and each of those ends with its answer recorded.
+        answers
+            .into_iter()
+            .map(|answer| answer.expect("every ask ends with an outcome"))
+            .collect()
+    }
+
+    /// Whether opening `ask`'s document would replace text the server
+    /// already holds for it.
+    fn would_change_open_text(&self, ask: &Ask<'_>) -> bool {
+        ask.open.is_some_and(|(path, content)| {
+            self.open_docs
+                .get(&file_uri(path).to_string())
+                .is_some_and(|held| held != content)
+        })
     }
 
     /// Holds `path` open with `content` ([`Client::ensure_open`], so the
@@ -3565,24 +3905,42 @@ impl Client {
         line: u32,
         col: u32,
     ) -> Result<Vec<CallTarget>, LspError> {
-        const METHOD: &str = "textDocument/prepareCallHierarchy";
         self.ensure_open(path, content)?;
-        let params = json!({
-            "textDocument": {"uri": file_uri(path)},
-            "position": {"line": line, "character": col},
-        });
-        let v = self.query_with_retry(METHOD, path, params)?;
-        let items =
-            serde_json::from_value::<Option<Vec<lt::CallHierarchyItem>>>(v).map_err(|e| {
-                LspError::Rpc {
-                    method: METHOD.to_string(),
-                    message: format!("decode response: {e}"),
-                }
-            })?;
-        items
-            .unwrap_or_default()
+        let v = self.query_with_retry(
+            PREPARE_CALL_HIERARCHY,
+            path,
+            position_params(path, line, col),
+        )?;
+        decode_call_targets(v)
+    }
+
+    /// [`Client::prepare_call_hierarchy`] for every query in `queries`, with up
+    /// to `in_flight` requests sent and unanswered at once. Returns one
+    /// outcome per query, in the order given; each is the outcome the single
+    /// call gives for that query, its retries and error taxonomy included.
+    ///
+    /// The server answers in its own order and each answer is matched to its
+    /// query by request id. A query's document is opened just before its
+    /// request goes out; a query that would change the text of a document
+    /// already open waits until every earlier request is answered, so no
+    /// answer is given against text its query did not name. `in_flight` of
+    /// one is the single call, one query after another.
+    pub fn prepare_call_hierarchy_many(
+        &mut self,
+        queries: &[PositionQuery<'_>],
+        in_flight: NonZeroUsize,
+    ) -> Vec<Result<Vec<CallTarget>, LspError>> {
+        let asks = queries
             .iter()
-            .map(to_call_target)
+            .map(|q| Ask {
+                path: q.path,
+                open: Some((q.path, q.content)),
+                params: position_params(q.path, q.line, q.character),
+            })
+            .collect();
+        self.query_many(PREPARE_CALL_HIERARCHY, asks, in_flight)
+            .into_iter()
+            .map(|answer| answer.and_then(decode_call_targets))
             .collect()
     }
 
@@ -3594,35 +3952,34 @@ impl Client {
     /// NOT distinguish "the symbol calls nothing" from "the server is not
     /// ready to say"; gate with [`Client::await_ready`] first.
     pub fn outgoing_calls(&mut self, target: &CallTarget) -> Result<Vec<OutgoingCall>, LspError> {
-        const METHOD: &str = "callHierarchy/outgoingCalls";
         let params = json!({"item": target.item});
-        let v = self.query_with_retry(METHOD, &target.location.path, params)?;
-        let calls = serde_json::from_value::<Option<Vec<lt::CallHierarchyOutgoingCall>>>(v)
-            .map_err(|e| LspError::Rpc {
-                method: METHOD.to_string(),
-                message: format!("decode response: {e}"),
-            })?;
-        calls
-            .unwrap_or_default()
+        let v = self.query_with_retry(OUTGOING_CALLS, &target.location.path, params)?;
+        decode_outgoing_calls(target, v)
+    }
+
+    /// [`Client::outgoing_calls`] for every target in `targets`, with up to
+    /// `in_flight` requests sent and unanswered at once. Returns one outcome
+    /// per target, in the order given; each is the outcome the single call
+    /// gives for that target. Answers are matched to targets by request id,
+    /// whatever order the server sends them in. `in_flight` of one is the
+    /// single call, one target after another.
+    pub fn outgoing_calls_many(
+        &mut self,
+        targets: &[CallTarget],
+        in_flight: NonZeroUsize,
+    ) -> Vec<Result<Vec<OutgoingCall>, LspError>> {
+        let asks = targets
             .iter()
-            .map(|c| {
-                Ok(OutgoingCall {
-                    to: to_call_target(&c.to)?,
-                    // `fromRanges` are spans in the CALLER's file, so they take
-                    // the caller's path — the callee's would misattribute them.
-                    call_sites: c
-                        .from_ranges
-                        .iter()
-                        .map(|r| SymbolLocation {
-                            path: target.location.path.clone(),
-                            start_line: r.start.line,
-                            start_char: r.start.character,
-                            end_line: r.end.line,
-                            end_char: r.end.character,
-                        })
-                        .collect(),
-                })
+            .map(|t| Ask {
+                path: &t.location.path,
+                open: None,
+                params: json!({"item": t.item}),
             })
+            .collect();
+        self.query_many(OUTGOING_CALLS, asks, in_flight)
+            .into_iter()
+            .zip(targets)
+            .map(|(answer, target)| answer.and_then(|v| decode_outgoing_calls(target, v)))
             .collect()
     }
 
@@ -4477,7 +4834,10 @@ fn read_loop(
             if arm != 0 && arm == id {
                 let _ = diags.try_send(DiagMsg::Barrier(id));
             }
-            if let Some(tx) = lock(&pending).remove(&id) {
+            // Bind before matching: a guard held across the `if let` body would
+            // keep the map locked while the waiter is woken.
+            let waiter = lock(&pending).remove(&id);
+            if let Some(tx) = waiter {
                 let outcome = match obj.get("error") {
                     Some(e) if !e.is_null() => RpcOutcome::Err(
                         e.get("message")
@@ -4487,7 +4847,8 @@ fn read_loop(
                     ),
                     _ => RpcOutcome::Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
                 };
-                let _ = tx.send(outcome);
+                // A waiter that gave up has dropped its receiver; nothing to tell.
+                let _ = tx.send((id, outcome));
             }
         }
     }
@@ -4496,8 +4857,8 @@ fn read_loop(
     // corpse. `Release` pairs with the `Acquire` loads in `call`/`diagnostics`.
     dead.store(true, Ordering::Release);
     // Fail any callers still waiting.
-    for (_, tx) in lock(&pending).drain() {
-        let _ = tx.send(RpcOutcome::Closed);
+    for (id, tx) in lock(&pending).drain() {
+        let _ = tx.send((id, RpcOutcome::Closed));
     }
 }
 
@@ -6685,19 +7046,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --lib -- --ignored"]
     fn warm_real_server_double_rename() {
-        // Env-gated real-server tier (rust-analyzer): render two renames
-        // through ONE pooled server, proving the warm-reuse didOpen/didClose
-        // handshake keeps a real server usable. Loud SKIP when rust-analyzer
-        // is absent or the tier is not opted in — never a false pass.
-        if std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() != Some("1") {
-            eprintln!("SKIP warm_real_server_double_rename: set BAGE_LSP_REAL_TEST=1 to run");
-            return;
-        }
-        if !command_on_path("rust-analyzer") {
-            eprintln!("SKIP warm_real_server_double_rename: rust-analyzer not on PATH");
-            return;
-        }
+        // Real-server tier (rust-analyzer): render two renames through ONE
+        // pooled server, proving the warm-reuse didOpen/didClose handshake
+        // keeps a real server usable. `#[ignore]`d, so a default run reports
+        // it as ignored; selected, a missing opt-in or server FAILS.
+        assert!(
+            std::env::var("BAGE_LSP_REAL_TEST").ok().as_deref() == Some("1"),
+            "the real-server tier needs BAGE_LSP_REAL_TEST=1 (and rust-analyzer on PATH)"
+        );
+        assert!(
+            command_on_path("rust-analyzer"),
+            "the real-server tier needs rust-analyzer on PATH"
+        );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(
@@ -10251,6 +10613,422 @@ mod tests {
             "no call-hierarchy symbol here is an answer, not a failure"
         );
         assert_eq!(count(&log, "textDocument/prepareCallHierarchy"), 1);
+    }
+
+    // ---- pipelined call-hierarchy batches ----
+
+    /// What a reordering server saw: each message's method and params, and
+    /// how many requests it was holding unanswered when the message arrived.
+    type Seen = Arc<Mutex<Vec<(String, Value, usize)>>>;
+
+    /// A server that answers OUT OF ORDER: it holds requests until `hold`
+    /// are waiting, or until no message has come for 50 ms, then answers the
+    /// held ones newest first. `answer` gives a request's outcome; `None`
+    /// leaves it unanswered. Returns what it saw and the most requests it
+    /// ever held at once — the evidence that the client kept several in
+    /// flight.
+    fn spawn_reordering_server(
+        server_conn: (PipeReader, PipeWriter),
+        hold: usize,
+        mut answer: impl FnMut(&str, &Value) -> Option<Result<Value, String>> + Send + 'static,
+    ) -> (Seen, Arc<AtomicUsize>) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (reader, mut w) = server_conn;
+        let (msg_tx, msg_rx) = mpsc::channel::<Value>();
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                if let Ok(msg) = serde_json::from_slice::<Value>(&body)
+                    && msg_tx.send(msg).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let (sink, high) = (Arc::clone(&seen), Arc::clone(&peak));
+        thread::spawn(move || {
+            let mut held: Vec<(Value, String, Value)> = Vec::new();
+            loop {
+                match msg_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(msg) => {
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                        lock(&sink).push((method.to_string(), params.clone(), held.len()));
+                        match method {
+                            "initialize" => {
+                                reply_ok(&mut w, &id, json!({"capabilities": {}}));
+                                continue;
+                            }
+                            "shutdown" => {
+                                reply_ok(&mut w, &id, Value::Null);
+                                continue;
+                            }
+                            "exit" => break,
+                            _ if id.is_null() => continue,
+                            _ => {
+                                held.push((id, method.to_string(), params));
+                                high.fetch_max(held.len(), Ordering::SeqCst);
+                                if held.len() < hold {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                while let Some((id, method, params)) = held.pop() {
+                    match answer(&method, &params) {
+                        Some(Ok(result)) => reply_ok(&mut w, &id, result),
+                        Some(Err(message)) => reply_err(&mut w, &id, &message),
+                        None => {}
+                    }
+                }
+            }
+        });
+        (seen, peak)
+    }
+
+    /// A `CallHierarchyItem` named `name` on line `line` of `path`.
+    fn call_item(name: &str, path: &str, line: u32) -> Value {
+        json!({
+            "name": name,
+            "kind": 12,
+            "uri": file_uri(path).to_string(),
+            "range": {
+                "start": {"line": line, "character": 0},
+                "end": {"line": line, "character": 20},
+            },
+            "selectionRange": {
+                "start": {"line": line, "character": 3},
+                "end": {"line": line, "character": 3 + name.len()},
+            },
+        })
+    }
+
+    fn call_target(name: &str, path: &str, line: u32) -> CallTarget {
+        let item: lt::CallHierarchyItem = serde_json::from_value(call_item(name, path, line))
+            .expect("a well-formed call hierarchy item");
+        to_call_target(&item).expect("target")
+    }
+
+    /// The one callee a reordering server reports for the target `params`
+    /// asks about: named after the caller, so a mismatched answer shows.
+    fn callee_of(params: &Value) -> Value {
+        let name = params["item"]["name"].as_str().unwrap_or("?");
+        json!([{
+            "to": call_item(&format!("callee_of_{name}"), "/work/dep.rs", 0),
+            "fromRanges": [],
+        }])
+    }
+
+    fn in_flight(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("nonzero")
+    }
+
+    #[test]
+    fn outgoing_calls_many_matches_each_answer_to_its_target_when_replies_reorder() {
+        let (client_conn, server_conn) = conn_pair();
+        // Holds more than the limit, so a client that sent more would show.
+        let (_, peak) = spawn_reordering_server(server_conn, 6, |method, params| {
+            (method == OUTGOING_CALLS).then(|| Ok(callee_of(params)))
+        });
+        let mut c = query_client(client_conn);
+        let targets: Vec<CallTarget> = (0..10)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        let answers = c.outgoing_calls_many(&targets, in_flight(4));
+        assert_eq!(answers.len(), targets.len(), "one outcome per target");
+        for (i, answer) in answers.into_iter().enumerate() {
+            let calls = answer.unwrap_or_else(|e| panic!("t{i}: {e}"));
+            let names: Vec<&str> = calls.iter().map(|c| c.to.name.as_str()).collect();
+            assert_eq!(
+                names,
+                [format!("callee_of_t{i}")],
+                "answer {i} is t{i}'s own"
+            );
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            4,
+            "the server held four requests at once: the client pipelined up to its limit, no further"
+        );
+    }
+
+    #[test]
+    fn prepare_call_hierarchy_many_opens_each_document_once_before_its_questions() {
+        let (client_conn, server_conn) = conn_pair();
+        let (seen, peak) = spawn_reordering_server(server_conn, 5, |method, params| {
+            (method == PREPARE_CALL_HIERARCHY).then(|| {
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("?");
+                let path = uri_str_to_path(uri);
+                let line = params["position"]["line"].as_u64().unwrap_or(0) as u32;
+                let name = format!("{}@{line}", path.rsplit('/').next().unwrap_or("?"));
+                Ok(json!([call_item(&name, &path, line)]))
+            })
+        });
+        let mut c = query_client(client_conn);
+        let files = [
+            ("/work/a.rs", "fn a0() {}\nfn a1() {}\nfn a2() {}\n"),
+            ("/work/b.rs", "fn b0() {}\nfn b1() {}\nfn b2() {}\n"),
+            ("/work/c.rs", "fn c0() {}\nfn c1() {}\nfn c2() {}\n"),
+        ];
+        let queries: Vec<PositionQuery<'_>> = files
+            .iter()
+            .flat_map(|(path, content)| {
+                (0..3).map(move |line| PositionQuery {
+                    path,
+                    content,
+                    line,
+                    character: 3,
+                })
+            })
+            .collect();
+        let answers = c.prepare_call_hierarchy_many(&queries, in_flight(3));
+        for (q, answer) in queries.iter().zip(answers) {
+            let targets = answer.unwrap_or_else(|e| panic!("{}:{}: {e}", q.path, q.line));
+            let file = q.path.rsplit('/').next().unwrap_or("?");
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].name, format!("{file}@{}", q.line));
+            assert_eq!(targets[0].location.path, q.path);
+        }
+        let seen = lock(&seen).clone();
+        for (path, _) in files {
+            let uri = file_uri(path).to_string();
+            let about = |params: &Value| params["textDocument"]["uri"] == json!(uri);
+            let opens: Vec<usize> = (0..seen.len())
+                .filter(|&i| seen[i].0 == "textDocument/didOpen" && about(&seen[i].1))
+                .collect();
+            let first_question = (0..seen.len())
+                .find(|&i| seen[i].0 == PREPARE_CALL_HIERARCHY && about(&seen[i].1))
+                .expect("asked");
+            assert_eq!(opens.len(), 1, "{path} opened once for three questions");
+            assert!(
+                opens[0] < first_question,
+                "{path} opened before it is asked about"
+            );
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 3, "pipelined up to the limit");
+    }
+
+    #[test]
+    fn in_flight_one_sends_one_request_at_a_time() {
+        let (client_conn, server_conn) = conn_pair();
+        let (_, peak) = spawn_reordering_server(server_conn, 8, |method, params| {
+            (method == OUTGOING_CALLS).then(|| Ok(callee_of(params)))
+        });
+        let mut c = query_client(client_conn);
+        let targets: Vec<CallTarget> = (0..4)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        for answer in c.outgoing_calls_many(&targets, NonZeroUsize::MIN) {
+            answer.expect("answered");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "never two unanswered at once"
+        );
+    }
+
+    #[test]
+    fn a_refused_request_in_a_batch_is_retried_without_holding_up_the_rest() {
+        let (client_conn, server_conn) = conn_pair();
+        let asked = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let tally = Arc::clone(&asked);
+        spawn_reordering_server(server_conn, 4, move |method, params| {
+            if method != OUTGOING_CALLS {
+                return None;
+            }
+            let name = params["item"]["name"].as_str().unwrap_or("?").to_string();
+            let n = {
+                let mut tally = lock(&tally);
+                let n = tally.entry(name.clone()).or_default();
+                *n += 1;
+                *n
+            };
+            Some(match name.as_str() {
+                "t3" if n == 1 => Err("content modified".to_string()),
+                "t5" => Err("still indexing".to_string()),
+                _ => Ok(callee_of(params)),
+            })
+        });
+        let mut c = query_client(client_conn);
+        let targets: Vec<CallTarget> = (0..8)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        let answers = c.outgoing_calls_many(&targets, in_flight(4));
+        for (i, answer) in answers.into_iter().enumerate() {
+            if i == 5 {
+                match answer {
+                    Err(LspError::QueryDeadline {
+                        method, path, last, ..
+                    }) => {
+                        assert_eq!(method, OUTGOING_CALLS);
+                        assert_eq!(path, "/work/main.rs");
+                        assert!(last.contains("still indexing"), "{last}");
+                    }
+                    other => panic!("t5 is refused forever: want QueryDeadline, got {other:?}"),
+                }
+                continue;
+            }
+            let calls = answer.unwrap_or_else(|e| panic!("t{i}: {e}"));
+            assert_eq!(calls[0].to.name, format!("callee_of_t{i}"));
+        }
+        let asked = lock(&asked).clone();
+        assert_eq!(asked["t3"], 2, "a refusal is retried once it is answered");
+        assert!(asked["t5"] > 1, "a refusal is retried until the deadline");
+        for i in [0, 1, 2, 4, 6, 7] {
+            assert_eq!(
+                asked[&format!("t{i}")],
+                1,
+                "t{i} answered first time, asked once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_answer_to_an_abandoned_request_is_never_taken_for_its_retry() {
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        // Holds t1's first request unanswered past the client's call timeout,
+        // then answers it WRONGLY just before answering t1's retry rightly.
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut abandoned: Option<Value> = None;
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                if msg.get("method").and_then(Value::as_str) != Some(OUTGOING_CALLS) {
+                    continue;
+                }
+                if params["item"]["name"] == json!("t1") {
+                    match abandoned.take() {
+                        None => {
+                            abandoned = Some(id);
+                            continue;
+                        }
+                        Some(old) => {
+                            let wrong = json!({"item": {"name": "stale"}});
+                            reply_ok(&mut w, &old, callee_of(&wrong));
+                        }
+                    }
+                }
+                reply_ok(&mut w, &id, callee_of(&params));
+            }
+        });
+        let mut c = query_client(client_conn);
+        c.call_timeout = Duration::from_millis(100);
+        c.query_deadline = Duration::from_secs(5);
+        let targets: Vec<CallTarget> = (0..3)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        let answers = c.outgoing_calls_many(&targets, in_flight(3));
+        for (i, answer) in answers.into_iter().enumerate() {
+            let calls = answer.unwrap_or_else(|e| panic!("t{i}: {e}"));
+            assert_eq!(
+                calls[0].to.name,
+                format!("callee_of_t{i}"),
+                "the answer to the request given up on must not stand in for the retry's"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_an_open_document_waits_for_every_earlier_question() {
+        let (client_conn, server_conn) = conn_pair();
+        let (seen, _) = spawn_reordering_server(server_conn, 4, |method, params| {
+            (method == PREPARE_CALL_HIERARCHY).then(|| {
+                let line = params["position"]["line"].as_u64().unwrap_or(0) as u32;
+                Ok(json!([call_item(&format!("f{line}"), "/work/a.rs", line)]))
+            })
+        });
+        let mut c = query_client(client_conn);
+        let queries = [
+            PositionQuery {
+                path: "/work/a.rs",
+                content: "fn f0() {}\n",
+                line: 0,
+                character: 3,
+            },
+            PositionQuery {
+                path: "/work/a.rs",
+                content: "fn f0() {}\nfn f1() {}\n",
+                line: 1,
+                character: 3,
+            },
+        ];
+        let answers = c.prepare_call_hierarchy_many(&queries, in_flight(4));
+        assert_eq!(answers[0].as_ref().expect("first")[0].name, "f0");
+        assert_eq!(answers[1].as_ref().expect("second")[0].name, "f1");
+        let seen = lock(&seen).clone();
+        let opens: Vec<&(String, Value, usize)> = seen
+            .iter()
+            .filter(|(m, _, _)| m == "textDocument/didOpen")
+            .collect();
+        assert_eq!(opens.len(), 2, "the second text replaces the first");
+        assert_eq!(
+            opens[1].2, 0,
+            "the new text went out only once the question about the old text was answered"
+        );
+        assert_eq!(
+            opens[1].1["textDocument"]["text"],
+            json!("fn f0() {}\nfn f1() {}\n")
+        );
+    }
+
+    #[test]
+    fn a_lost_connection_fails_the_rest_of_a_batch_fast_and_fatally() {
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut w) = server_conn;
+        // Answers two questions, then goes away mid-batch.
+        thread::spawn(move || {
+            let mut r = BufReader::new(reader);
+            let mut answered = 0;
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                if msg.get("method").and_then(Value::as_str) != Some(OUTGOING_CALLS) {
+                    continue;
+                }
+                if answered == 2 {
+                    return;
+                }
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                reply_ok(&mut w, &id, callee_of(&msg["params"]));
+                answered += 1;
+            }
+        });
+        let mut c = query_client(client_conn);
+        c.query_deadline = Duration::from_secs(30);
+        let targets: Vec<CallTarget> = (0..8)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        let start = Instant::now();
+        let answers = c.outgoing_calls_many(&targets, in_flight(4));
+        assert!(start.elapsed() < Duration::from_secs(5), "failed fast");
+        let mut answers = answers.into_iter();
+        for i in 0..2 {
+            let calls = answers
+                .next()
+                .expect("answer")
+                .expect("answered before the loss");
+            assert_eq!(calls[0].to.name, format!("callee_of_t{i}"));
+        }
+        for (i, answer) in answers.enumerate() {
+            let err = answer.expect_err("no server to answer");
+            assert!(
+                is_fatal_transport(&err),
+                "t{}: want a fatal transport error the pool respawns on, got {err:?}",
+                i + 2
+            );
+        }
     }
 
     /// A query server whose `initialize` advertises `caps`, then answers the
