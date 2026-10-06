@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — a server started in its workspace, pipelined call-hierarchy batches (source break)
+
+### Source break, and the fix
+
+- **`lsp::LspError` has a new variant**, `WorkingDir { dir, source }`. An exhaustive match adds it.
+
+### Added
+
+- `lsp::Client::new_stdio_in(command, dir)`: starts the server in `dir`, so a toolchain manager's
+  proxy (rustup) reads the workspace's `rust-toolchain.toml`. A `dir` that is not a directory is
+  refused with `LspError::WorkingDir` before anything starts. An inherited `RUSTUP_TOOLCHAIN` still
+  outranks the file — rustup's cargo proxy sets it for every process cargo runs.
+- `lsp::Client::prepare_call_hierarchy_many(queries, in_flight)` with `lsp::PositionQuery`, and
+  `lsp::Client::outgoing_calls_many(targets, in_flight)`: up to `in_flight` requests outstanding on
+  one server, answers matched to questions by request id, one outcome per input in input order,
+  each with the single call's retry and error discipline. Changing an open document's text waits
+  until every earlier request is answered.
+
 ## 0.15.0 — one parse per file, positions without text scans, `_` names nothing, open once (source breaks)
 
 `Block`, every fact and scope shape, and `region_hash` are unchanged. **Three source breaks for a
