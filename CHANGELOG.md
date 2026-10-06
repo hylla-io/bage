@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — a server started in its workspace, pipelined call-hierarchy batches (source break)
+## 0.16.0 — a server started in its workspace, pipelined call-hierarchy batches (source break)
 
 ### Source break, and the fix
 
