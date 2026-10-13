@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — a query answered while the server is loading is asked again (source break)
+
+### Source break, and the fix
+
+- **`lsp::LspError` has a new variant**, `NotReadyDeadline { method, path, after, signal, latest,
+  withdrawals }`. An exhaustive match adds it.
+
+### Fixed
+
+- **A query is never answered by a server that said it was loading.** With
+  `ClientConfig::ready_signals` declared, every code-navigation query — `definition`,
+  `type_definition`, `hover`, `implementation`, `pull_diagnostics`, the call and type hierarchy, and
+  the `_many` batches — sends nothing while a signal does not hold, and takes an answer only if every
+  signal held when it was asked AND when it was answered, with no withdrawal in between. Any other
+  answer, empty or not, is asked again once the signals hold. Measured on a cold rust-analyzer run:
+  the signal was withdrawn mid-batch, and 2,944 `prepareCallHierarchy` and 1,284 `outgoingCalls`
+  answers given while it was withdrawn came back empty and were taken as final, so whole files lost
+  their call edges depending on machine load.
+- A query that gets no ready answer within `query_deadline` (from its first send, or, for one not
+  yet sent, from when the server stopped being ready) fails with `LspError::NotReadyDeadline`,
+  naming the signal that does not hold, the server's latest params for it, and how many times the
+  signal was withdrawn while the batch ran. A dead connection still fails at once with `Closed`.
+- With no signal declared every answer is taken, as before. A `ReadyMode::Once` signal holds
+  answers back only until it is first met.
+
+### Added
+
+- `lsp::Client::ready_withdrawals()`: how many times the declared ready signals stopped holding
+  over the client's life.
+
+### Tests
+
+- Fakes for a server that reloads mid-batch, one that reloads around every answer, one that never
+  restores, and one that dies while answers are held; positive controls for no signal, a holding
+  `Latest` signal and a met `Once` signal.
+- Real tier (`BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored`): a batch asked
+  straight after the handshake equals the settled answers (on the old behaviour all 45 questions
+  came back empty), and a batch fired at a real `Cargo.toml` reload still answers completely.
+
 ## 0.16.0 — a server started in its workspace, pipelined call-hierarchy batches (source break)
 
 ### Source break, and the fix
