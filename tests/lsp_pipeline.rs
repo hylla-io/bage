@@ -12,7 +12,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bage::lsp::{self, CallTarget, Client, ClientConfig, LspError, PositionQuery, SymbolLocation};
+use bage::lsp::{
+    self, CallTarget, Client, ClientConfig, LspError, PositionQuery, ReadyMode, ReadySignal,
+    SymbolLocation,
+};
 
 /// A stdio child that prints the physical directory it started in to stderr,
 /// then waits.
@@ -334,5 +337,179 @@ fn pipelined_call_hierarchy_equals_one_at_a_time_against_rust_analyzer() {
     );
     assert_eq!(calls_of("f0"), ["helper"]);
 
+    c.close().expect("close");
+}
+
+// ---- rust-analyzer: a reload in the middle of a batch ----
+
+/// Per question its targets, and per target its callees.
+type Graph = (Vec<Vec<(String, SymbolLocation)>>, Vec<Vec<Edge>>);
+
+/// Every target the questions resolve to, and every target's callees, asked
+/// as two pipelined batches.
+fn pipelined_graph(c: &mut Client, queries: &[PositionQuery<'_>]) -> Graph {
+    let eight = NonZeroUsize::new(8).expect("nonzero");
+    let mut keys = Vec::new();
+    let mut targets: Vec<CallTarget> = Vec::new();
+    for (q, answer) in queries
+        .iter()
+        .zip(c.prepare_call_hierarchy_many(queries, eight))
+    {
+        let got = answer.unwrap_or_else(|e| panic!("{}:{}: {e}", q.path, q.line));
+        keys.push(got.iter().map(target_key).collect::<Vec<_>>());
+        targets.extend(got);
+    }
+    let edges = c
+        .outgoing_calls_many(&targets, eight)
+        .into_iter()
+        .map(|answer| {
+            answer
+                .expect("outgoing")
+                .into_iter()
+                .map(|o| (o.to.name, o.to.location, o.call_sites))
+                .collect()
+        })
+        .collect();
+    (keys, edges)
+}
+
+/// rust-analyzer in `root`, declared ready only while it says it is
+/// quiescent, with a query deadline that covers a cold load.
+fn quiescent_rust_analyzer(root: &Path) -> Client {
+    let mut c = Client::new_stdio_in(&["rust-analyzer".to_string()], root)
+        .unwrap_or_else(|e| panic!("spawn rust-analyzer: {e}"));
+    c.configure(ClientConfig {
+        initialize_timeout: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(60),
+        query_deadline: Duration::from_secs(120),
+        ready_deadline: Duration::from_secs(120),
+        ready_retry: Duration::from_millis(250),
+        experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
+        ready_signals: vec![ReadySignal {
+            method: "experimental/serverStatus".to_string(),
+            when: serde_json::json!({"quiescent": true}),
+            mode: ReadyMode::Latest,
+        }],
+        ..ClientConfig::default()
+    });
+    c
+}
+
+/// rust-analyzer stops being quiescent while it reloads its workspace.
+/// Rewriting `Cargo.toml` makes its file watcher reload; the batch is fired
+/// the moment the client sees the withdrawal, so it is asked while the
+/// server is loading, and must still end with the settled answers rather
+/// than a deadline or a hang. Withdrawal timing is the server's, so a run
+/// that never saw one fails rather than passing on nothing.
+///
+/// This case does NOT tell the hold from its absence: on a fixture this
+/// small rust-analyzer answers completely through a manifest reload, and
+/// it passed with the hold removed. The case that does is
+/// `a_batch_asked_before_rust_analyzer_has_loaded_equals_the_settled_answers`.
+#[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored"]
+fn a_batch_asked_while_rust_analyzer_reloads_equals_the_settled_answers() {
+    require_real_tier();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root: PathBuf = dir.path().canonicalize().expect("canonical root");
+    write_fixture(&root);
+    let mut c = quiescent_rust_analyzer(&root);
+    c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
+        .expect("initialize");
+    let a = root.join("src/a.rs");
+    let a_text = fs::read_to_string(&a).expect("read a.rs");
+    c.await_ready(a.to_str().expect("utf-8"), &a_text, 3, 4)
+        .expect("ready");
+
+    let decls = declarations(&root);
+    let queries: Vec<PositionQuery<'_>> = decls
+        .iter()
+        .map(|(path, content, line, character)| PositionQuery {
+            path,
+            content,
+            line: *line,
+            character: *character,
+        })
+        .collect();
+    let settled = pipelined_graph(&mut c, &queries);
+    assert!(
+        settled.1.iter().any(|edges| !edges.is_empty()),
+        "the baseline has edges: equal empties would prove nothing"
+    );
+
+    let before = c.ready_withdrawals();
+    let manifest = root.join("Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).expect("read manifest");
+    text.push_str("\n[features]\nreload = []\n");
+    fs::write(&manifest, text).expect("rewrite manifest");
+    let until = Instant::now() + Duration::from_secs(60);
+    while c.ready_withdrawals() == before {
+        assert!(
+            Instant::now() < until,
+            "rust-analyzer never withdrew its signal after the manifest changed; this run proves nothing"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let started = Instant::now();
+    let reloading = pipelined_graph(&mut c, &queries);
+    eprintln!(
+        "rust-analyzer: batch fired at the withdrawal took {:?}; withdrawals {} -> {}",
+        started.elapsed(),
+        before,
+        c.ready_withdrawals()
+    );
+    assert_eq!(
+        reloading.0, settled.0,
+        "the same targets, in query order, as when settled"
+    );
+    assert_eq!(
+        reloading.1, settled.1,
+        "the same callees and call sites, per target, as when settled"
+    );
+    c.close().expect("close");
+}
+
+/// The same rule before rust-analyzer has EVER been quiescent: a batch asked
+/// straight after the handshake, with no readiness wait, is held until the
+/// server first says it is done loading. Without the hold it is answered
+/// from a workspace not yet loaded, and comes back short.
+#[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_pipeline -- --ignored"]
+fn a_batch_asked_before_rust_analyzer_has_loaded_equals_the_settled_answers() {
+    require_real_tier();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root: PathBuf = dir.path().canonicalize().expect("canonical root");
+    write_fixture(&root);
+    let decls = declarations(&root);
+    let queries: Vec<PositionQuery<'_>> = decls
+        .iter()
+        .map(|(path, content, line, character)| PositionQuery {
+            path,
+            content,
+            line: *line,
+            character: *character,
+        })
+        .collect();
+    let mut c = quiescent_rust_analyzer(&root);
+    c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
+        .expect("initialize");
+    let cold = pipelined_graph(&mut c, &queries);
+    let a = root.join("src/a.rs");
+    let a_text = fs::read_to_string(&a).expect("read a.rs");
+    c.await_ready(a.to_str().expect("utf-8"), &a_text, 3, 4)
+        .expect("ready");
+    let settled = pipelined_graph(&mut c, &queries);
+    assert!(
+        settled.1.iter().any(|edges| !edges.is_empty()),
+        "the baseline has edges: equal empties would prove nothing"
+    );
+    assert_eq!(
+        cold.0, settled.0,
+        "the same targets, in query order, as when settled"
+    );
+    assert_eq!(
+        cold.1, settled.1,
+        "the same callees and call sites, per target, as when settled"
+    );
     c.close().expect("close");
 }

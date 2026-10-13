@@ -402,6 +402,32 @@ struct StatusWatch {
     /// The workspace root as declared and as the filesystem spells it, for
     /// naming documents relative to it.
     root: Option<(PathBuf, Option<PathBuf>)>,
+    /// Whether some declared signal does not hold now. Kept rather than
+    /// worked out on demand because the read loop stamps every response with
+    /// it; false by default because no signal declared is no signal unmet.
+    unmet: bool,
+    /// How many times every signal holding gave way to one not holding.
+    /// Readiness read at two moments cannot see a withdrawal that was
+    /// restored in between; a count can.
+    withdrawals: u64,
+}
+
+/// Whether a server's declared ready signals held at one moment, and how
+/// many times they had been withdrawn by then. Compared across a request's
+/// life, it says whether the server stayed ready from the question to the
+/// answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReadyStamp {
+    holds: bool,
+    withdrawals: u64,
+}
+
+impl ReadyStamp {
+    /// Whether an answer stamped `answered` to a question stamped `self` was
+    /// given by a server that stayed ready the whole time.
+    fn ready_throughout(self, answered: ReadyStamp) -> bool {
+        self.holds && answered.holds && self.withdrawals == answered.withdrawals
+    }
 }
 
 /// What a declared failure rule found: the method that carried it, the
@@ -479,6 +505,29 @@ impl StatusWatch {
         self.latest.retain(|method, _| {
             rules.iter().any(|r| &r.method == method) || signals.iter().any(|s| &s.method == method)
         });
+        // A declaration is not the server withdrawing anything, so it is not
+        // counted; the count carries over, so a stamp taken before stays
+        // comparable.
+        self.unmet = self.unmet_signal_at().is_some();
+    }
+
+    /// Re-reads whether every signal holds, counting a change from holding
+    /// to not holding as one withdrawal.
+    fn refresh_holds(&mut self) {
+        let unmet = self.unmet_signal_at().is_some();
+        if !self.unmet && unmet {
+            self.withdrawals += 1;
+        }
+        self.unmet = unmet;
+    }
+
+    /// Whether the declared signals hold now, and how often they were
+    /// withdrawn before.
+    fn stamp(&self) -> ReadyStamp {
+        ReadyStamp {
+            holds: !self.unmet,
+            withdrawals: self.withdrawals,
+        }
     }
 
     fn watches(&self, method: &str) -> bool {
@@ -511,23 +560,31 @@ impl StatusWatch {
             }
         }
         self.latest.insert(method.to_string(), params);
+        self.refresh_holds();
     }
 
     /// The first declared signal that does not hold, with the latest params
     /// seen for its method.
     fn unmet_signal(&self) -> Option<(ReadySignal, Option<Value>)> {
+        self.unmet_signal_at().map(|i| {
+            (
+                self.signals[i].clone(),
+                self.latest.get(&self.signals[i].method).cloned(),
+            )
+        })
+    }
+
+    /// The index of the first declared signal that does not hold.
+    fn unmet_signal_at(&self) -> Option<usize> {
         self.signals
             .iter()
             .zip(&self.met)
-            .find_map(|(signal, met)| {
-                let latest = self.latest.get(&signal.method);
-                let holds = match signal.mode {
-                    ReadyMode::Latest => {
-                        latest.is_some_and(|params| value_contains(params, &signal.when))
-                    }
-                    ReadyMode::Once => *met,
-                };
-                (!holds).then(|| (signal.clone(), latest.cloned()))
+            .position(|(signal, met)| match signal.mode {
+                ReadyMode::Latest => self
+                    .latest
+                    .get(&signal.method)
+                    .is_none_or(|params| !value_contains(params, &signal.when)),
+                ReadyMode::Once => !*met,
             })
     }
 
@@ -768,8 +825,14 @@ pub struct ClientConfig {
     pub rename_deadline: Duration,
     /// Pause between rename attempts. Default 300 ms.
     pub rename_retry: Duration,
-    /// Bounds a code-navigation query's retries against a refusing server.
-    /// Default 30 s.
+    /// Bounds a code-navigation query's retries against a refusing server,
+    /// and its wait for a server whose declared `ready_signals` do not hold:
+    /// counted from the query's first send, or, for one not yet sent, from
+    /// when the server stopped being ready. Default 30 s. A server that
+    /// reloads for longer than this fails the query with
+    /// [`LspError::NotReadyDeadline`] rather than answering it from a
+    /// half-loaded workspace, so declare one that covers the longest reload
+    /// the caller will wait out.
     pub query_deadline: Duration,
     /// Pause between query attempts. Default 300 ms.
     pub query_retry: Duration,
@@ -809,8 +872,10 @@ pub struct ClientConfig {
     /// decided by probing alone.
     pub ready_failures: Vec<ReadyFailure>,
     /// Server status notifications that must ALL match before
-    /// [`Client::await_ready`] probes. Default: none, so readiness is decided
-    /// by probing alone.
+    /// [`Client::await_ready`] probes, and while every code-navigation query
+    /// is asked and answered: an answer given while one does not hold is
+    /// asked again (see [`LspError::NotReadyDeadline`]). Default: none, so
+    /// readiness is decided by probing alone and every answer is taken.
     pub ready_signals: Vec<ReadySignal>,
     /// Diagnostics that end [`Client::await_ready`] at once, and fail
     /// [`Client::check_failures`], with a located
@@ -1044,7 +1109,9 @@ pub enum LspError {
     /// far more often ANSWERS with an empty result, which is indistinguishable
     /// on the wire from a genuine no-result and therefore never reaches this
     /// variant — see [`LspError::ReadyProbeDeadline`] and
-    /// [`Client::await_ready`] for the outcome that does carry readiness.
+    /// [`Client::await_ready`] for the outcome that does carry readiness, and
+    /// [`LspError::NotReadyDeadline`] for a query answered only while a
+    /// declared ready signal did not hold.
     #[error("lsp: {method} {path:?}: not ready after {after:?}: {last}")]
     QueryDeadline {
         /// The request method.
@@ -1055,6 +1122,51 @@ pub enum LspError {
         after: Duration,
         /// The last not-ready error observed.
         last: String,
+    },
+    /// A code-navigation query found no moment, within its deadline, when
+    /// the server was ready from question to answer: every declared
+    /// [`ReadySignal`] held when it was asked AND when it answered, with no
+    /// withdrawal in between.
+    ///
+    /// A server that withdraws its signal is loading again, and what it
+    /// answers meanwhile may be incomplete: rust-analyzer answers
+    /// `prepareCallHierarchy` and `outgoingCalls` EMPTY while it is not
+    /// quiescent. Such an answer is never returned. The query waits for the
+    /// signal to hold again and asks again, until `query_deadline` from its
+    /// first send (or, for a query never sent, until the signal has stayed
+    /// withdrawn that long), and then fails with this.
+    ///
+    /// Only a declared signal can tell: with none declared every answer is
+    /// taken. A [`ReadyMode::Once`] signal is never withdrawn once met, so
+    /// it holds back answers only until then. The server's stderr is not
+    /// carried, because one stalled batch fails every query in it at once;
+    /// read it with [`Client::stderr_tail`].
+    #[error(
+        "lsp: {method} {path:?}: never answered while ready within {after:?} ({withdrawals} withdrawal(s) of the ready signal meanwhile); waiting on: {}; latest: {}",
+        .signal.as_ref().map_or_else(
+            || "none now, but one was withdrawn while the answer was on its way".to_string(),
+            |s| format!("{} {}", s.method, s.when)
+        ),
+        .latest.as_ref().map_or_else(|| "none".to_string(), |params| params.to_string())
+    )]
+    NotReadyDeadline {
+        /// The request method.
+        method: String,
+        /// The file the query targeted.
+        path: String,
+        /// The configured query deadline.
+        after: Duration,
+        /// The declared signal that did not hold when the query gave up;
+        /// `None` when every signal held then, and the last answer was
+        /// refused only because a withdrawal fell while it was on its way.
+        /// Boxed, as `latest` is, because both hold JSON of any size.
+        signal: Option<Box<ReadySignal>>,
+        /// The latest params the server sent for that signal's method;
+        /// `None` when it sent none, or when `signal` is `None`.
+        latest: Option<Box<Value>>,
+        /// How many times the server withdrew its signal while the batch
+        /// this query belongs to ran.
+        withdrawals: u64,
     },
     /// [`Client::await_ready`] waited its whole deadline for a declared
     /// [`ReadySignal`] the server never sent (or sent and withdrew), so the
@@ -2395,10 +2507,16 @@ fn outcome_result(method: &str, outcome: RpcOutcome) -> Result<Value, LspError> 
     }
 }
 
+/// A response as the read loop routes it: the request id, the outcome, and
+/// the server's readiness when the response arrived. The read loop takes
+/// each frame in the order the server wrote it, so the stamp counts every
+/// status the server sent ahead of the response and none it sent after.
+type Answered = (u64, RpcOutcome, ReadyStamp);
+
 /// The table of in-flight requests, keyed by request id. Each outcome is sent
 /// with its id, so several requests can share one channel and a pipelined
 /// batch still knows which question an answer belongs to.
-type PendingMap = Arc<Mutex<HashMap<u64, Sender<(u64, RpcOutcome)>>>>;
+type PendingMap = Arc<Mutex<HashMap<u64, Sender<Answered>>>>;
 
 /// A thin synchronous LSP client over a spawned language-server subprocess
 /// (or any Read/Write pair via [`Client::from_conn`]). It exposes only the
@@ -2753,6 +2871,15 @@ impl Client {
         lock(&self.stderr).snapshot()
     }
 
+    /// How many times the declared [`ClientConfig::ready_signals`] went from
+    /// all holding to one not holding, over this client's life. Each one is
+    /// the server saying it is loading again; a query answered across one is
+    /// asked again (see [`LspError::NotReadyDeadline`]). A caller can report
+    /// it, or compare it across a step to learn whether the server reloaded.
+    pub fn ready_withdrawals(&self) -> u64 {
+        lock(&self.status).stamp().withdrawals
+    }
+
     /// The bounds currently in force, including any set field by field.
     pub fn config(&self) -> ClientConfig {
         let (ready_failures, ready_signals, diagnostic_failures) = {
@@ -2791,7 +2918,7 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         let id = self.send_request(method, params, tx)?;
         match rx.recv_timeout(timeout) {
-            Ok((_, outcome)) => outcome_result(method, outcome),
+            Ok((_, outcome, _)) => outcome_result(method, outcome),
             Err(RecvTimeoutError::Disconnected) => Err(LspError::Closed {
                 method: method.to_string(),
             }),
@@ -2811,7 +2938,7 @@ impl Client {
         &mut self,
         method: &str,
         params: Value,
-        tx: Sender<(u64, RpcOutcome)>,
+        tx: Sender<Answered>,
     ) -> Result<u64, LspError> {
         // Reader dead: the read loop already exited, so no response can ever
         // arrive. Writing + blocking would burn the full `timeout` and return a
@@ -3253,10 +3380,19 @@ impl Client {
     /// invalidates and respawns a corpse instead of retrying it for the full
     /// deadline.
     ///
-    /// A SUCCESSFUL response is final, including `null` and `[]`: the spec's
-    /// way of saying the server looked and found nothing. Retrying it would
-    /// turn every genuine no-result — the common case when a graph builder
-    /// probes every identifier — into a deadline-long stall.
+    /// A SUCCESSFUL response given by a READY server is final, including
+    /// `null` and `[]`: the spec's way of saying the server looked and found
+    /// nothing. Retrying it would turn every genuine no-result — the common
+    /// case when a graph builder probes every identifier — into a
+    /// deadline-long stall.
+    ///
+    /// Ready means every declared [`ClientConfig::ready_signals`] held when
+    /// the request was sent and when its answer arrived, with no withdrawal
+    /// between. Nothing is sent while a signal does not hold, and an answer
+    /// that arrives across a withdrawal is asked again once the signals
+    /// hold. A query that never gets a ready answer ends in
+    /// [`LspError::NotReadyDeadline`]. With no signal declared every answer
+    /// counts, as before: bage has nothing to tell a loading server by.
     fn query_with_retry(
         &mut self,
         method: &str,
@@ -3289,6 +3425,17 @@ impl Client {
     /// ask's final outcome, and every ask still to be sent then fails fast on
     /// the dead connection with its own error.
     ///
+    /// Readiness is checked per answer, not per batch. The read loop stamps
+    /// each response with the declared signals' state as it routes it, so a
+    /// status the server sent ahead of the response is always counted and
+    /// one sent after never is. An answer is taken only if the signals held
+    /// when its request went out and when it came back, with no withdrawal
+    /// in between; otherwise it is asked again. While a signal does not hold
+    /// nothing is sent, new or again, and the loop looks again every
+    /// `query_retry`. An ask already sent ends at `query_deadline` from its
+    /// first send; one never sent ends once the server has stayed unready
+    /// for a whole `query_deadline`; both as [`LspError::NotReadyDeadline`].
+    ///
     /// Document sync stays in request order. An ask's document is opened just
     /// before its request is written, so the server sees every question after
     /// the text it asks about. Changing the text of a document the server
@@ -3305,14 +3452,28 @@ impl Client {
         let mut answers: Vec<Option<Result<Value, LspError>>> = asks.iter().map(|_| None).collect();
         // When each ask was first sent: the start of its `query_deadline`.
         let mut first_sent: Vec<Option<Instant>> = vec![None; asks.len()];
-        // Request id → (ask index, when its `call_timeout` runs out).
-        let mut outstanding: HashMap<u64, (usize, Instant)> = HashMap::new();
-        // (when it may go again, ask index), for asks a server refused.
+        // Request id → (ask index, when its `call_timeout` runs out, the
+        // server's readiness when it was sent).
+        let mut outstanding: HashMap<u64, (usize, Instant, ReadyStamp)> = HashMap::new();
+        // (when it may go again, ask index), for asks a server refused or
+        // answered while not ready.
         let mut retries: Vec<(Instant, usize)> = Vec::new();
+        // So an error counts only the withdrawals its own batch saw.
+        let withdrawn_before = lock(&self.status).stamp().withdrawals;
+        // Since when the declared signals have not held, while they do not.
+        let mut unready_since: Option<Instant> = None;
         let mut next = 0;
         loop {
             // Fill the window: a due retry first, then the next unsent ask.
             while outstanding.len() < in_flight.get() {
+                // A server that is not ready is asked nothing, new or again:
+                // it may answer from a half-loaded workspace. A dead one is
+                // asked anyway, so each ask fails fast on the closed
+                // connection.
+                let stamp = lock(&self.status).stamp();
+                if !stamp.holds && !self.dead.load(Ordering::Acquire) {
+                    break;
+                }
                 let now = Instant::now();
                 let idx = if let Some(pos) = retries.iter().position(|(due, _)| *due <= now) {
                     retries.swap_remove(pos).1
@@ -3335,7 +3496,7 @@ impl Client {
                     Ok(id) => {
                         let at = Instant::now();
                         first_sent[idx].get_or_insert(at);
-                        outstanding.insert(id, (idx, at + self.call_timeout));
+                        outstanding.insert(id, (idx, at + self.call_timeout, stamp));
                     }
                     Err(e) => answers[idx] = Some(Err(e)),
                 }
@@ -3343,25 +3504,36 @@ impl Client {
             if outstanding.is_empty() && retries.is_empty() && next >= asks.len() {
                 break;
             }
+            // The status watch cannot wake this loop, so while the server is
+            // not ready it looks again every `query_retry`.
+            let unready = self.is_unready();
+            if unready {
+                unready_since.get_or_insert_with(Instant::now);
+            }
             // Sleep until the next answer, the next request to run out, or —
-            // when the window has room for it — the next retry falls due.
-            let room = outstanding.len() < in_flight.get();
+            // when the window has room for it and the server is ready — the
+            // next retry falls due.
+            let room = outstanding.len() < in_flight.get() && !unready;
             let wake = outstanding
                 .values()
-                .map(|(_, expires)| *expires)
+                .map(|(_, expires, _)| *expires)
                 .chain(retries.iter().filter(|_| room).map(|(due, _)| *due))
+                .chain(unready.then(|| Instant::now() + self.query_retry))
                 .min();
             let wait = wake.map_or(Duration::ZERO, |at| {
                 at.saturating_duration_since(Instant::now())
             });
-            let failed: Vec<(usize, LspError)> = match rx.recv_timeout(wait) {
-                Ok((id, outcome)) => match outstanding.remove(&id) {
-                    Some((idx, _)) => match outcome_result(method, outcome) {
-                        Ok(v) => {
+            // `None` is an answer given while the server was not ready
+            // throughout.
+            let failed: Vec<(usize, Option<LspError>)> = match rx.recv_timeout(wait) {
+                Ok((id, outcome, answered)) => match outstanding.remove(&id) {
+                    Some((idx, _, asked)) => match outcome_result(method, outcome) {
+                        Ok(v) if asked.ready_throughout(answered) => {
                             answers[idx] = Some(Ok(v));
                             Vec::new()
                         }
-                        Err(e) => vec![(idx, e)],
+                        Ok(_) => vec![(idx, None)],
+                        Err(e) => vec![(idx, Some(e))],
                     },
                     // The answer to a request already given up on.
                     None => Vec::new(),
@@ -3370,7 +3542,7 @@ impl Client {
                     let now = Instant::now();
                     let expired: Vec<u64> = outstanding
                         .iter()
-                        .filter(|(_, (_, expires))| *expires <= now)
+                        .filter(|(_, (_, expires, _))| *expires <= now)
                         .map(|(id, _)| *id)
                         .collect();
                     expired
@@ -3379,32 +3551,70 @@ impl Client {
                             lock(&self.pending).remove(&id);
                             outstanding.remove(&id)
                         })
-                        .map(|(idx, _)| {
+                        .map(|(idx, _, _)| {
                             let e = LspError::Timeout {
                                 method: method.to_string(),
                                 after: self.call_timeout,
                             };
-                            (idx, e)
+                            (idx, Some(e))
                         })
                         .collect()
                 }
             };
             for (idx, e) in failed {
-                if is_fatal_transport(&e) {
-                    answers[idx] = Some(Err(e));
-                    continue;
-                }
+                let e = match e {
+                    Some(e) if is_fatal_transport(&e) => {
+                        answers[idx] = Some(Err(e));
+                        continue;
+                    }
+                    e => e,
+                };
                 let started = first_sent[idx].unwrap_or_else(Instant::now);
-                if Instant::now() > started + self.query_deadline {
-                    answers[idx] = Some(Err(LspError::QueryDeadline {
-                        method: method.to_string(),
-                        path: asks[idx].path.to_string(),
-                        after: self.query_deadline,
-                        last: e.to_string(),
-                    }));
-                } else {
-                    retries.push((Instant::now() + self.query_retry, idx));
+                let past = Instant::now() > started + self.query_deadline;
+                match e {
+                    Some(e) if past => {
+                        answers[idx] = Some(Err(LspError::QueryDeadline {
+                            method: method.to_string(),
+                            path: asks[idx].path.to_string(),
+                            after: self.query_deadline,
+                            last: e.to_string(),
+                        }));
+                    }
+                    Some(_) => retries.push((Instant::now() + self.query_retry, idx)),
+                    None if past => {
+                        let e = self.not_ready_deadline(method, asks[idx].path, withdrawn_before);
+                        answers[idx] = Some(Err(e));
+                    }
+                    // Asked again as soon as the server is ready; waiting for
+                    // that is the pause.
+                    None => retries.push((Instant::now(), idx)),
                 }
+            }
+            if !self.is_unready() {
+                unready_since = None;
+                continue;
+            }
+            // Nothing goes out while the server is not ready, so the
+            // deadlines of what waits to go out are kept here: an ask
+            // already sent counts from its first send, as a refused one
+            // does; one never sent ends once the server has stayed unready
+            // a whole `query_deadline`.
+            let now = Instant::now();
+            retries.retain(|&(_, idx)| {
+                let started = first_sent[idx].unwrap_or(now);
+                if now <= started + self.query_deadline {
+                    return true;
+                }
+                let e = self.not_ready_deadline(method, asks[idx].path, withdrawn_before);
+                answers[idx] = Some(Err(e));
+                false
+            });
+            if unready_since.is_some_and(|since| now > since + self.query_deadline) {
+                for idx in next..asks.len() {
+                    let e = self.not_ready_deadline(method, asks[idx].path, withdrawn_before);
+                    answers[idx] = Some(Err(e));
+                }
+                next = asks.len();
             }
         }
         // The loop ends only once every ask is sent and none is outstanding or
@@ -3413,6 +3623,30 @@ impl Client {
             .into_iter()
             .map(|answer| answer.expect("every ask ends with an outcome"))
             .collect()
+    }
+
+    /// Whether a declared ready signal does not hold on a live connection. A
+    /// dead connection is never waited on: nothing would ever restore it.
+    fn is_unready(&self) -> bool {
+        !self.dead.load(Ordering::Acquire) && !lock(&self.status).stamp().holds
+    }
+
+    /// The error for a query of `method` on `path` that was never answered
+    /// while the server was ready, naming the signal that does not hold now.
+    fn not_ready_deadline(&self, method: &str, path: &str, withdrawn_before: u64) -> LspError {
+        let status = lock(&self.status);
+        let (signal, latest) = match status.unmet_signal() {
+            Some((signal, latest)) => (Some(Box::new(signal)), latest.map(Box::new)),
+            None => (None, None),
+        };
+        LspError::NotReadyDeadline {
+            method: method.to_string(),
+            path: path.to_string(),
+            after: self.query_deadline,
+            signal,
+            latest,
+            withdrawals: status.stamp().withdrawals.saturating_sub(withdrawn_before),
+        }
     }
 
     /// Whether opening `ask`'s document would replace text the server
@@ -3841,7 +4075,7 @@ impl Client {
     /// in `path` is DEFINED — the query that turns a reference into a
     /// cross-file edge. `content` is the authoritative text sent via didOpen.
     ///
-    /// AN EMPTY VEC CARRIES NO READINESS INFORMATION. A server still building
+    /// ON ITS OWN, AN EMPTY VEC CARRIES NO READINESS INFORMATION. A server still building
     /// its index answers successfully with an empty result, byte-identical to
     /// the answer for a symbol that genuinely has no definition; `null` versus
     /// `[]` does not separate them either, and neither does latency. The
@@ -3850,7 +4084,11 @@ impl Client {
     /// loading its workspace, readiness is not monotonic — rust-analyzer can
     /// resolve the probe and then answer this query empty until its load
     /// finishes. Only a declared [`ClientConfig::ready_signals`] the server
-    /// reports separates that empty from "no definition".
+    /// reports separates that empty from "no definition": with one declared,
+    /// an answer given while it did not hold is never returned (see
+    /// [`LspError::NotReadyDeadline`]), so an empty vec is the answer of a
+    /// server that said it was loaded. A server that answers before it has
+    /// finished, without saying so, is beyond any client's view.
     ///
     /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
     /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
@@ -3894,10 +4132,13 @@ impl Client {
     ///
     /// This is the entry point when the caller has a CONTAINING function but
     /// not the position of each call site inside it — the case a plain
-    /// `definition` cannot serve. An empty vec does NOT distinguish "the
-    /// position names no call-hierarchy symbol" from "the server is not ready
-    /// to say"; gate with [`Client::await_ready`] first. The error taxonomy is
-    /// that of [`Client::definition`].
+    /// `definition` cannot serve. Without a declared
+    /// [`ClientConfig::ready_signals`], an empty vec does NOT distinguish
+    /// "the position names no call-hierarchy symbol" from "the server is not
+    /// ready to say"; gate with [`Client::await_ready`] first. With one, an
+    /// answer given while it did not hold is asked again, as
+    /// [`Client::definition`] says. The error taxonomy is that of
+    /// [`Client::definition`].
     pub fn prepare_call_hierarchy(
         &mut self,
         path: &str,
@@ -3948,9 +4189,12 @@ impl Client {
     /// file where the call appears, which is exactly one code-graph edge each.
     ///
     /// `target` must come from [`Client::prepare_call_hierarchy`] against this
-    /// server — its opaque item is echoed back unmodified. An empty vec does
-    /// NOT distinguish "the symbol calls nothing" from "the server is not
-    /// ready to say"; gate with [`Client::await_ready`] first.
+    /// server — its opaque item is echoed back unmodified. Without a declared
+    /// [`ClientConfig::ready_signals`], an empty vec does NOT distinguish
+    /// "the symbol calls nothing" from "the server is not ready to say"; gate
+    /// with [`Client::await_ready`] first. With one, an answer given while it
+    /// did not hold is asked again, as [`Client::definition`] says — a
+    /// partial list as much as an empty one.
     pub fn outgoing_calls(&mut self, target: &CallTarget) -> Result<Vec<OutgoingCall>, LspError> {
         let params = json!({"item": target.item});
         let v = self.query_with_retry(OUTGOING_CALLS, &target.location.path, params)?;
@@ -4847,8 +5091,11 @@ fn read_loop(
                     ),
                     _ => RpcOutcome::Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
                 };
+                // Stamped here, not by the waiter: a status the server sends
+                // after this response must not be read as preceding it.
+                let stamp = lock(&status).stamp();
                 // A waiter that gave up has dropped its receiver; nothing to tell.
-                let _ = tx.send((id, outcome));
+                let _ = tx.send((id, outcome, stamp));
             }
         }
     }
@@ -4856,9 +5103,10 @@ fn read_loop(
     // request racing in right now observes the flag rather than writing into a
     // corpse. `Release` pairs with the `Acquire` loads in `call`/`diagnostics`.
     dead.store(true, Ordering::Release);
+    let stamp = lock(&status).stamp();
     // Fail any callers still waiting.
     for (id, tx) in lock(&pending).drain() {
-        let _ = tx.send((id, RpcOutcome::Closed));
+        let _ = tx.send((id, RpcOutcome::Closed, stamp));
     }
 }
 
@@ -11029,6 +11277,564 @@ mod tests {
                 i + 2
             );
         }
+    }
+
+    // ---- answers given while the ready signal is withdrawn ----
+
+    /// rust-analyzer's status notification, `health: ok`.
+    fn quiescent_frame(quiescent: bool) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "experimental/serverStatus",
+            "params": {"health": "ok", "quiescent": quiescent},
+        })
+    }
+
+    /// A query client that waits on rust-analyzer's quiescent signal.
+    fn quiescent_client(conn: (PipeReader, PipeWriter)) -> Client {
+        let mut c = query_client(conn);
+        let mut cfg = c.config();
+        cfg.ready_signals = vec![quiescent_signal()];
+        c.configure(cfg);
+        c
+    }
+
+    /// What a withdrawing server does once it has answered the held requests
+    /// empty.
+    #[derive(Clone, Copy)]
+    enum Restore {
+        /// Says it is quiescent again after the pause, then answers rightly.
+        After(Duration),
+        /// Stays loading, answering every further question empty.
+        Never,
+        /// Goes away.
+        Hangup,
+    }
+
+    /// Every request a withdrawing server received: method, params, and
+    /// whether it had withdrawn its ready signal when the request arrived.
+    type Arrivals = Arc<Mutex<Vec<(String, Value, bool)>>>;
+
+    /// A rust-analyzer-shaped server that reloads in the middle of a batch.
+    /// It says `quiescent: true` at once, holds the first `hold` requests of
+    /// `method` unanswered, then says `quiescent: false` and answers each of
+    /// them with `empty` — what rust-analyzer does while it loads — and goes
+    /// on as `restore` says. Once restored it answers through `answer`.
+    fn spawn_withdrawing_server(
+        server_conn: (PipeReader, PipeWriter),
+        method: &'static str,
+        hold: usize,
+        empty: Value,
+        restore: Restore,
+        mut answer: impl FnMut(&Value) -> Value + Send + 'static,
+    ) -> Arrivals {
+        let arrivals: Arrivals = Arc::new(Mutex::new(Vec::new()));
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let (reader, mut w) = server_conn;
+        let (msg_tx, msg_rx) = mpsc::channel::<Value>();
+        {
+            let (log, withdrawn) = (Arc::clone(&arrivals), Arc::clone(&withdrawn));
+            // Logged as it arrives, so a request the client sent while the
+            // server was paused is seen as sent then.
+            thread::spawn(move || {
+                let mut r = BufReader::new(reader);
+                while let Ok(Some(body)) = read_frame(&mut r) {
+                    let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                        continue;
+                    };
+                    if msg.get("id").is_some() {
+                        let m = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                        let now = withdrawn.load(Ordering::SeqCst);
+                        lock(&log).push((m.to_string(), params, now));
+                    }
+                    if msg_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        thread::spawn(move || {
+            write_frame(&mut w, &quiescent_frame(true)).unwrap();
+            let mut held: Vec<Value> = Vec::new();
+            let mut ready_again = false;
+            while let Ok(msg) = msg_rx.recv() {
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                if id.is_null() {
+                    continue;
+                }
+                if msg.get("method").and_then(Value::as_str) != Some(method) {
+                    reply_err(&mut w, &id, "method not found");
+                    continue;
+                }
+                if ready_again {
+                    reply_ok(&mut w, &id, answer(&msg["params"]));
+                    continue;
+                }
+                if !held.is_empty() && held.len() >= hold {
+                    // Still loading: everything is answered empty.
+                    reply_ok(&mut w, &id, empty.clone());
+                    continue;
+                }
+                held.push(id);
+                if held.len() < hold {
+                    continue;
+                }
+                withdrawn.store(true, Ordering::SeqCst);
+                write_frame(&mut w, &quiescent_frame(false)).unwrap();
+                for id in &held {
+                    reply_ok(&mut w, id, empty.clone());
+                }
+                match restore {
+                    Restore::After(pause) => thread::sleep(pause),
+                    Restore::Never => continue,
+                    Restore::Hangup => return,
+                }
+                withdrawn.store(false, Ordering::SeqCst);
+                write_frame(&mut w, &quiescent_frame(true)).unwrap();
+                ready_again = true;
+            }
+        });
+        arrivals
+    }
+
+    /// The requests of `method` a withdrawing server received, each with
+    /// whether the server was withdrawn when it arrived.
+    fn asked_about(arrivals: &Arrivals, method: &str) -> Vec<(Value, bool)> {
+        lock(arrivals)
+            .iter()
+            .filter(|(m, _, _)| m == method)
+            .map(|(_, params, withdrawn)| (params.clone(), *withdrawn))
+            .collect()
+    }
+
+    /// One document of `n` functions, `f0` on line 0 onward, and a
+    /// call-hierarchy question at each.
+    fn function_file(n: u32) -> String {
+        (0..n).map(|i| format!("fn f{i}() {{}}\n")).collect()
+    }
+
+    fn function_queries(content: &str, n: u32) -> Vec<PositionQuery<'_>> {
+        (0..n)
+            .map(|line| PositionQuery {
+                path: "/work/a.rs",
+                content,
+                line,
+                character: 3,
+            })
+            .collect()
+    }
+
+    /// Runs `work` on its own thread and fails the test if it has not ended
+    /// within `bound`: a query that never ends must be a red, not a hang.
+    fn within<T: Send + 'static>(bound: Duration, work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(bound)
+            .unwrap_or_else(|e| panic!("still running after {bound:?}: {e}"))
+    }
+
+    /// The one call-hierarchy target a ready server finds at a question.
+    fn function_at(params: &Value) -> Value {
+        let line = params["position"]["line"].as_u64().unwrap_or(0) as u32;
+        json!([call_item(&format!("f{line}"), "/work/a.rs", line)])
+    }
+
+    #[test]
+    fn a_withdrawal_is_counted_once_per_change_from_holding_to_not() {
+        let mut watch = StatusWatch::default();
+        let stamp = |w: &StatusWatch| (w.stamp().holds, w.stamp().withdrawals);
+        assert_eq!(stamp(&watch), (true, 0), "no signal declared holds");
+        watch.set_watch(Vec::new(), vec![quiescent_signal()], Vec::new());
+        assert_eq!(
+            stamp(&watch),
+            (false, 0),
+            "declaring a signal not yet sent is not a withdrawal"
+        );
+        let status = |q: bool| json!({"health": "ok", "quiescent": q});
+        let method = "experimental/serverStatus";
+        // (quiescent sent, want holds, want withdrawals)
+        let steps = [
+            (true, true, 0),
+            (true, true, 0),
+            (false, false, 1),
+            (false, false, 1),
+            (true, true, 1),
+            (false, false, 2),
+            (true, true, 2),
+        ];
+        for (i, (quiescent, holds, withdrawals)) in steps.into_iter().enumerate() {
+            watch.observe(method, Some(&status(quiescent)));
+            assert_eq!(stamp(&watch), (holds, withdrawals), "step {i}");
+        }
+        watch.set_watch(Vec::new(), vec![quiescent_signal()], Vec::new());
+        assert_eq!(
+            stamp(&watch),
+            (true, 2),
+            "re-declaring keeps the count, and the status kept for the method"
+        );
+        watch.observe(method, Some(&status(false)));
+        watch.set_watch(Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(
+            stamp(&watch),
+            (true, 3),
+            "no signal left holds, and the count stays"
+        );
+    }
+
+    #[test]
+    fn a_batch_answered_while_the_server_reloads_is_asked_again_once_it_is_ready() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let arrivals = spawn_withdrawing_server(
+            server_conn,
+            PREPARE_CALL_HIERARCHY,
+            4,
+            json!([]),
+            Restore::After(Duration::from_millis(150)),
+            function_at,
+        );
+        round_trip(&mut c);
+        let content = function_file(8);
+        let queries = function_queries(&content, 8);
+        let answers = c.prepare_call_hierarchy_many(&queries, in_flight(4));
+        for (line, answer) in answers.into_iter().enumerate() {
+            let targets = answer.unwrap_or_else(|e| panic!("f{line}: {e}"));
+            let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(
+                names,
+                [format!("f{line}")],
+                "f{line}: the answer given while ready, never the empty one given while loading"
+            );
+        }
+        let asked = asked_about(&arrivals, PREPARE_CALL_HIERARCHY);
+        let while_loading: Vec<&(Value, bool)> = asked.iter().filter(|(_, w)| *w).collect();
+        assert!(
+            while_loading.is_empty(),
+            "nothing is asked while the server is loading: {while_loading:?}"
+        );
+        assert_eq!(
+            asked.len(),
+            12,
+            "the four answered while loading were asked again, the rest once"
+        );
+    }
+
+    #[test]
+    fn an_answer_given_across_a_withdrawal_and_its_restore_is_asked_again() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tally = Arc::clone(&asked);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            write_frame(&mut w, &quiescent_frame(true)).unwrap();
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                if id.is_null() {
+                    continue;
+                }
+                if msg.get("method").and_then(Value::as_str) != Some(OUTGOING_CALLS) {
+                    reply_err(&mut w, &id, "method not found");
+                    continue;
+                }
+                let name = if tally.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // A reload starts and ends while the question is out:
+                    // both readings of the signal hold, and the answer still
+                    // came from a server that was loading.
+                    write_frame(&mut w, &quiescent_frame(false)).unwrap();
+                    write_frame(&mut w, &quiescent_frame(true)).unwrap();
+                    "stale"
+                } else {
+                    "fresh"
+                };
+                reply_ok(&mut w, &id, callee_of(&json!({"item": {"name": name}})));
+            }
+        });
+        round_trip(&mut c);
+        let target = call_target("t0", "/work/main.rs", 0);
+        let mut answers = c.outgoing_calls_many(std::slice::from_ref(&target), in_flight(1));
+        let calls = answers.remove(0).expect("answered once ready");
+        assert_eq!(calls[0].to.name, "callee_of_fresh");
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "asked again once");
+    }
+
+    #[test]
+    fn a_server_that_reloads_around_every_answer_fails_loudly_at_the_deadline() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_millis(200);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tally = Arc::clone(&asked);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            write_frame(&mut w, &quiescent_frame(true)).unwrap();
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                if id.is_null() {
+                    continue;
+                }
+                if msg.get("method").and_then(Value::as_str) != Some(OUTGOING_CALLS) {
+                    reply_err(&mut w, &id, "method not found");
+                    continue;
+                }
+                tally.fetch_add(1, Ordering::SeqCst);
+                // Never ready from question to answer, though ready at each.
+                write_frame(&mut w, &quiescent_frame(false)).unwrap();
+                write_frame(&mut w, &quiescent_frame(true)).unwrap();
+                reply_ok(&mut w, &id, json!([]));
+            }
+        });
+        round_trip(&mut c);
+        let target = call_target("t0", "/work/main.rs", 0);
+        let mut answers = within(Duration::from_secs(10), move || {
+            c.outgoing_calls_many(std::slice::from_ref(&target), in_flight(1))
+        });
+        match answers.remove(0) {
+            Err(LspError::NotReadyDeadline {
+                signal,
+                latest,
+                withdrawals,
+                ..
+            }) => {
+                assert_eq!(signal, None, "every signal holds now");
+                assert_eq!(latest, None);
+                assert!(withdrawals > 1, "asked again across each: {withdrawals}");
+            }
+            other => panic!("want NotReadyDeadline, got {other:?}"),
+        }
+        assert!(
+            asked.load(Ordering::SeqCst) > 1,
+            "asked again until the deadline"
+        );
+    }
+
+    #[test]
+    fn a_server_that_stays_withdrawn_fails_every_query_loudly_at_the_deadline() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_millis(300);
+        let arrivals = spawn_withdrawing_server(
+            server_conn,
+            PREPARE_CALL_HIERARCHY,
+            2,
+            json!([]),
+            Restore::Never,
+            function_at,
+        );
+        round_trip(&mut c);
+        let start = Instant::now();
+        let answers = within(Duration::from_secs(10), move || {
+            let content = function_file(4);
+            c.prepare_call_hierarchy_many(&function_queries(&content, 4), in_flight(2))
+        });
+        let took = start.elapsed();
+        for (line, answer) in answers.into_iter().enumerate() {
+            match answer {
+                Err(LspError::NotReadyDeadline {
+                    method,
+                    path,
+                    after,
+                    signal,
+                    latest,
+                    withdrawals,
+                    ..
+                }) => {
+                    assert_eq!(method, PREPARE_CALL_HIERARCHY);
+                    assert_eq!(path, "/work/a.rs");
+                    assert_eq!(after, Duration::from_millis(300));
+                    assert_eq!(signal.as_deref(), Some(&quiescent_signal()));
+                    assert_eq!(
+                        latest.as_deref(),
+                        Some(&json!({"health": "ok", "quiescent": false}))
+                    );
+                    assert_eq!(withdrawals, 1, "f{line}");
+                }
+                other => panic!(
+                    "f{line}: want NotReadyDeadline, never the answer given while loading; got {other:?}"
+                ),
+            }
+        }
+        assert!(
+            took >= Duration::from_millis(300),
+            "held until the deadline: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "and not much past it: {took:?}"
+        );
+        assert_eq!(
+            asked_about(&arrivals, PREPARE_CALL_HIERARCHY).len(),
+            2,
+            "nothing is asked again, and nothing new, while the server stays withdrawn"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_final_only_while_every_declared_signal_holds() {
+        let ok = |q: bool| server_status("ok", q, "");
+        // (case, signals, statuses, want definitions asked, want an answer)
+        type Case = (
+            &'static str,
+            Vec<ReadySignal>,
+            Vec<(String, Value)>,
+            usize,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
+            ("no signal declared", Vec::new(), Vec::new(), 1, true),
+            (
+                "a latest signal holding",
+                vec![quiescent_signal()],
+                vec![ok(true)],
+                1,
+                true,
+            ),
+            (
+                "a once signal met, then other messages",
+                vec![finished_loading(ReadyMode::Once)],
+                vec![
+                    show_message(3, "Finished loading packages."),
+                    show_message(3, "something else"),
+                ],
+                1,
+                true,
+            ),
+            (
+                "a latest signal never sent",
+                vec![quiescent_signal()],
+                Vec::new(),
+                0,
+                false,
+            ),
+            (
+                "a latest signal withdrawn",
+                vec![quiescent_signal()],
+                vec![ok(true), ok(false)],
+                0,
+                false,
+            ),
+        ];
+        for (case, signals, statuses, want_asked, want_answer) in cases {
+            let (client_conn, server_conn) = conn_pair();
+            let asked = spawn_status_server(server_conn, statuses, StatusAt::Initialized);
+            let mut c = query_client(client_conn);
+            let mut cfg = c.config();
+            cfg.ready_signals = signals;
+            c.configure(cfg);
+            c.initialize("file:///work").unwrap();
+            round_trip(&mut c);
+            let got = within(Duration::from_secs(10), move || {
+                c.definition("/work/main.rs", "fn main() {}\n", 0, 3)
+            });
+            match (want_answer, got) {
+                (true, Ok(found)) => assert!(found.is_empty(), "{case}: {found:?}"),
+                (false, Err(LspError::NotReadyDeadline { .. })) => {}
+                (_, other) => panic!("{case}: want an answer: {want_answer}; got {other:?}"),
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), want_asked, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_server_that_dies_while_answers_are_held_fails_the_batch_fast_and_fatally() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(30);
+        spawn_withdrawing_server(
+            server_conn,
+            PREPARE_CALL_HIERARCHY,
+            2,
+            json!([]),
+            Restore::Hangup,
+            function_at,
+        );
+        round_trip(&mut c);
+        let content = function_file(4);
+        let queries = function_queries(&content, 4);
+        let start = Instant::now();
+        let answers = c.prepare_call_hierarchy_many(&queries, in_flight(2));
+        assert!(start.elapsed() < Duration::from_secs(5), "failed fast");
+        for (line, answer) in answers.into_iter().enumerate() {
+            let err = answer.expect_err("no server to answer");
+            assert!(
+                is_fatal_transport(&err),
+                "f{line}: want a fatal transport error the pool respawns on, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outgoing_calls_and_definition_answered_while_loading_are_asked_again() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let arrivals = spawn_withdrawing_server(
+            server_conn,
+            OUTGOING_CALLS,
+            3,
+            json!([]),
+            Restore::After(Duration::from_millis(100)),
+            callee_of,
+        );
+        round_trip(&mut c);
+        let targets: Vec<CallTarget> = (0..6)
+            .map(|i| call_target(&format!("t{i}"), "/work/main.rs", i))
+            .collect();
+        for (i, answer) in c
+            .outgoing_calls_many(&targets, in_flight(3))
+            .into_iter()
+            .enumerate()
+        {
+            let calls = answer.unwrap_or_else(|e| panic!("t{i}: {e}"));
+            assert_eq!(
+                calls.len(),
+                1,
+                "t{i}: never the empty answer given while loading"
+            );
+            assert_eq!(calls[0].to.name, format!("callee_of_t{i}"));
+        }
+        assert_eq!(asked_about(&arrivals, OUTGOING_CALLS).len(), 9);
+
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let dep = file_uri("/work/dep.rs").to_string();
+        let arrivals = spawn_withdrawing_server(
+            server_conn,
+            "textDocument/definition",
+            1,
+            Value::Null,
+            Restore::After(Duration::from_millis(100)),
+            move |_| {
+                json!([{
+                    "uri": dep,
+                    "range": {
+                        "start": {"line": 4, "character": 3},
+                        "end": {"line": 4, "character": 6},
+                    },
+                }])
+            },
+        );
+        round_trip(&mut c);
+        let found = c
+            .definition("/work/main.rs", "fn main() { dep(); }\n", 0, 12)
+            .expect("answered once ready");
+        assert_eq!(found.len(), 1, "never the null answer given while loading");
+        assert_eq!(found[0].path, "/work/dep.rs");
+        assert_eq!(asked_about(&arrivals, "textDocument/definition").len(), 2);
     }
 
     /// A query server whose `initialize` advertises `caps`, then answers the
