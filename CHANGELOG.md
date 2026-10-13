@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — a query answered while the server is loading is asked again (source break)
+## 0.17.0 — a query answered while the server is loading is asked again (source break)
 
 ### Source break, and the fix
 
