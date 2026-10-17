@@ -1077,6 +1077,26 @@ pub enum LspError {
         /// The server's error message.
         message: String,
     },
+    /// A server whose declared [`ClientConfig::ready_signals`] held from
+    /// question to answer refused a code-navigation query with a JSON-RPC
+    /// error LSP does not mark as worth asking again. That is the server's
+    /// answer, the same however often it is asked: gopls refuses a use of a
+    /// package it cannot find this way, where other servers answer empty.
+    ///
+    /// Returned at once and never retried. A server that declares no signal
+    /// cannot say it is loaded, so its refusals stay "not yet" and end as
+    /// [`LspError::QueryDeadline`]; so do the codes LSP gives for asking
+    /// again (`RequestCancelled`, `ContentModified`, `ServerCancelled`,
+    /// `ServerNotInitialized`).
+    #[error("lsp: {method}: refused: {message}")]
+    Refused {
+        /// The request method.
+        method: String,
+        /// The server's `error.code`; `None` when it sent no number.
+        code: Option<i64>,
+        /// The server's `error.message`.
+        message: String,
+    },
     /// The connection closed while a request was outstanding.
     #[error("lsp: {method}: connection closed")]
     Closed {
@@ -1104,6 +1124,11 @@ pub enum LspError {
     },
     /// A code-navigation query kept being REFUSED (JSON-RPC error) by a server
     /// that never became ready within its deadline.
+    ///
+    /// Only refusals that may mean "not yet" get here: from a server that
+    /// declares no [`ClientConfig::ready_signals`], given while a declared
+    /// signal did not hold, or with a code LSP marks retryable. A ready
+    /// server's other refusals are [`LspError::Refused`] at once.
     ///
     /// This covers only the refusing server. A server that is still indexing
     /// far more often ANSWERS with an empty result, which is indistinguishable
@@ -2478,10 +2503,26 @@ enum DiagMsg {
 enum RpcOutcome {
     /// The `result` member (possibly `Value::Null`).
     Ok(Value),
-    /// The server's `error.message`.
-    Err(String),
+    /// The server's `error`: its `code` when that is a number, and its
+    /// `message`. The code is kept because it alone says whether LSP wants
+    /// the request asked again.
+    Err {
+        /// `error.code`, when a number.
+        code: Option<i64>,
+        /// `error.message`, or the whole error when it has none.
+        message: String,
+    },
     /// The connection closed before a response arrived.
     Closed,
+}
+
+/// Whether a JSON-RPC error `code` is one LSP gives for asking again: the
+/// client or the server cancelled the request (`RequestCancelled` -32800,
+/// `ServerCancelled` -32802), the text changed under it (`ContentModified`
+/// -32801), or the server is not initialized yet (`ServerNotInitialized`
+/// -32002). LSP 3.17, "Response Message", `ErrorCodes`.
+fn is_retryable_refusal(code: Option<i64>) -> bool {
+    matches!(code, Some(-32800 | -32801 | -32802 | -32002))
 }
 
 /// One request of a pipelined batch (see `Client::query_many`).
@@ -2497,7 +2538,7 @@ struct Ask<'a> {
 fn outcome_result(method: &str, outcome: RpcOutcome) -> Result<Value, LspError> {
     match outcome {
         RpcOutcome::Ok(v) => Ok(v),
-        RpcOutcome::Err(message) => Err(LspError::Rpc {
+        RpcOutcome::Err { message, .. } => Err(LspError::Rpc {
             method: method.to_string(),
             message,
         }),
@@ -3393,6 +3434,11 @@ impl Client {
     /// hold. A query that never gets a ready answer ends in
     /// [`LspError::NotReadyDeadline`]. With no signal declared every answer
     /// counts, as before: bage has nothing to tell a loading server by.
+    ///
+    /// A REFUSAL FROM A READY SERVER IS FINAL TOO: with a signal declared and
+    /// holding from request to answer, a JSON-RPC error whose code LSP does
+    /// not mark retryable is [`LspError::Refused`] at once. With no signal
+    /// declared, a refusal cannot be told from "not yet" and is retried.
     fn query_with_retry(
         &mut self,
         method: &str,
@@ -3423,7 +3469,9 @@ impl Client {
     /// sent) is retried, without holding up the others, until
     /// `query_deadline` from its first send; a fatal transport error is that
     /// ask's final outcome, and every ask still to be sent then fails fast on
-    /// the dead connection with its own error.
+    /// the dead connection with its own error. A refusal from a server whose
+    /// declared signals held from question to answer, with a code LSP does
+    /// not mark retryable, is final: [`LspError::Refused`], never retried.
     ///
     /// Readiness is checked per answer, not per batch. The read loop stamps
     /// each response with the declared signals' state as it routes it, so a
@@ -3460,6 +3508,9 @@ impl Client {
         let mut retries: Vec<(Instant, usize)> = Vec::new();
         // So an error counts only the withdrawals its own batch saw.
         let withdrawn_before = lock(&self.status).stamp().withdrawals;
+        // Only a server that can say it is loaded gives a refusal that is an
+        // answer; one that declares no signal may be refusing while it loads.
+        let signalled = !lock(&self.status).signals.is_empty();
         // Since when the declared signals have not held, while they do not.
         let mut unready_since: Option<Instant> = None;
         let mut next = 0;
@@ -3527,14 +3578,29 @@ impl Client {
             // throughout.
             let failed: Vec<(usize, Option<LspError>)> = match rx.recv_timeout(wait) {
                 Ok((id, outcome, answered)) => match outstanding.remove(&id) {
-                    Some((idx, _, asked)) => match outcome_result(method, outcome) {
-                        Ok(v) if asked.ready_throughout(answered) => {
-                            answers[idx] = Some(Ok(v));
-                            Vec::new()
+                    Some((idx, _, asked)) => {
+                        let ready = asked.ready_throughout(answered);
+                        match outcome {
+                            RpcOutcome::Err { code, message }
+                                if ready && signalled && !is_retryable_refusal(code) =>
+                            {
+                                answers[idx] = Some(Err(LspError::Refused {
+                                    method: method.to_string(),
+                                    code,
+                                    message,
+                                }));
+                                Vec::new()
+                            }
+                            outcome => match outcome_result(method, outcome) {
+                                Ok(v) if ready => {
+                                    answers[idx] = Some(Ok(v));
+                                    Vec::new()
+                                }
+                                Ok(_) => vec![(idx, None)],
+                                Err(e) => vec![(idx, Some(e))],
+                            },
                         }
-                        Ok(_) => vec![(idx, None)],
-                        Err(e) => vec![(idx, Some(e))],
-                    },
+                    }
                     // The answer to a request already given up on.
                     None => Vec::new(),
                 },
@@ -4043,16 +4109,18 @@ impl Client {
     /// A server can only show documentation it can read: the dependency's
     /// source or declarations must be where the server looks for them.
     ///
-    /// A POSITION OUTSIDE THE TEXT COSTS THE WHOLE `query_deadline` on a
-    /// server that refuses it. A refusal (JSON-RPC error) is also how a
-    /// loading server says "not yet", the two cannot be told apart, and so
-    /// every refusal is retried: the call returns
-    /// [`LspError::QueryDeadline`] only once the deadline is spent, with the
-    /// server's refusal as `last`. Measured: gopls refuses a column past the
-    /// end of its line and a line past the end of the file; rust-analyzer
-    /// refuses the line and answers the column with `None`.
-    /// [`Client::definition`] behaves the same. A caller that cannot rule
-    /// such positions out declares a `query_deadline` it can afford.
+    /// A REFUSAL IS AN ANSWER ONLY FROM A SERVER THAT SAID IT WAS READY.
+    /// Measured: gopls refuses a column past the end of its line and a line
+    /// past the end of the file; rust-analyzer refuses the line and answers
+    /// the column with `None`. With a declared
+    /// [`ClientConfig::ready_signals`] holding from question to answer, such
+    /// a refusal is [`LspError::Refused`] at once. With none declared, a
+    /// refusal is also how a loading server says "not yet", the two cannot
+    /// be told apart, and it is retried until `query_deadline`, ending as
+    /// [`LspError::QueryDeadline`] with the refusal as `last`; a caller in
+    /// that case that cannot rule such positions out declares a
+    /// `query_deadline` it can afford. [`Client::definition`] behaves the
+    /// same.
     pub fn hover(
         &mut self,
         path: &str,
@@ -4092,9 +4160,9 @@ impl Client {
     ///
     /// [`LspError::Timeout`] (no answer) and [`LspError::Closed`] (server
     /// gone) remain distinct outcomes. Positions in and out are UTF-16 code
-    /// units; see [`SymbolLocation`]. A position outside the text that the
-    /// server refuses is retried until `query_deadline` and ends as
-    /// [`LspError::QueryDeadline`], as [`Client::hover`] describes.
+    /// units; see [`SymbolLocation`]. A refusal is [`LspError::Refused`] from
+    /// a server whose declared signal held, and is retried to
+    /// [`LspError::QueryDeadline`] otherwise, as [`Client::hover`] describes.
     ///
     /// Unlike `rename` this does NOT prime the workspace: priming re-opens
     /// every sibling file, which is amortizable across one rename but not
@@ -5083,12 +5151,14 @@ fn read_loop(
             let waiter = lock(&pending).remove(&id);
             if let Some(tx) = waiter {
                 let outcome = match obj.get("error") {
-                    Some(e) if !e.is_null() => RpcOutcome::Err(
-                        e.get("message")
+                    Some(e) if !e.is_null() => RpcOutcome::Err {
+                        code: e.get("code").and_then(Value::as_i64),
+                        message: e
+                            .get("message")
                             .and_then(Value::as_str)
                             .map(str::to_string)
                             .unwrap_or_else(|| e.to_string()),
-                    ),
+                    },
                     _ => RpcOutcome::Ok(obj.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 // Stamped here, not by the waiter: a status the server sends
@@ -11440,6 +11510,139 @@ mod tests {
     fn function_at(params: &Value) -> Value {
         let line = params["position"]["line"].as_u64().unwrap_or(0) as u32;
         json!([call_item(&format!("f{line}"), "/work/a.rs", line)])
+    }
+
+    /// A location in another file: what a ready server answers once it
+    /// stops refusing.
+    fn elsewhere() -> Value {
+        json!([{"uri": "file:///work/dep.go",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}])
+    }
+
+    /// A server that says it is quiescent, then answers the `n`th definition
+    /// request (from 0) through `answer`, which writes whatever frames it
+    /// likes. Returns how many definition requests arrived.
+    fn spawn_definition_server(
+        server_conn: (PipeReader, PipeWriter),
+        mut answer: impl FnMut(usize, &mut PipeWriter, &Value) + Send + 'static,
+    ) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let tally = Arc::clone(&asked);
+        let (reader, mut w) = server_conn;
+        thread::spawn(move || {
+            write_frame(&mut w, &quiescent_frame(true)).unwrap();
+            let mut r = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut r) {
+                let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+                    continue;
+                };
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                if id.is_null() {
+                    continue;
+                }
+                if msg.get("method").and_then(Value::as_str) != Some("textDocument/definition") {
+                    reply_err(&mut w, &id, "method not found");
+                    continue;
+                }
+                answer(tally.fetch_add(1, Ordering::SeqCst), &mut w, &id);
+            }
+        });
+        asked
+    }
+
+    fn reply_error(w: &mut PipeWriter, id: &Value, error: &Value) {
+        write_frame(w, &json!({"jsonrpc": "2.0", "id": id, "error": error})).unwrap();
+    }
+
+    /// gopls refuses a use of a package it cannot find, every time it is
+    /// asked, with code 0. From a server whose signal held throughout that is
+    /// its answer: returned at once, and never asked again.
+    #[test]
+    fn a_ready_servers_refusal_is_its_answer_and_is_asked_once() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let error =
+            json!({"code": 0, "message": "failed to resolve import \"thirdparty.example/lib\""});
+        let asked =
+            spawn_definition_server(server_conn, move |_, w, id| reply_error(w, id, &error));
+        round_trip(&mut c);
+        let started = Instant::now();
+        let got = within(Duration::from_secs(10), move || {
+            c.definition("/work/a.go", "package a\n", 0, 0)
+        });
+        match got {
+            Err(LspError::Refused {
+                ref method,
+                code: Some(0),
+                ref message,
+            }) => {
+                assert_eq!(method, "textDocument/definition");
+                assert!(message.contains("failed to resolve import"), "{message}");
+            }
+            other => panic!("want Refused, got {other:?}"),
+        }
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a final refusal is never asked again"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The codes LSP gives for "ask again" — cancelled by the client or the
+    /// server, the text changed under the request, not initialized yet — are
+    /// retried even from a ready server.
+    #[test]
+    fn a_ready_servers_retryable_refusal_is_asked_again() {
+        for code in [-32800, -32801, -32802, -32002] {
+            let (client_conn, server_conn) = conn_pair();
+            let mut c = quiescent_client(client_conn);
+            c.query_deadline = Duration::from_secs(5);
+            let asked = spawn_definition_server(server_conn, move |n, w, id| {
+                if n == 0 {
+                    reply_error(w, id, &json!({"code": code, "message": "ask again"}));
+                } else {
+                    reply_ok(w, id, elsewhere());
+                }
+            });
+            round_trip(&mut c);
+            let got = within(Duration::from_secs(10), move || {
+                c.definition("/work/a.go", "package a\n", 0, 0)
+            });
+            let found = got.unwrap_or_else(|e| panic!("code {code}: {e}"));
+            assert_eq!(found.len(), 1, "code {code}");
+            assert_eq!(asked.load(Ordering::SeqCst), 2, "code {code}");
+        }
+    }
+
+    /// A refusal that arrives after the server withdrew its signal may be
+    /// the loading server's "not yet", so it is asked again once ready.
+    #[test]
+    fn a_refusal_given_while_the_server_reloads_is_asked_again() {
+        let (client_conn, server_conn) = conn_pair();
+        let mut c = quiescent_client(client_conn);
+        c.query_deadline = Duration::from_secs(5);
+        let asked = spawn_definition_server(server_conn, |n, w, id| {
+            if n == 0 {
+                write_frame(w, &quiescent_frame(false)).unwrap();
+                reply_error(w, id, &json!({"code": 0, "message": "no package yet"}));
+                thread::sleep(Duration::from_millis(100));
+                write_frame(w, &quiescent_frame(true)).unwrap();
+            } else {
+                reply_ok(w, id, elsewhere());
+            }
+        });
+        round_trip(&mut c);
+        let got = within(Duration::from_secs(10), move || {
+            c.definition("/work/a.go", "package a\n", 0, 0)
+        });
+        assert_eq!(got.expect("answered once ready again").len(), 1);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     #[test]

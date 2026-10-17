@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — a ready server's refusal is its answer (source break)
+
+### Source break, and the fix
+
+- **`lsp::LspError` has a new variant**, `Refused { method, code, message }`. An exhaustive match
+  adds it.
+
+### Fixed
+
+- **A refusal from a server that said it was ready is final.** With `ClientConfig::ready_signals`
+  declared and holding from question to answer, a JSON-RPC error on a code-navigation query —
+  `definition`, `type_definition`, `hover`, `implementation`, `pull_diagnostics`, the call and type
+  hierarchy, and the `_many` batches — returns `LspError::Refused` at once, carrying the server's
+  `error.code` and `error.message`, and is never asked again. Measured: gopls, loaded, refuses a
+  use of a package it cannot find (`failed to resolve import`, code 0) every time it is asked;
+  bage retried it until `query_deadline` (Hylla declares 120 s) and failed with `QueryDeadline`.
+- The codes LSP 3.17 gives for asking again are still retried: `RequestCancelled` (-32800),
+  `ContentModified` (-32801), `ServerCancelled` (-32802) and `ServerNotInitialized` (-32002). So is
+  a refusal given while a declared signal did not hold.
+- With no signal declared nothing tells a loaded server from a loading one, so every refusal is
+  retried to `QueryDeadline`, as before. Silence (`Timeout`), a closed connection (`Closed`) and a
+  server that never becomes ready (`NotReadyDeadline`) fail as before.
+- A position outside the text, refused by a ready gopls or rust-analyzer, now costs one round trip
+  instead of the whole `query_deadline`.
+
+### Tests
+
+- Fakes: a ready server's refusal is asked once and returned as `Refused`; each retryable code is
+  asked again; a refusal given across a withdrawal is asked again. The existing no-signal cases
+  stay `QueryDeadline`.
+- Real tier (`BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored`): gopls's refusal of
+  an unresolvable import is `Refused` in under a millisecond with its signal declared, and
+  `QueryDeadline` after the whole deadline without one; out-of-text positions on gopls and
+  rust-analyzer are `Refused` at once.
+
 ## 0.17.0 — a query answered while the server is loading is asked again (source break)
 
 ### Source break, and the fix
