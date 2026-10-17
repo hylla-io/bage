@@ -627,17 +627,21 @@ the SERVER says it is in, and the span hovered when the server names one. `None`
 answer or one with empty content; it carries no readiness information, so gate with `await_ready`
 first. A server without `hoverProvider` is refused with `Unsupported`, nothing sent. The older
 `MarkedString` shapes are rendered to the markdown the protocol defines them as.
-A position OUTSIDE the text is the server's to judge, and a server that refuses it costs the whole
-`query_deadline` (30 s by default): a refusal is a JSON-RPC error, the same thing a loading server
-sends, so `hover` and `definition` retry it every `query_retry` and return
-`LspError::QueryDeadline { method, path, after, last }` only when the deadline is spent, `last`
-being the server's refusal. Measured: gopls refuses a column past the end of its line (`column is
-beyond end of line`) and a line past the end of the file (`line number 500 out of range 0-10`);
-rust-analyzer refuses the line (`Invalid offset LineCol { line: 500, col: 0 }`) and ANSWERS the
-column at once, `None` for hover and no location for definition. bage checks no position against
-the text itself; a caller that cannot rule such positions out declares a `query_deadline` it can
-afford. Real-server proof at a 1 s deadline: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, gopls
-and rust-analyzer).
+A position OUTSIDE the text is the server's to judge. A refusal is a JSON-RPC error, the same
+thing a loading server sends, so what it means depends on whether the server said it was loaded.
+With a declared `ready_signals` holding from question to answer, a refusal whose code LSP does not
+mark retryable (`RequestCancelled`, `ContentModified`, `ServerCancelled`, `ServerNotInitialized`)
+is the server's answer: `LspError::Refused { method, code, message }` at once, never retried. With
+no signal declared, `hover` and `definition` retry it every `query_retry` and return
+`LspError::QueryDeadline { method, path, after, last }` only when `query_deadline` (30 s by
+default) is spent, `last` being the server's refusal. Measured: gopls refuses a column past the
+end of its line (`column is beyond end of line`) and a line past the end of the file (`line number
+500 out of range 0-10`), code 0; rust-analyzer refuses the line (`Invalid offset LineCol { line:
+500, col: 0 }`, code -32603) and ANSWERS the column at once, `None` for hover and no location for
+definition. gopls refuses a use of a package it cannot find (`failed to resolve import`, code 0)
+however often it is asked. bage checks no position against the text itself; a caller with no
+signal declared that cannot rule such positions out declares a `query_deadline` it can afford.
+Real-server proof: `tests/lsp_session.rs` (`BAGE_LSP_REAL_TEST=1`, gopls and rust-analyzer).
 `hover_content_format` is the `textDocument.hover.contentFormat` capability, most wanted first;
 empty omits it. Markdown leads by default because it is the one format in which every server
 measured keeps the signature (a code fence) apart from the documentation: asked for plain text,

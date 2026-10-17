@@ -1315,10 +1315,11 @@ const POSITION_QUERIES: [(&str, Ask); 2] = [
 
 /// Starts `case`'s server under [`SHORT_QUERY_DEADLINE`] and asks hover and
 /// definition at each position of `outside`, which lies outside the text and
-/// which the server refuses in words containing the given fragment. A
-/// refusal is what a server still loading sends too, so bage retries it and
-/// the caller gets `QueryDeadline` after the whole deadline, the refusal as
-/// its `last`. Returns the client, still usable, for the caller's own checks.
+/// which the server refuses in words containing the given fragment. Each
+/// case declares its server's ready signal, so a refusal given while it held
+/// is the server's answer: `Refused` at once, carrying the server's words,
+/// well inside the deadline. Returns the client, still usable, for the
+/// caller's own checks.
 fn refused_outside_the_text(
     case: &HoverCase,
     outside: &[(&str, (u32, u32), &str)],
@@ -1347,26 +1348,23 @@ fn refused_outside_the_text(
             let got = ask(&mut c, &path, content, *line, *character);
             let took = start.elapsed();
             match got {
-                Err(LspError::QueryDeadline {
+                Err(LspError::Refused {
                     method: asked,
-                    path: of,
-                    after,
-                    last,
+                    code,
+                    message,
                 }) => {
                     assert_eq!(asked, method, "{server}: {what}");
-                    assert_eq!(of, path, "{server}: {what}");
-                    assert_eq!(after, SHORT_QUERY_DEADLINE, "{server}: {what}");
                     assert!(
-                        last.contains(says),
-                        "{server}: {method} {what}: the server's own refusal is kept: {last}"
+                        message.contains(says),
+                        "{server}: {method} {what}: the server's own refusal is kept: {message}"
                     );
-                    eprintln!("{server} {method} {what} after {took:?}: {last}");
+                    eprintln!("{server} {method} {what} after {took:?}: code {code:?}: {message}");
                 }
-                other => panic!("{server}: {method} {what}: want QueryDeadline, got {other:?}"),
+                other => panic!("{server}: {method} {what}: want Refused, got {other:?}"),
             }
             assert!(
-                took >= SHORT_QUERY_DEADLINE,
-                "{server}: {method} {what}: retried for the whole deadline, took {took:?}"
+                took < SHORT_QUERY_DEADLINE,
+                "{server}: {method} {what}: a ready server's refusal is not retried, took {took:?}"
             );
         }
     }
@@ -1384,7 +1382,7 @@ fn hover_content(case: &HoverCase) -> &'static str {
 
 #[test]
 #[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
-fn gopls_position_outside_the_text_is_retried_to_the_query_deadline() {
+fn gopls_position_outside_the_text_is_refused_at_once() {
     require_real_tier();
     let case = go_hover_case();
     let (_dir, path, mut c) = refused_outside_the_text(
@@ -1402,7 +1400,7 @@ fn gopls_position_outside_the_text_is_retried_to_the_query_deadline() {
             ),
         ],
     );
-    // The refusals cost time and nothing else: the session still answers.
+    // A refusal ends one query and nothing else: the session still answers.
     let symbol = &case.symbols[0];
     let content = hover_content(&case);
     let col = column_of(content, symbol.line, symbol.needle) + 1;
@@ -1411,9 +1409,103 @@ fn gopls_position_outside_the_text_is_retried_to_the_query_deadline() {
     c.close().expect("close");
 }
 
+/// A Go module whose `a.go` imports a package nobody can find, beside a call
+/// into `b.go` that a loaded module resolves.
+const GO_UNRESOLVABLE_IMPORT: &[(&str, &str)] = &[
+    ("go.mod", "module example.com/t\n\ngo 1.21\n"),
+    (
+        "a.go",
+        "package t\n\nimport \"thirdparty.example/helper\"\n\nfunc F() int { return helper.Do() + g() }\n",
+    ),
+    ("b.go", "package t\n\nfunc g() int { return 1 }\n"),
+];
+
+/// Starts gopls on [`GO_UNRESOLVABLE_IMPORT`] under `ready_signals`, waits
+/// until the call into `b.go` resolves, then asks for the definition of the
+/// import path. Returns the outcome and how long that one query took.
+fn gopls_unresolvable_import(
+    ready_signals: Vec<ReadySignal>,
+) -> (Result<Vec<lsp::SymbolLocation>, LspError>, Duration) {
+    let cfg = ClientConfig {
+        initialize_timeout: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(60),
+        ready_deadline: Duration::from_secs(180),
+        ready_retry: Duration::from_millis(250),
+        query_deadline: SHORT_QUERY_DEADLINE,
+        query_retry: Duration::from_millis(100),
+        ready_signals,
+        ..ClientConfig::default()
+    };
+    let (_dir, root, mut c) = start_server("gopls", GO_UNRESOLVABLE_IMPORT, cfg);
+    let path = root.join("a.go");
+    let path = path.to_str().expect("utf-8");
+    let content = GO_UNRESOLVABLE_IMPORT[1].1;
+    let call = column_of(content, 4, "g()");
+    c.await_ready(path, content, 4, call)
+        .unwrap_or_else(|e| panic!("gopls: never ready: {e}"));
+    let import = column_of(content, 2, "thirdparty") + 1;
+    let start = Instant::now();
+    let got = c.definition(path, content, 2, import);
+    let took = start.elapsed();
+    c.close().expect("close");
+    (got, took)
+}
+
+/// gopls, loaded and saying so, refuses the import of a package it cannot
+/// find with the same error however often it is asked. That is its answer:
+/// `Refused` at once, never retried to the deadline.
 #[test]
 #[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
-fn rust_analyzer_line_outside_the_text_is_retried_to_the_query_deadline() {
+fn gopls_refusal_of_an_unresolvable_import_is_its_answer() {
+    require_real_tier();
+    let (got, took) = gopls_unresolvable_import(vec![gopls_finished_loading(ReadyMode::Once)]);
+    match got {
+        Err(LspError::Refused {
+            ref method,
+            code,
+            ref message,
+        }) => {
+            assert_eq!(method, "textDocument/definition");
+            assert!(
+                message.contains("failed to resolve import"),
+                "gopls's own words are kept: {message}"
+            );
+            eprintln!("gopls refused in {took:?}: code {code:?}: {message}");
+        }
+        other => panic!("want Refused, got {other:?}"),
+    }
+    assert!(
+        took < SHORT_QUERY_DEADLINE,
+        "a ready server's refusal is not retried: {took:?}"
+    );
+}
+
+/// Control: the same server and question with no ready signal declared.
+/// Nothing says the server is loaded, so its refusal may be "not yet" and is
+/// retried until the deadline, as before.
+#[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
+fn gopls_refusal_without_a_ready_signal_is_retried_to_the_query_deadline() {
+    require_real_tier();
+    let (got, took) = gopls_unresolvable_import(Vec::new());
+    match got {
+        Err(LspError::QueryDeadline {
+            ref last, after, ..
+        }) => {
+            assert_eq!(after, SHORT_QUERY_DEADLINE);
+            assert!(last.contains("failed to resolve import"), "{last}");
+        }
+        other => panic!("want QueryDeadline, got {other:?}"),
+    }
+    assert!(
+        took >= SHORT_QUERY_DEADLINE,
+        "retried for the whole deadline: {took:?}"
+    );
+}
+
+#[test]
+#[ignore = "real language servers: BAGE_LSP_REAL_TEST=1 cargo test --test lsp_session -- --ignored"]
+fn rust_analyzer_line_outside_the_text_is_refused_at_once() {
     require_real_tier();
     let case = rust_hover_case();
     let (_dir, path, mut c) = refused_outside_the_text(
