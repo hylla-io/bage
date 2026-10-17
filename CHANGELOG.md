@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — a ready server's refusal is its answer (source break)
+## 0.18.0 — a ready server's refusal is its answer (source break)
 
 ### Source break, and the fix
 
