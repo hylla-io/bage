@@ -124,7 +124,8 @@ fn stderr_tail_is_bounded_and_reports_the_cut() {
         shutdown_timeout: Duration::from_millis(50),
         exit_deadline: Duration::from_millis(50),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     let err = c
         .initialize(&lsp::file_uri("/tmp").to_string())
         .expect_err("a server that never answers cannot initialize");
@@ -173,7 +174,8 @@ fn stderr_tail_zero_keeps_nothing_but_counts() {
         shutdown_timeout: Duration::from_millis(50),
         exit_deadline: Duration::from_millis(50),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     let until = Instant::now() + Duration::from_secs(5);
     while c.stderr_tail().dropped_bytes < 21 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
@@ -204,6 +206,10 @@ fn configure_round_trips_every_bound() {
         ),
         experimental_capabilities: Some(serde_json::json!({"serverStatusNotification": true})),
         ready_failures: vec![rust_analyzer_failed()],
+        missing_executable_patterns: vec![lsp::MissingExecutablePattern {
+            prefix: "missing [".into(),
+            suffix: "]".into(),
+        }],
         ready_signals: vec![
             rust_analyzer_quiescent(),
             gopls_finished_loading(ReadyMode::Once),
@@ -217,7 +223,7 @@ fn configure_round_trips_every_bound() {
         stderr_tail_bytes: 12,
     };
     let mut c = Client::new_stdio(&silent_server()).expect("spawn sleep");
-    c.configure(cfg.clone());
+    c.configure(cfg.clone()).expect("valid configuration");
     assert_eq!(c.config(), cfg);
 }
 
@@ -228,14 +234,15 @@ fn initialize_fails_at_the_declared_timeout() {
     c.configure(ClientConfig {
         initialize_timeout: declared,
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     let started = Instant::now();
     let err = c
         .initialize(&lsp::file_uri("/tmp").to_string())
         .expect_err("a silent server cannot initialize");
     let took = started.elapsed();
     match err {
-        LspError::Timeout { method, after } => {
+        LspError::Timeout { method, after, .. } => {
             assert_eq!(method, "initialize");
             assert_eq!(after, declared, "the error must name the DECLARED bound");
         }
@@ -270,7 +277,7 @@ fn pool_initialize_fails_at_the_declared_timeout() {
         .expect_err("a silent server cannot initialize");
     let took = started.elapsed();
     match err {
-        LspError::Timeout { method, after } => {
+        LspError::Timeout { method, after, .. } => {
             assert_eq!(method, "initialize");
             assert_eq!(after, declared);
         }
@@ -293,7 +300,8 @@ fn close_honours_declared_shutdown_waits() {
         exit_deadline: exit,
         exit_poll: Duration::from_millis(10),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     let pid = c.server_pid().expect("owned child");
     assert!(pid_alive(pid), "precondition: child alive before close");
     let started = Instant::now();
@@ -302,7 +310,7 @@ fn close_honours_declared_shutdown_waits() {
         .expect_err("a silent server never acknowledges shutdown");
     let took = started.elapsed();
     match err {
-        LspError::Timeout { method, after } => {
+        LspError::Timeout { method, after, .. } => {
             assert_eq!(method, "shutdown");
             assert_eq!(after, shutdown);
         }
@@ -399,7 +407,8 @@ fn run_real_case(case: &RealCase) {
         ready_deadline: Duration::from_secs(120),
         ready_retry: Duration::from_millis(250),
         ..ClientConfig::default()
-    }));
+    }))
+    .expect("valid configuration");
     c.initialize(&lsp::file_uri(root_str).to_string())
         .unwrap_or_else(|e| panic!("{}: initialize: {e}", case.name));
 
@@ -492,7 +501,7 @@ fn await_rust_crate(files: &[(&str, &str)], cfg: ClientConfig) -> (Result<(), Ls
         fs::write(&p, content).expect("fixture");
     }
     let mut c = Client::new_stdio(&["rust-analyzer".to_string()]).expect("spawn rust-analyzer");
-    c.configure(cfg);
+    c.configure(cfg).expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .expect("initialize");
     let lib = root.join("src/lib.rs");
@@ -674,7 +683,8 @@ fn gopls_once_signal_outlives_the_messages_that_follow_it() {
     let gate = |c: &mut Client| c.await_ready(a_go.to_str().expect("utf-8"), content, 2, col);
 
     let mut c = Client::new_stdio(&["gopls".to_string()]).expect("spawn gopls");
-    c.configure(declared(vec![once.clone()], Duration::from_secs(120)));
+    c.configure(declared(vec![once.clone()], Duration::from_secs(120)))
+        .expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .expect("initialize");
     gate(&mut c).unwrap_or_else(|e| panic!("a loaded module must pass its once signal: {e}"));
@@ -690,12 +700,14 @@ fn gopls_once_signal_outlives_the_messages_that_follow_it() {
     c.configure(declared(
         vec![once, done_is_latest],
         Duration::from_secs(120),
-    ));
+    ))
+    .expect("valid configuration");
     gate(&mut c).unwrap_or_else(|e| panic!("a later showMessage un-met the once signal: {e}"));
 
     // Control, same server, same messages, read as a state: never met again.
     let as_state = gopls_finished_loading(ReadyMode::Latest);
-    c.configure(declared(vec![as_state.clone()], Duration::from_secs(3)));
+    c.configure(declared(vec![as_state.clone()], Duration::from_secs(3)))
+        .expect("valid configuration");
     match gate(&mut c) {
         Err(LspError::ReadySignalDeadline {
             ref signal,
@@ -737,7 +749,7 @@ fn start_argv(
     }
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut c = Client::new_stdio(&argv).unwrap_or_else(|e| panic!("spawn {server}: {e}"));
-    c.configure(cfg);
+    c.configure(cfg).expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .unwrap_or_else(|e| panic!("{server}: initialize: {e}"));
     (dir, root, c)
@@ -837,7 +849,8 @@ fn gopls_malformed_go_mod_is_reported_where_it_is() {
     // file, that the module never initialised. It comes on gopls's own
     // schedule, so it is declared now and asked for after the gate, and is
     // found whichever side of this line it arrived on.
-    c.configure(declared(vec![in_go_mod, from_go_list], deadline));
+    c.configure(declared(vec![in_go_mod, from_go_list], deadline))
+        .expect("valid configuration");
     let until = Instant::now() + Duration::from_secs(60);
     let located = loop {
         match c.check_failures() {
@@ -1702,7 +1715,8 @@ fn rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_on
         ready_deadline: Duration::from_secs(120),
         ready_retry: Duration::from_millis(250),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .expect("initialize");
     assert!(
@@ -1725,7 +1739,7 @@ fn rust_analyzer_is_ready_by_a_cross_file_probe_and_never_by_blank_or_in_file_on
     // it reloads after `cargo check`, a "content modified" refusal.
     let mut cfg = c.config();
     cfg.ready_deadline = Duration::from_secs(3);
-    c.configure(cfg);
+    c.configure(cfg).expect("valid configuration");
     match c.await_ready_by(&[in_file]) {
         Err(LspError::ReadyProbesDeadline { probes, .. }) => {
             eprintln!("in-file probe, last answer: {}", probes[0].last);

@@ -48,7 +48,8 @@ fn quick_close(mut c: Client) {
         shutdown_timeout: Duration::from_millis(50),
         exit_deadline: Duration::from_millis(50),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     // The child is no language server and cannot answer `shutdown`; close
     // still reaps it, which is all this needs.
     let _ = c.close();

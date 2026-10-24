@@ -121,7 +121,8 @@ fn npm_calls_during_session(options: Value, stop_at_first: bool) -> Vec<String> 
         initialize_timeout: Duration::from_secs(60),
         initialization_options: Some(declared),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     // The server looks for `lib/tsserver.js` in the declared path, then the
     // workspace's `node_modules`, then the `typescript` beside its own
     // install, and refuses to initialize when none has one. Only the operator

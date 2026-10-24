@@ -253,7 +253,8 @@ fn run_case(case: &Case) {
         ready_deadline: Duration::from_secs(120),
         ready_retry: Duration::from_millis(250),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .unwrap_or_else(|e| panic!("{}: initialize: {e}", case.name));
 
