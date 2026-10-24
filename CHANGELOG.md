@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.19.0 — declared missing tools and opt-in LSP metadata (source breaks)
+
+### Source breaks
+
+- `LspError` adds `MissingExecutable` and `InvalidMissingExecutablePattern`.
+- `LspError::Timeout` adds optional boxed request metadata in `request`.
+- `ClientConfig` adds `missing_executable_patterns`; exhaustive literals must declare it.
+  `MissingExecutablePattern` is a serde declaration that rejects unknown fields.
+- `Client::configure` returns `Result<(), LspError>`. Invalid missing-tool patterns
+  fail before any configuration field changes; callers must handle the result.
+  Pool `with_config` spawns can now fail when configuration is invalid.
+- `Client::set_request_trace`, `RequestTraceSink`, `RequestTraceEvent` and
+  `RequestTraceHop` expose opt-in metadata. Event and hop types are non-exhaustive.
+  Request ids are optional: status notifications carry no request id.
+- `LspPool::from_spawn` is public. Its caller-owned factory returns a fresh,
+  uninitialized client with configuration and tracing set before the handshake.
+
+### Behaviour
+
+- Caller-declared literal missing-executable patterns map matching refusals in
+  pipelined queries, readiness probes and `check_failures` to actionable errors
+  that name the missing tool and retain diagnostic context.
+- Request tracing carries session, method, id, URI, position and observation time,
+  never source or response payloads. Terminal hops include Reply, Timeout and Discarded.
+- Status observations expose server health and quiescence without message text.
+- Reader panic cleanup marks the connection dead and fails pending calls closed.
+
+
 ## 0.18.0 — a ready server's refusal is its answer (source break)
 
 ### Source break, and the fix

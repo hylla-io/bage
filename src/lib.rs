@@ -16,6 +16,7 @@ pub mod format;
 pub mod hashing;
 pub mod inspect;
 pub mod lsp;
+mod lsp_trace;
 pub mod normalize;
 pub mod parser;
 pub mod region;

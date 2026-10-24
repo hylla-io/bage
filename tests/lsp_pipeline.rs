@@ -62,7 +62,8 @@ fn quick_close(mut c: Client) {
         shutdown_timeout: Duration::from_millis(50),
         exit_deadline: Duration::from_millis(50),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     // The child is no language server and cannot answer `shutdown`; close
     // still reaps it, which is all this needs.
     let _ = c.close();
@@ -239,7 +240,8 @@ fn pipelined_call_hierarchy_equals_one_at_a_time_against_rust_analyzer() {
         ready_deadline: Duration::from_secs(120),
         ready_retry: Duration::from_millis(250),
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     c.initialize(&lsp::file_uri(root.to_str().expect("utf-8")).to_string())
         .expect("initialize");
     let a = root.join("src/a.rs");
@@ -391,7 +393,8 @@ fn quiescent_rust_analyzer(root: &Path) -> Client {
             mode: ReadyMode::Latest,
         }],
         ..ClientConfig::default()
-    });
+    })
+    .expect("valid configuration");
     c
 }
 

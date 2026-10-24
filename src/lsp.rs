@@ -30,9 +30,13 @@
 //! publish for a document replaces them, an empty one clears them), so
 //! [`Client::published_diagnostics`] reads them at any time and a declared
 //! [`DiagnosticFailure`] turns one of them into a located
-//! [`LspError::ServerReported`]. A server that answers only when asked is
+//! [`LspError::ServerReported`] or, under a matching declared pattern,
+//! [`LspError::MissingExecutable`]. A server that answers only when asked is
 //! reached with [`Client::pull_diagnostics`], whose answer lands in the same
 //! store.
+
+use crate::lsp_trace::{RequestTrace, SharedTrace, emit as emit_trace};
+pub use crate::lsp_trace::{RequestTraceEvent, RequestTraceHop, RequestTraceSink};
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -148,6 +152,7 @@ pub enum ReadyMode {
 
 /// A server notification that means "not functional and done trying":
 /// [`Client::await_ready`] stops at once with [`LspError::ServerReported`]
+/// (or [`LspError::MissingExecutable`] under a matching declared pattern)
 /// while it holds, instead of probing a server that has already said it will
 /// never answer; [`Client::check_failures`] reports it after the gate too.
 ///
@@ -810,8 +815,8 @@ fn value_contains(have: &Value, want: &Value) -> bool {
 /// later then fails that consumer's build instead of silently taking a default
 /// (such an addition ships as a minor-version bump while bage is pre-1.0).
 ///
-/// No value is validated. A zero bound is legal and fails at once, loudly, as
-/// the typed timeout of whatever it bounds.
+/// A zero bound is legal and fails at once as the typed timeout of whatever
+/// it bounds. Missing-executable patterns are validated before requests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClientConfig {
     /// Bounds the `initialize` request. Default 30 s. Separate from
@@ -868,9 +873,13 @@ pub struct ClientConfig {
     /// declared here; see [`ReadyFailure`].
     pub experimental_capabilities: Option<Value>,
     /// Server status notifications that end [`Client::await_ready`] at once
-    /// with [`LspError::ServerReported`]. Default: none, so readiness is
+    /// with [`LspError::ServerReported`] or a declared-pattern
+    /// [`LspError::MissingExecutable`]. Default: none, so readiness is
     /// decided by probing alone.
     pub ready_failures: Vec<ReadyFailure>,
+    /// Literal diagnostic patterns whose captured executable must be installed.
+    /// Empty by default; malformed patterns refuse before any request is sent.
+    pub missing_executable_patterns: Vec<MissingExecutablePattern>,
     /// Server status notifications that must ALL match before
     /// [`Client::await_ready`] probes, and while every code-navigation query
     /// is asked and answered: an answer given while one does not hold is
@@ -920,6 +929,7 @@ impl Default for ClientConfig {
             initialization_options: None,
             experimental_capabilities: None,
             ready_failures: Vec::new(),
+            missing_executable_patterns: Vec::new(),
             ready_signals: Vec::new(),
             diagnostic_failures: Vec::new(),
             hover_content_format: vec![MarkupKind::Markdown, MarkupKind::PlainText],
@@ -1034,9 +1044,81 @@ impl std::fmt::Display for Located<'_> {
     }
 }
 
+/// A caller-declared diagnostic with an executable between two literal delimiters.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingExecutablePattern {
+    /// Literal text immediately before the executable.
+    pub prefix: String,
+    /// Literal text immediately after the executable.
+    pub suffix: String,
+}
+
+impl MissingExecutablePattern {
+    fn validate(&self) -> Result<(), LspError> {
+        if self.prefix.is_empty()
+            || self.suffix.is_empty()
+            || self.prefix.chars().any(char::is_control)
+            || self.suffix.chars().any(char::is_control)
+        {
+            return Err(LspError::InvalidMissingExecutablePattern);
+        }
+        Ok(())
+    }
+
+    fn extract<'a>(&self, message: &'a str) -> Option<&'a str> {
+        let (_, tail) = message.split_once(&self.prefix)?;
+        let (executable, _) = tail.split_once(&self.suffix)?;
+        (!executable.is_empty()
+            && !executable
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\\'))
+        .then_some(executable)
+    }
+}
+
+#[cfg(test)]
+mod missing_executable_tests {
+    use super::MissingExecutablePattern;
+
+    #[test]
+    fn only_an_explicit_missing_executable_diagnostic_is_terminal() {
+        let pattern = MissingExecutablePattern {
+            prefix: "exec: \"".into(),
+            suffix: "\": executable file not found in $PATH".into(),
+        };
+        for executable in ["go", "cargo", "tool-name", "/tools/my tool"] {
+            let message = format!(
+                "load failed: exec: \"{executable}\": executable file not found in $PATH: stderr:"
+            );
+            assert_eq!(pattern.extract(&message), Some(executable));
+        }
+        for message in [
+            "no views",
+            "still loading",
+            "go command required",
+            "file not found",
+            "exec: \"go\": permission denied",
+            "exec: \"a\": permission denied; exec: \"b\": executable file not found in $PATH",
+            "exec: \"\": executable file not found in $PATH",
+            "exec: \"go\nother\": executable file not found in $PATH",
+            "exec: \"go\\other\": executable file not found in $PATH",
+            "exec: \"go\"other\": executable file not found in $PATH",
+            "exec: \"go\": executable file not found in project",
+        ] {
+            assert_eq!(pattern.extract(message), None, "{message:?}");
+        }
+    }
+}
+
 /// Errors surfaced by the LSP boundary.
 #[derive(Debug, Error)]
 pub enum LspError {
+    /// An executable diagnostic cannot be matched without valid literal delimiters.
+    #[error(
+        "lsp: missing-executable pattern requires nonempty prefix and suffix without control characters"
+    )]
+    InvalidMissingExecutablePattern,
     /// The source contains an invalid UTF-8 sequence at the given byte.
     #[error("lsp: malformed UTF-8 at byte {0}")]
     MalformedUtf8(usize),
@@ -1084,7 +1166,8 @@ pub enum LspError {
     /// package it cannot find this way, where other servers answer empty.
     ///
     /// Returned at once and never retried. A server that declares no signal
-    /// cannot say it is loaded, so its refusals stay "not yet" and end as
+    /// cannot say it is loaded, so, unless a declared missing-executable
+    /// pattern matches, its refusals stay "not yet" and end as
     /// [`LspError::QueryDeadline`]; so do the codes LSP gives for asking
     /// again (`RequestCancelled`, `ContentModified`, `ServerCancelled`,
     /// `ServerNotInitialized`).
@@ -1097,6 +1180,23 @@ pub enum LspError {
         /// The server's `error.message`.
         message: String,
     },
+    /// The server cannot run a tool its workspace requires.
+    #[error(
+        "lsp: {method}: required executable `{executable}` was not found; put `{executable}` on PATH. Server said: {message}{}{stderr}",
+        Located(.locations)
+    )]
+    MissingExecutable {
+        /// The request or notification that carried the failure.
+        method: String,
+        /// The executable named by the server.
+        executable: String,
+        /// The server's complete diagnostic.
+        message: String,
+        /// Locations retained from a declared diagnostic failure.
+        locations: Vec<PublishedDiagnostic>,
+        /// Captured server stderr at refusal.
+        stderr: Box<StderrTail>,
+    },
     /// The connection closed while a request was outstanding.
     #[error("lsp: {method}: connection closed")]
     Closed {
@@ -1104,12 +1204,14 @@ pub enum LspError {
         method: String,
     },
     /// No response arrived within the per-call bound.
-    #[error("lsp: {method}: no response after {after:?}")]
+    #[error("lsp: {method}: no response after {after:?}{context}", context = request.as_ref().map(|event| format!(" ({event})")).unwrap_or_default())]
     Timeout {
         /// The request method.
         method: String,
         /// How long the call waited.
         after: Duration,
+        /// Correlation metadata when request tracing was enabled.
+        request: Option<Box<RequestTraceEvent>>,
     },
     /// The rename retry loop exhausted its deadline against a server that
     /// never became ready.
@@ -1275,7 +1377,8 @@ pub enum LspError {
     /// The server said the project did not load: a declared [`ReadyFailure`]
     /// or [`DiagnosticFailure`] holds. Returned by [`Client::await_ready`],
     /// which stops at once rather than probing a server that has given up,
-    /// and by [`Client::check_failures`].
+    /// and by [`Client::check_failures`]. A matching declared executable pattern
+    /// instead returns [`LspError::MissingExecutable`] with the same context.
     #[error(
         "lsp: not ready: server reported failure via {method}: {message}{}{stderr}",
         Located(.locations)
@@ -2568,6 +2671,7 @@ type PendingMap = Arc<Mutex<HashMap<u64, Sender<Answered>>>>;
 pub struct Client {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pending: PendingMap,
+    trace: SharedTrace,
     /// Bounded FIFO of [`DiagMsg`] — `publishDiagnostics` params (uri + version +
     /// diagnostics) interleaved with the in-band barrier marker. Carrying the uri
     /// lets [`Client::diagnostics`] match the requested file and drain a warm
@@ -2658,6 +2762,7 @@ pub struct Client {
     /// The declared failure rules and ready signals, and what the server has
     /// said that they are judged on, shared with the read loop.
     status: Arc<Mutex<StatusWatch>>,
+    missing_executable_patterns: Vec<MissingExecutablePattern>,
     /// Server stderr tail, fed by the drain thread `new_stdio` starts.
     stderr: Arc<Mutex<StderrRing>>,
 }
@@ -2797,6 +2902,7 @@ impl Client {
     ) -> Client {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(writer)));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
         // `+ 1` reserves a slot that the publish accounting (`diag_publishes`,
         // capped at DIAG_BUFFER) can never claim, so the barrier marker is never
         // dropped on a full buffer (DL-65 item 2).
@@ -2812,22 +2918,40 @@ impl Client {
             let barrier_arm = Arc::clone(&barrier_arm);
             let diag_publishes = Arc::clone(&diag_publishes);
             let status = Arc::clone(&status);
+            let trace = Arc::clone(&trace);
             thread::spawn(move || {
-                read_loop(
-                    Box::new(reader),
-                    writer,
-                    pending,
-                    diag_tx,
-                    diag_publishes,
-                    dead,
-                    barrier_arm,
-                    status,
-                )
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    read_loop(
+                        Box::new(reader),
+                        writer,
+                        pending.clone(),
+                        diag_tx,
+                        diag_publishes,
+                        dead.clone(),
+                        barrier_arm,
+                        status.clone(),
+                        trace.clone(),
+                    )
+                }));
+                if result.is_err() {
+                    dead.store(true, Ordering::Release);
+                    let discarded = lock(&trace).clear();
+                    let stamp = lock(&status).stamp();
+                    for (id, tx) in lock(&pending).drain() {
+                        // A caller may already have reached its own bound.
+                        let _ = tx.send((id, RpcOutcome::Closed, stamp));
+                    }
+                    // A broken sink must not interrupt failure delivery to callers.
+                    for event in discarded {
+                        emit_trace(Some(event));
+                    }
+                }
             });
         }
         Client {
             writer,
             pending,
+            trace,
             diags: diag_rx,
             diag_publishes,
             barrier_arm,
@@ -2856,6 +2980,7 @@ impl Client {
             experimental_capabilities: None,
             hover_content_format: vec![MarkupKind::Markdown, MarkupKind::PlainText],
             status,
+            missing_executable_patterns: Vec::new(),
             stderr: Arc::new(Mutex::new(StderrRing {
                 cap: DEFAULT_STDERR_TAIL_BYTES,
                 ..StderrRing::default()
@@ -2865,7 +2990,13 @@ impl Client {
 
     /// Applies every bound in `cfg`. Call before [`Client::initialize`] so the
     /// handshake itself runs under the declared `initialize_timeout`.
-    pub fn configure(&mut self, cfg: ClientConfig) {
+    ///
+    /// Invalid missing-executable patterns return
+    /// [`LspError::InvalidMissingExecutablePattern`] without changing any configuration.
+    pub fn configure(&mut self, cfg: ClientConfig) -> Result<(), LspError> {
+        for pattern in &cfg.missing_executable_patterns {
+            pattern.validate()?;
+        }
         let ClientConfig {
             initialize_timeout,
             call_timeout,
@@ -2882,6 +3013,7 @@ impl Client {
             initialization_options,
             experimental_capabilities,
             ready_failures,
+            missing_executable_patterns,
             ready_signals,
             diagnostic_failures,
             hover_content_format,
@@ -2902,8 +3034,10 @@ impl Client {
         self.initialization_options = initialization_options;
         self.experimental_capabilities = experimental_capabilities;
         self.hover_content_format = hover_content_format;
+        self.missing_executable_patterns = missing_executable_patterns;
         lock(&self.status).set_watch(ready_failures, ready_signals, diagnostic_failures);
         lock(&self.stderr).set_cap(stderr_tail_bytes);
+        Ok(())
     }
 
     /// The server's recent stderr; empty and uncaptured for a
@@ -2947,6 +3081,7 @@ impl Client {
             initialization_options: self.initialization_options.clone(),
             experimental_capabilities: self.experimental_capabilities.clone(),
             ready_failures,
+            missing_executable_patterns: self.missing_executable_patterns.clone(),
             ready_signals,
             diagnostic_failures,
             hover_content_format: self.hover_content_format.clone(),
@@ -2954,20 +3089,53 @@ impl Client {
         }
     }
 
+    /// Enables metadata-only request tracing for this session, or disables it with `None`.
+    /// Changing the destination forgets correlation for requests already in flight.
+    /// A callback already captured by the reader may finish after this returns.
+    /// No new callback captures the previous destination after this returns.
+    pub fn set_request_trace(&mut self, session: String, sink: Option<Arc<dyn RequestTraceSink>>) {
+        let discarded = lock(&self.trace).configure(session, sink);
+        for event in discarded {
+            emit_trace(Some(event));
+        }
+    }
+
+    fn missing_executable(&self, message: &str) -> Option<String> {
+        self.missing_executable_patterns
+            .iter()
+            .find_map(|pattern| pattern.extract(message).map(str::to_owned))
+    }
+
     /// Sends one request and blocks for its response (bounded by `timeout`).
     fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, LspError> {
         let (tx, rx) = mpsc::channel();
-        let id = self.send_request(method, params, tx)?;
+        let (id, request) = self.send_request(method, params, tx)?;
         match rx.recv_timeout(timeout) {
-            Ok((_, outcome, _)) => outcome_result(method, outcome),
-            Err(RecvTimeoutError::Disconnected) => Err(LspError::Closed {
-                method: method.to_string(),
-            }),
+            Ok((_, outcome, _)) => {
+                let event = lock(&self.trace).discard(id);
+                emit_trace(event);
+                outcome_result(method, outcome)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let event = lock(&self.trace).discard(id);
+                emit_trace(event);
+                Err(LspError::Closed {
+                    method: method.to_string(),
+                })
+            }
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&id);
+                let event = lock(&self.trace).end(id, RequestTraceHop::Timeout);
+                let request = request.map(|mut event| {
+                    event.hop = RequestTraceHop::Timeout;
+                    event.observed_at = std::time::SystemTime::now();
+                    event
+                });
+                emit_trace(event);
                 Err(LspError::Timeout {
                     method: method.to_string(),
                     after: timeout,
+                    request,
                 })
             }
         }
@@ -2980,7 +3148,10 @@ impl Client {
         method: &str,
         params: Value,
         tx: Sender<Answered>,
-    ) -> Result<u64, LspError> {
+    ) -> Result<(u64, Option<Box<RequestTraceEvent>>), LspError> {
+        for pattern in &self.missing_executable_patterns {
+            pattern.validate()?;
+        }
         // Reader dead: the read loop already exited, so no response can ever
         // arrive. Writing + blocking would burn the full `timeout` and return a
         // non-fatal `Timeout` (the half-dead escape). Fail FATAL now so the
@@ -3009,12 +3180,25 @@ impl Client {
             });
         }
 
+        let event = lock(&self.trace).send(id, method, &params);
+        let request = event.as_ref().map(|(_, event)| Box::new(event.clone()));
+        emit_trace(event);
+        if self.dead.load(Ordering::Acquire) {
+            lock(&self.pending).remove(&id);
+            let event = lock(&self.trace).discard(id);
+            emit_trace(event);
+            return Err(LspError::Closed {
+                method: method.to_string(),
+            });
+        }
         let req = rpc_message(Some(id), method, params);
         if let Err(e) = write_frame(lock(&self.writer).as_mut(), &req) {
             lock(&self.pending).remove(&id);
+            let event = lock(&self.trace).discard(id);
+            emit_trace(event);
             return Err(LspError::Io(e));
         }
-        Ok(id)
+        Ok((id, request))
     }
 
     /// Sends one notification (no response expected).
@@ -3333,6 +3517,8 @@ impl Client {
         self.next_id += 1;
         let barrier_id = self.next_id;
         self.barrier_arm.store(barrier_id, Ordering::Release);
+        let event = lock(&self.trace).send(barrier_id, BARRIER_METHOD, &Value::Null);
+        emit_trace(event);
         let req = rpc_message(Some(barrier_id), BARRIER_METHOD, Value::Null);
         let write_res = write_frame(lock(&self.writer).as_mut(), &req);
         let out = match write_res {
@@ -3343,6 +3529,13 @@ impl Client {
         // Disarm unconditionally so a late barrier response cannot stamp a stale
         // marker against a FUTURE call's channel.
         self.barrier_arm.store(0, Ordering::Release);
+        let event = match &out {
+            Err(LspError::DiagnosticsTimeout { .. }) => {
+                lock(&self.trace).end(barrier_id, RequestTraceHop::Timeout)
+            }
+            _ => lock(&self.trace).discard(barrier_id),
+        };
+        emit_trace(event);
         out
     }
 
@@ -3472,6 +3665,8 @@ impl Client {
     /// the dead connection with its own error. A refusal from a server whose
     /// declared signals held from question to answer, with a code LSP does
     /// not mark retryable, is final: [`LspError::Refused`], never retried.
+    /// A refusal matching a declared missing-executable pattern is terminal
+    /// regardless of readiness and returns [`LspError::MissingExecutable`].
     ///
     /// Readiness is checked per answer, not per batch. The read loop stamps
     /// each response with the declared signals' state as it routes it, so a
@@ -3500,6 +3695,7 @@ impl Client {
         let mut answers: Vec<Option<Result<Value, LspError>>> = asks.iter().map(|_| None).collect();
         // When each ask was first sent: the start of its `query_deadline`.
         let mut first_sent: Vec<Option<Instant>> = vec![None; asks.len()];
+        let mut request_context: HashMap<u64, Box<RequestTraceEvent>> = HashMap::new();
         // Request id → (ask index, when its `call_timeout` runs out, the
         // server's readiness when it was sent).
         let mut outstanding: HashMap<u64, (usize, Instant, ReadyStamp)> = HashMap::new();
@@ -3544,7 +3740,10 @@ impl Client {
                 }
                 .and_then(|()| self.send_request(method, ask.params.clone(), tx.clone()));
                 match sent {
-                    Ok(id) => {
+                    Ok((id, request)) => {
+                        if let Some(request) = request {
+                            request_context.insert(id, request);
+                        }
                         let at = Instant::now();
                         first_sent[idx].get_or_insert(at);
                         outstanding.insert(id, (idx, at + self.call_timeout, stamp));
@@ -3579,9 +3778,24 @@ impl Client {
             let failed: Vec<(usize, Option<LspError>)> = match rx.recv_timeout(wait) {
                 Ok((id, outcome, answered)) => match outstanding.remove(&id) {
                     Some((idx, _, asked)) => {
+                        request_context.remove(&id);
                         let ready = asked.ready_throughout(answered);
-                        match outcome {
-                            RpcOutcome::Err { code, message }
+                        let missing = match &outcome {
+                            RpcOutcome::Err { message, .. } => self.missing_executable(message),
+                            _ => None,
+                        };
+                        match (outcome, missing) {
+                            (RpcOutcome::Err { message, .. }, Some(executable)) => {
+                                answers[idx] = Some(Err(LspError::MissingExecutable {
+                                    method: method.to_owned(),
+                                    executable,
+                                    message,
+                                    locations: Vec::new(),
+                                    stderr: Box::new(self.stderr_tail()),
+                                }));
+                                Vec::new()
+                            }
+                            (RpcOutcome::Err { code, message }, _)
                                 if ready && signalled && !is_retryable_refusal(code) =>
                             {
                                 answers[idx] = Some(Err(LspError::Refused {
@@ -3591,7 +3805,7 @@ impl Client {
                                 }));
                                 Vec::new()
                             }
-                            outcome => match outcome_result(method, outcome) {
+                            (outcome, _) => match outcome_result(method, outcome) {
                                 Ok(v) if ready => {
                                     answers[idx] = Some(Ok(v));
                                     Vec::new()
@@ -3615,12 +3829,20 @@ impl Client {
                         .into_iter()
                         .filter_map(|id| {
                             lock(&self.pending).remove(&id);
-                            outstanding.remove(&id)
+                            let event = lock(&self.trace).end(id, RequestTraceHop::Timeout);
+                            let request = request_context.remove(&id).map(|mut request| {
+                                request.hop = RequestTraceHop::Timeout;
+                                request.observed_at = std::time::SystemTime::now();
+                                request
+                            });
+                            emit_trace(event);
+                            outstanding.remove(&id).map(|entry| (entry, request))
                         })
-                        .map(|(idx, _, _)| {
+                        .map(|((idx, _, _), request)| {
                             let e = LspError::Timeout {
                                 method: method.to_string(),
                                 after: self.call_timeout,
+                                request,
                             };
                             (idx, Some(e))
                         })
@@ -3768,7 +3990,8 @@ impl Client {
     /// empty can never terminate. Point it at a reference the workspace
     /// resolves — an import, a call to a declared function.
     ///
-    /// A refusal (JSON-RPC error) is also not-ready and keeps polling; a fatal
+    /// A refusal matching a declared missing-executable pattern returns
+    /// [`LspError::MissingExecutable`] at once; other JSON-RPC errors keep polling. A fatal
     /// transport error aborts at once so the pool respawns the corpse rather
     /// than probing a dead process for the full deadline. Readiness is a
     /// property of the SERVER, not of the probe position, but it is NOT
@@ -3784,7 +4007,8 @@ impl Client {
     /// A server that SAYS it has failed stops the wait at once: when a
     /// declared [`ClientConfig::ready_failures`] or
     /// [`ClientConfig::diagnostic_failures`] rule holds, this returns
-    /// [`LspError::ServerReported`] carrying the server's message and the
+    /// [`LspError::ServerReported`] (or [`LspError::MissingExecutable`] when
+    /// a declared pattern matches), carrying the server's message and the
     /// failing diagnostics' locations rather than probing a server that will
     /// never answer until the deadline. A failure the server reports only
     /// AFTER this returns is caught by [`Client::check_failures`].
@@ -3835,6 +4059,15 @@ impl Client {
                         }
                     }
                     Err(LspError::Rpc { message, .. }) => {
+                        if let Some(executable) = self.missing_executable(&message) {
+                            return Err(LspError::MissingExecutable {
+                                method: METHOD.to_owned(),
+                                executable,
+                                message,
+                                locations: Vec::new(),
+                                stderr: Box::new(self.stderr_tail()),
+                            });
+                        }
                         last = Waiting::Probe(ProbeAnswer::Refused { message });
                     }
                     Err(LspError::Timeout { after, .. }) => {
@@ -3946,7 +4179,18 @@ impl Client {
                                 locations => ProbeAnswer::SameFile { locations },
                             }
                         }
-                        Err(LspError::Rpc { message, .. }) => ProbeAnswer::Refused { message },
+                        Err(LspError::Rpc { message, .. }) => {
+                            if let Some(executable) = self.missing_executable(&message) {
+                                return Err(LspError::MissingExecutable {
+                                    method: METHOD.to_owned(),
+                                    executable,
+                                    message,
+                                    locations: Vec::new(),
+                                    stderr: Box::new(self.stderr_tail()),
+                                });
+                            }
+                            ProbeAnswer::Refused { message }
+                        }
                         Err(LspError::Timeout { after, .. }) => ProbeAnswer::NoResponse { after },
                         // Anything else means the transport is gone.
                         Err(e) => return Err(e),
@@ -3995,7 +4239,8 @@ impl Client {
     /// Judges the declared [`ClientConfig::ready_failures`] and
     /// [`ClientConfig::diagnostic_failures`] against everything the server
     /// has said SO FAR, and returns [`LspError::ServerReported`] when one
-    /// holds. Sends nothing and waits for nothing, so a caller can ask after
+    /// holds, or [`LspError::MissingExecutable`] when a declared pattern matches.
+    /// Malformed patterns return [`LspError::InvalidMissingExecutablePattern`]. Sends nothing and waits for nothing, so a caller can ask after
     /// its queries as well as before them.
     ///
     /// WHY AFTER: a server keeps talking once it has answered. Measured:
@@ -4014,14 +4259,28 @@ impl Client {
     /// nothing until [`Client::pull_diagnostics`] has been called for the
     /// documents that matter.
     pub fn check_failures(&self) -> Result<(), LspError> {
+        for pattern in &self.missing_executable_patterns {
+            pattern.validate()?;
+        }
         let failure = lock(&self.status).failure();
         match failure {
-            Some(reported) => Err(LspError::ServerReported {
-                method: reported.method,
-                message: reported.message,
-                locations: reported.locations,
-                stderr: self.stderr_tail(),
-            }),
+            Some(reported) => {
+                if let Some(executable) = self.missing_executable(&reported.message) {
+                    return Err(LspError::MissingExecutable {
+                        method: reported.method,
+                        executable,
+                        message: reported.message,
+                        locations: reported.locations,
+                        stderr: Box::new(self.stderr_tail()),
+                    });
+                }
+                Err(LspError::ServerReported {
+                    method: reported.method,
+                    message: reported.message,
+                    locations: reported.locations,
+                    stderr: self.stderr_tail(),
+                })
+            }
             None => Ok(()),
         }
     }
@@ -4120,7 +4379,8 @@ impl Client {
     /// [`LspError::QueryDeadline`] with the refusal as `last`; a caller in
     /// that case that cannot rule such positions out declares a
     /// `query_deadline` it can afford. [`Client::definition`] behaves the
-    /// same.
+    /// same. A matching declared executable pattern instead returns
+    /// [`LspError::MissingExecutable`] at once, with or without a ready signal.
     pub fn hover(
         &mut self,
         path: &str,
@@ -4163,6 +4423,8 @@ impl Client {
     /// units; see [`SymbolLocation`]. A refusal is [`LspError::Refused`] from
     /// a server whose declared signal held, and is retried to
     /// [`LspError::QueryDeadline`] otherwise, as [`Client::hover`] describes.
+    /// A matching declared executable pattern returns [`LspError::MissingExecutable`]
+    /// at once instead.
     ///
     /// Unlike `rename` this does NOT prime the workspace: priming re-opens
     /// every sibling file, which is amortizable across one rename but not
@@ -4611,16 +4873,19 @@ impl LspPool {
     ) -> LspPool {
         let spawn = move || {
             let mut c = Client::new_stdio(&command)?;
-            c.configure(client.clone());
+            c.configure(client.clone())?;
             Ok(c)
         };
         LspPool::from_spawn(Box::new(spawn), idle_ttl, max_servers)
     }
 
-    /// Seam constructor over an arbitrary spawn factory (tests wire in-memory
-    /// transports; production goes through [`LspPool::with_config`]). The cap
-    /// is floored at 1 so the pool can always hold the server it just spawned.
-    fn from_spawn(
+    /// Pool with a caller-owned client factory, invoked before initialization.
+    /// Configure each client's bounds and optional request trace in the factory
+    /// so the handshake uses them too. Return an uninitialized client; the pool
+    /// owns its initialization and close. The factory can run again after eviction
+    /// or a fatal transport failure, so each invocation must create a fresh client.
+    /// The cap is floored at 1 so the pool can hold the server it just spawned.
+    pub fn from_spawn(
         spawn: Box<dyn Fn() -> Result<Client, LspError> + Send + Sync>,
         idle_ttl: Duration,
         max_servers: usize,
@@ -5079,6 +5344,7 @@ fn read_loop(
     dead: Arc<AtomicBool>,
     barrier_arm: Arc<AtomicU64>,
     status: Arc<Mutex<StatusWatch>>,
+    trace: SharedTrace,
 ) {
     let mut r = BufReader::new(reader);
     // Run until EOF or a transport error: the connection is gone.
@@ -5129,6 +5395,8 @@ fn read_loop(
                 let _ = write_frame(lock(&writer).as_mut(), &resp);
             } else {
                 lock(&status).observe(method, obj.get("params"));
+                let event = lock(&trace).status(method, obj.get("params"));
+                emit_trace(event);
             }
             continue;
         }
@@ -5142,6 +5410,8 @@ fn read_loop(
         // `DiagnosticsTimeout` on a healthy warm server. The `arm != 0` guard
         // avoids matching the never-issued request id 0.
         if let Some(id) = obj.get("id").and_then(Value::as_u64) {
+            let event = lock(&trace).end(id, RequestTraceHop::Reply);
+            emit_trace(event);
             let arm = barrier_arm.load(Ordering::Acquire);
             if arm != 0 && arm == id {
                 let _ = diags.try_send(DiagMsg::Barrier(id));
@@ -5173,10 +5443,14 @@ fn read_loop(
     // request racing in right now observes the flag rather than writing into a
     // corpse. `Release` pairs with the `Acquire` loads in `call`/`diagnostics`.
     dead.store(true, Ordering::Release);
+    let discarded = lock(&trace).clear();
     let stamp = lock(&status).stamp();
-    // Fail any callers still waiting.
+    // A broken or slow sink must not delay failure delivery to callers.
     for (id, tx) in lock(&pending).drain() {
         let _ = tx.send((id, RpcOutcome::Closed, stamp));
+    }
+    for event in discarded {
+        emit_trace(Some(event));
     }
 }
 
@@ -6088,6 +6362,7 @@ mod tests {
             dead,
             barrier_arm,
             Arc::new(Mutex::new(StatusWatch::default())),
+            Arc::new(Mutex::new(RequestTrace::default())),
         );
 
         let mut publishes = 0;
@@ -6107,6 +6382,63 @@ mod tests {
             publishes, DIAG_BUFFER,
             "publishes stay capped at {DIAG_BUFFER}, never stealing the reserved slot"
         );
+    }
+
+    #[test]
+    fn client_connection_reserves_barrier_slot_under_publish_flood() {
+        struct GatedReader {
+            release: mpsc::Receiver<()>,
+            bytes: std::io::Cursor<Vec<u8>>,
+            started: bool,
+        }
+        impl Read for GatedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.started {
+                    self.release.recv().unwrap();
+                    self.started = true;
+                }
+                self.bytes.read(buffer)
+            }
+        }
+        let mut frames = Vec::new();
+        for _ in 0..DIAG_BUFFER {
+            write_frame(
+                &mut frames,
+                &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": "file:///work/main.rs", "diagnostics": []}}),
+            )
+            .unwrap();
+        }
+        write_frame(
+            &mut frames,
+            &json!({"jsonrpc": "2.0", "id": 7, "result": null}),
+        )
+        .unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let client = Client::from_conn(
+            GatedReader {
+                release: release_rx,
+                bytes: std::io::Cursor::new(frames),
+                started: false,
+            },
+            io::sink(),
+        );
+        client.barrier_arm.store(7, Ordering::Release);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        lock(&client.pending).insert(99, closed_tx);
+        release_tx.send(()).unwrap();
+        let (_, outcome, _) = closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(outcome, RpcOutcome::Closed));
+        let mut publishes = 0;
+        let mut barriers = Vec::new();
+        for message in client.diags.try_iter() {
+            match message {
+                DiagMsg::Publish(_) => publishes += 1,
+                DiagMsg::Barrier(id) => barriers.push(id),
+            }
+        }
+        assert_eq!(publishes, DIAG_BUFFER);
+        assert_eq!(barriers, vec![7], "connection must reserve a barrier slot");
     }
 
     #[test]
@@ -8482,6 +8814,891 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_trace_reports_the_timed_out_request_position() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                match message.get("method").and_then(Value::as_str) {
+                    Some("shutdown") => reply_ok(&mut writer, &message["id"], Value::Null),
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.set_request_trace("timeout-session".into(), Some(events.clone()));
+        let outcome = client.call(
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": "file:///work/slow.rs"},
+                "position": {"line": 7, "character": 11}
+            }),
+            Duration::from_millis(20),
+        );
+        client.set_request_trace("timeout-session".into(), None);
+        let closed = client.close();
+        assert!(matches!(outcome, Err(LspError::Timeout { .. })));
+        let events = lock(&events.0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].hop, RequestTraceHop::Timeout);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        assert_eq!(events[1].path.as_deref(), Some("file:///work/slow.rs"));
+        assert_eq!((events[1].line, events[1].character), (Some(7), Some(11)));
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("file:///work/slow.rs"), "{error}");
+        assert!(error.contains("timeout-session"), "{error}");
+        assert!(
+            error.contains("line 7") && error.contains("character 11"),
+            "{error}"
+        );
+        closed.expect("close");
+    }
+
+    #[test]
+    fn request_trace_timeout_keeps_context_when_reply_delivery_is_paused() {
+        struct PausedReply {
+            entered: Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            replies: Arc<AtomicUsize>,
+        }
+        impl RequestTraceSink for PausedReply {
+            fn record(&self, event: &RequestTraceEvent) {
+                if event.hop == RequestTraceHop::Reply {
+                    self.replies.fetch_add(1, Ordering::SeqCst);
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                }
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut client = query_client(client_conn);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let replies = Arc::new(AtomicUsize::new(0));
+        client.set_request_trace(
+            "reply-race".into(),
+            Some(Arc::new(PausedReply {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                replies: replies.clone(),
+            })),
+        );
+        // The latch models reader preemption after capturing Reply, before delivery.
+        let started = std::time::SystemTime::now();
+        let outcome = client.call(
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": "file:///work/race.rs"},
+                "position": {"line": 13, "character": 17}
+            }),
+            Duration::from_millis(50),
+        );
+        let timeout_returned = std::time::SystemTime::now();
+        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+        client.set_request_trace(String::new(), None);
+        release_tx.send(()).unwrap();
+        client
+            .call(
+                "textDocument/definition",
+                json!({
+                    "textDocument": {"uri": "file:///work/after-disable.rs"},
+                    "position": {"line": 0, "character": 0}
+                }),
+                Duration::from_secs(2),
+            )
+            .expect("untraced response after captured callback");
+        client.close().expect("close");
+        entered.expect("reply reached the delivery pause");
+        assert_eq!(
+            replies.load(Ordering::SeqCst),
+            1,
+            "old sink received a new reply after disable"
+        );
+        match outcome {
+            Err(LspError::Timeout { request, .. }) => {
+                let request = request.expect("enabled tracing retains timeout attribution");
+                assert!(
+                    request.observed_at.duration_since(started).unwrap()
+                        >= Duration::from_millis(50),
+                    "timeout context retained send timestamp"
+                );
+                assert!(request.observed_at <= timeout_returned);
+                assert_eq!(request.session, "reply-race");
+                assert_eq!(request.path.as_deref(), Some("file:///work/race.rs"));
+                assert_eq!((request.line, request.character), (Some(13), Some(17)));
+            }
+            other => panic!("want attributed timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_trace_status_observation_omits_message_text() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                match message["method"].as_str() {
+                    Some("textDocument/definition") => {
+                        write_frame(&mut writer, &rpc_message(None, "experimental/serverStatus", json!({
+                            "health": "ok", "quiescent": false, "message": "private_status_canary"
+                        }))).unwrap();
+                        reply_ok(&mut writer, &message["id"], json!([]));
+                    }
+                    Some("shutdown") => reply_ok(&mut writer, &message["id"], Value::Null),
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.set_request_trace("status-session".into(), Some(events.clone()));
+        client
+            .call("textDocument/definition", json!({}), Duration::from_secs(2))
+            .unwrap();
+        client.set_request_trace(String::new(), None);
+        client.close().unwrap();
+        let events = lock(&events.0);
+        let status: Vec<_> = events
+            .iter()
+            .filter(|event| event.method == "experimental/serverStatus")
+            .collect();
+        assert_eq!(status.len(), 1, "{events:?}");
+        assert_eq!(status[0].session, "status-session");
+        assert_eq!(status[0].request_id, None);
+        assert_eq!(status[0].hop, RequestTraceHop::Status);
+        assert_eq!(status[0].health.as_deref(), Some("ok"));
+        assert_eq!(status[0].quiescent, Some(false));
+        assert!(status[0].observed_at <= std::time::SystemTime::now());
+        assert!(!format!("{events:?}").contains("private_status_canary"));
+    }
+
+    #[test]
+    fn request_trace_diagnostics_barrier_is_correlated() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |_, _| None);
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.next_id = 41;
+        client.set_request_trace("diagnostics-session".into(), Some(events.clone()));
+        let outcome =
+            client.diagnostics("/work/main.rs", "fn main() {}", Duration::from_millis(20));
+        assert!(
+            matches!(outcome, Err(LspError::DiagnosticsTimeout { .. })),
+            "{outcome:?}"
+        );
+        client.set_request_trace(String::new(), None);
+        client.close().expect("close");
+        let events = lock(&events.0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].request_id, Some(42));
+        assert_eq!(events[0].method, BARRIER_METHOD);
+        assert_eq!(events[0].hop, RequestTraceHop::Send);
+        assert_eq!(events[1].hop, RequestTraceHop::Reply);
+        assert_eq!(events[0].request_id, events[1].request_id);
+    }
+
+    #[test]
+    fn request_trace_unanswered_barrier_emits_timeout() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                match message["method"].as_str() {
+                    Some("shutdown") => reply_ok(&mut writer, &message["id"], Value::Null),
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.set_request_trace("barrier-timeout".into(), Some(events.clone()));
+        let outcome =
+            client.diagnostics("/work/main.rs", "fn main() {}", Duration::from_millis(20));
+        assert!(
+            matches!(outcome, Err(LspError::DiagnosticsTimeout { .. })),
+            "{outcome:?}"
+        );
+        client.set_request_trace(String::new(), None);
+        client.close().unwrap();
+        let events = lock(&events.0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].hop, RequestTraceHop::Send);
+        assert_eq!(events[1].hop, RequestTraceHop::Timeout);
+        assert_eq!(events[0].request_id, events[1].request_id);
+    }
+
+    #[test]
+    fn malformed_missing_executable_config_is_atomic() {
+        let mut client = Client::from_conn(std::io::empty(), std::io::sink());
+        let before = client.config();
+        let mut invalid = before.clone();
+        invalid.call_timeout = Duration::from_secs(123);
+        invalid.missing_executable_patterns = vec![MissingExecutablePattern {
+            prefix: String::new(),
+            suffix: "missing".into(),
+        }];
+        let outcome = client.configure(invalid);
+        assert!(matches!(
+            outcome,
+            Err(LspError::InvalidMissingExecutablePattern)
+        ));
+        assert_eq!(client.config(), before);
+    }
+
+    #[test]
+    fn request_trace_sink_panic_fails_the_client_closed() {
+        struct PanicReply;
+        impl RequestTraceSink for PanicReply {
+            fn record(&self, event: &RequestTraceEvent) {
+                if event.hop == RequestTraceHop::Reply {
+                    panic!("trace sink panic canary");
+                }
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut client = query_client(client_conn);
+        client.set_request_trace("panic-session".into(), Some(Arc::new(PanicReply)));
+        let first = client.call(
+            "textDocument/definition",
+            json!({}),
+            Duration::from_millis(20),
+        );
+        client.set_request_trace(String::new(), None);
+        let second = client.call(
+            "textDocument/definition",
+            json!({}),
+            Duration::from_millis(20),
+        );
+        assert!(matches!(first, Err(LspError::Closed { .. })), "{first:?}");
+        assert!(matches!(second, Err(LspError::Closed { .. })), "{second:?}");
+        assert!(client.dead.load(Ordering::Acquire));
+        assert!(lock(&client.pending).is_empty());
+    }
+
+    #[test]
+    fn reader_null_error_is_a_result_without_an_unarmed_barrier() {
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        let (release_tx, release_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let frame = read_frame(&mut reader).unwrap().expect("request");
+            let request: Value = serde_json::from_slice(&frame).unwrap();
+            write_frame(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": request["id"], "error": null, "result": 42}),
+            )
+            .unwrap();
+            release_rx.recv().unwrap();
+        });
+        let mut client = query_client(client_conn);
+        client.barrier_arm.store(7, Ordering::Release);
+        let result = client.call("test/null-error", json!({}), Duration::from_secs(2));
+        let diagnostics = client.diags.try_recv();
+        release_tx.send(()).unwrap();
+        peer.join().unwrap();
+        assert_eq!(result.unwrap(), json!(42));
+        assert!(matches!(diagnostics, Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn request_trace_failure_paths_emit_discarded() {
+        struct FailWrite;
+        impl Write for FailWrite {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "write failure control",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Events {
+            events: Mutex<Vec<RequestTraceEvent>>,
+            on_send: Box<dyn Fn() + Send + Sync>,
+        }
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.events).push(event.clone());
+                if event.hop == RequestTraceHop::Send {
+                    (self.on_send)();
+                }
+            }
+        }
+        for scenario in ["write", "dead", "disconnected", "barrier"] {
+            let (client_conn, _server_conn) = conn_pair();
+            let mut client = query_client(client_conn);
+            if scenario == "barrier" {
+                client.did_open("/work/main.rs", "fn main() {}").unwrap();
+            }
+            if scenario == "write" {
+                *lock(&client.writer) = Box::new(FailWrite);
+            }
+            let dead = client.dead.clone();
+            let pending = client.pending.clone();
+            let writer = client.writer.clone();
+            let events = Arc::new(Events {
+                events: Mutex::new(Vec::new()),
+                on_send: Box::new(move || match scenario {
+                    "dead" => dead.store(true, Ordering::Release),
+                    "disconnected" => lock(&pending).clear(),
+                    "barrier" => *lock(&writer) = Box::new(FailWrite),
+                    _ => {}
+                }),
+            });
+            client.set_request_trace(scenario.into(), Some(events.clone()));
+            let outcome = if scenario == "barrier" {
+                client
+                    .diagnostics("/work/main.rs", "fn main() {}", Duration::from_secs(2))
+                    .map(|_| ())
+            } else {
+                client
+                    .call("test/request", json!({}), Duration::from_secs(2))
+                    .map(|_| ())
+            };
+            if matches!(scenario, "write" | "barrier") {
+                assert!(
+                    matches!(outcome, Err(LspError::Io(_))),
+                    "{scenario}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Err(LspError::Closed { .. })),
+                    "{scenario}: {outcome:?}"
+                );
+            }
+            let events = lock(&events.events);
+            assert_eq!(events.len(), 2, "{scenario}: {events:?}");
+            assert_eq!(events[0].hop, RequestTraceHop::Send, "{scenario}");
+            assert_eq!(events[1].hop, RequestTraceHop::Discarded, "{scenario}");
+            assert_eq!(events[0].request_id, events[1].request_id, "{scenario}");
+        }
+    }
+
+    #[test]
+    fn request_trace_terminal_panic_still_drains_waiters() {
+        struct PanicDiscard;
+        impl RequestTraceSink for PanicDiscard {
+            fn record(&self, event: &RequestTraceEvent) {
+                if event.hop == RequestTraceHop::Discarded {
+                    panic!("terminal sink panic canary");
+                }
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            read_frame(&mut reader).unwrap().expect("request");
+            drop(writer);
+        });
+        let mut client = query_client(client_conn);
+        client.set_request_trace("terminal-panic".into(), Some(Arc::new(PanicDiscard)));
+        let outcome = client.call(
+            "textDocument/definition",
+            json!({}),
+            Duration::from_millis(20),
+        );
+        assert!(
+            matches!(outcome, Err(LspError::Closed { .. })),
+            "{outcome:?}"
+        );
+        assert!(lock(&client.pending).is_empty());
+        assert!(client.dead.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn request_trace_eof_closes_waiters_before_terminal_callback() {
+        struct PausedDiscard {
+            entered: Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl RequestTraceSink for PausedDiscard {
+            fn record(&self, event: &RequestTraceEvent) {
+                if event.hop == RequestTraceHop::Discarded {
+                    self.entered.send(()).unwrap();
+                    lock(&self.release).recv().unwrap();
+                    panic!("EOF terminal sink panic canary");
+                }
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            for _ in 0..2 {
+                read_frame(&mut reader).unwrap().expect("request");
+            }
+            drop(writer);
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut client = query_client(client_conn);
+        client.set_request_trace(
+            "eof-order".into(),
+            Some(Arc::new(PausedDiscard {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            })),
+        );
+        let (tx, rx) = mpsc::channel();
+        client.send_request("first", json!({}), tx.clone()).unwrap();
+        client.send_request("second", json!({}), tx).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let outcomes: Vec<_> = rx.try_iter().collect();
+        let pending_empty = lock(&client.pending).is_empty();
+        release_tx.send(()).unwrap();
+        assert_eq!(outcomes.len(), 2, "EOF callback delayed Closed delivery");
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, outcome, _)| matches!(outcome, RpcOutcome::Closed))
+        );
+        assert!(pending_empty);
+    }
+
+    #[test]
+    fn request_trace_repeated_sink_panic_still_drains_waiters() {
+        struct PanicTerminal;
+        impl RequestTraceSink for PanicTerminal {
+            fn record(&self, event: &RequestTraceEvent) {
+                if event.hop != RequestTraceHop::Send {
+                    panic!("repeated terminal sink panic canary");
+                }
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let first = read_frame(&mut reader).unwrap().expect("first request");
+            let first: Value = serde_json::from_slice(&first).unwrap();
+            read_frame(&mut reader).unwrap().expect("second request");
+            write_frame(
+                &mut writer,
+                &json!({"jsonrpc": "2.0", "id": first["id"], "result": []}),
+            )
+            .unwrap();
+        });
+        let mut client = query_client(client_conn);
+        client.set_request_trace("repeated-panic".into(), Some(Arc::new(PanicTerminal)));
+        let (tx, rx) = mpsc::channel();
+        let (first, _) = client.send_request("first", json!({}), tx.clone()).unwrap();
+        let (second, _) = client.send_request("second", json!({}), tx).unwrap();
+        let mut closed = Vec::new();
+        for _ in 0..2 {
+            let (id, outcome, _) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader panic must close every waiter");
+            assert!(matches!(outcome, RpcOutcome::Closed));
+            closed.push(id);
+        }
+        closed.sort_unstable();
+        assert_eq!(closed, vec![first, second]);
+        assert!(lock(&client.pending).is_empty());
+        assert!(client.dead.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn request_trace_connection_close_releases_correlation() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            read_frame(&mut reader).unwrap().expect("request");
+            drop(writer);
+        });
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.set_request_trace("closed-session".into(), Some(events.clone()));
+        let outcome = client.call(
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": "file:///work/closed.rs"},
+                "position": {"line": 2, "character": 5}
+            }),
+            Duration::from_secs(2),
+        );
+        assert!(
+            matches!(outcome, Err(LspError::Closed { .. })),
+            "{outcome:?}"
+        );
+        let events = lock(&events.0);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].hop, RequestTraceHop::Send);
+        assert_eq!(events[1].hop, RequestTraceHop::Discarded);
+        assert_eq!(events[0].request_id, events[1].request_id);
+        assert!(
+            lock(&client.trace)
+                .end(events[0].request_id.unwrap(), RequestTraceHop::Reply)
+                .is_none(),
+            "closed connection retained request correlation"
+        );
+    }
+
+    #[test]
+    fn request_trace_factory_captures_initialization_and_warm_reuse() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let events = Arc::new(Events::default());
+        let sink = events.clone();
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let count = spawned.clone();
+        let pool = LspPool::from_spawn(
+            Box::new(move || {
+                let session = count.fetch_add(1, Ordering::SeqCst);
+                let (client_conn, server_conn) = conn_pair();
+                spawn_query_server(server_conn, |_, _| None);
+                let mut client = query_client(client_conn);
+                client.set_request_trace(format!("factory-{session}"), Some(sink.clone()));
+                Ok(client)
+            }),
+            Duration::from_secs(60),
+            1,
+        );
+        for _ in 0..2 {
+            pool.with_client(Path::new("/work"), "rust", |_| Ok(()))
+                .unwrap();
+        }
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        {
+            let events = lock(&events.0);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[0].method, "initialize");
+            assert_eq!(events[0].session, "factory-0");
+            assert_eq!(events[0].hop, RequestTraceHop::Send);
+            assert_eq!(events[1].hop, RequestTraceHop::Reply);
+            assert_eq!(events[0].request_id, events[1].request_id);
+        }
+        pool.shutdown();
+    }
+
+    #[test]
+    fn request_trace_pipeline_timeout_releases_correlation() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        let (reader, mut writer) = server_conn;
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            while let Ok(Some(body)) = read_frame(&mut reader) {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                match message.get("method").and_then(Value::as_str) {
+                    Some("shutdown") => reply_ok(&mut writer, &message["id"], Value::Null),
+                    Some("exit") => break,
+                    _ => {}
+                }
+            }
+        });
+        let mut client = query_client(client_conn);
+        client.call_timeout = Duration::from_millis(20);
+        client.query_deadline = Duration::from_millis(1);
+        let events = Arc::new(Events::default());
+        client.set_request_trace("pipeline-session".into(), Some(events.clone()));
+        let outcome = client.definition("/work/slow.rs", "fn slow() {}", 0, 3);
+        assert!(
+            matches!(outcome, Err(LspError::QueryDeadline { .. })),
+            "{outcome:?}"
+        );
+        {
+            let events = lock(&events.0);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[1].hop, RequestTraceHop::Timeout);
+            assert_eq!(events[0].request_id, events[1].request_id);
+            assert_eq!((events[1].line, events[1].character), (Some(0), Some(3)));
+            assert!(
+                lock(&client.trace)
+                    .end(events[0].request_id.unwrap(), RequestTraceHop::Reply)
+                    .is_none()
+            );
+        }
+        client.set_request_trace(String::new(), None);
+        client.close().expect("close");
+    }
+
+    #[test]
+    fn request_trace_correlates_send_reply_and_omits_source() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<RequestTraceEvent>>);
+        impl RequestTraceSink for Events {
+            fn record(&self, event: &RequestTraceEvent) {
+                lock(&self.0).push(event.clone());
+            }
+        }
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Ok(json!([]))),
+            _ => None,
+        });
+        let mut client = query_client(client_conn);
+        let events = Arc::new(Events::default());
+        client.next_id = 41;
+        client.set_request_trace("trace-session".into(), Some(events.clone()));
+        client
+            .definition("/work/main.rs", "fn source_content_canary() {}", 0, 3)
+            .expect("answer");
+        client.set_request_trace("trace-session".into(), None);
+        client
+            .definition("/work/main.rs", "fn source_content_canary() {}", 0, 3)
+            .expect("untraced answer");
+        client.close().expect("close");
+        let events = lock(&events.0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].hop, RequestTraceHop::Send);
+        assert_eq!(events[1].hop, RequestTraceHop::Reply);
+        assert_eq!(events[0].request_id, Some(42));
+        assert_eq!(events[0].request_id, events[1].request_id);
+        for event in events.iter() {
+            assert_eq!(event.session, "trace-session");
+            assert_eq!(event.method, "textDocument/definition");
+            assert_eq!(event.path.as_deref(), Some("file:///work/main.rs"));
+            assert_eq!((event.line, event.character), (Some(0), Some(3)));
+        }
+    }
+
+    #[test]
+    fn missing_executable_rpc_ends_both_readiness_waits() {
+        for multiple in [false, true] {
+            let (client_conn, server_conn) = conn_pair();
+            spawn_query_server(server_conn, |method, _| match method {
+                "textDocument/definition" => Some(Err(
+                    "exec: \"compiler-tool\": executable file not found in $PATH".to_owned(),
+                )),
+                _ => None,
+            });
+            let mut client = ready_client(client_conn);
+            client.missing_executable_patterns = vec![MissingExecutablePattern {
+                prefix: "exec: \"".into(),
+                suffix: "\": executable file not found in $PATH".into(),
+            }];
+            let path = "/work/main.rs";
+            let content = "fn main() {}\n";
+            let started = Instant::now();
+            let outcome = if multiple {
+                client
+                    .await_ready_by(&[ReadyProbe {
+                        path,
+                        content,
+                        line: 0,
+                        character: 3,
+                    }])
+                    .map(|_| ())
+            } else {
+                client.await_ready(path, content, 0, 3)
+            };
+            let elapsed = started.elapsed();
+            let closed = client.close();
+            assert!(
+                matches!(outcome, Err(LspError::MissingExecutable { executable, .. }) if executable == "compiler-tool")
+            );
+            assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+            closed.expect("close server");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_missing_executable_message_keeps_the_existing_refusal() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Err(
+                "exec: \"compiler\": executable file not found in $PATH".into(),
+            )),
+            _ => None,
+        });
+        let mut client = query_client(client_conn);
+        assert!(client.config().missing_executable_patterns.is_empty());
+        let outcome = client.definition("/work/main.rs", "fn main() {}", 0, 3);
+        let closed = client.close();
+        assert!(
+            matches!(outcome, Err(LspError::QueryDeadline { .. })),
+            "{outcome:?}"
+        );
+        closed.expect("close");
+    }
+
+    #[test]
+    fn missing_executable_after_readiness_is_terminal_without_a_signal() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_query_server(server_conn, |method, _| match method {
+            "textDocument/definition" => Some(Err("tool [compiler] is unavailable".into())),
+            _ => None,
+        });
+        let mut client = query_client(client_conn);
+        client.missing_executable_patterns = vec![MissingExecutablePattern {
+            prefix: "tool [".into(),
+            suffix: "] is unavailable".into(),
+        }];
+        let outcome = client.definition("/work/main.rs", "fn main() {}", 0, 3);
+        let closed = client.close();
+        assert!(
+            matches!(outcome, Err(LspError::MissingExecutable { executable, .. }) if executable == "compiler")
+        );
+        closed.expect("close");
+    }
+
+    #[test]
+    fn missing_executable_status_preserves_the_declared_failure() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_located_server(server_conn, vec![]);
+        let mut client = ready_client(client_conn);
+        client
+            .configure(ClientConfig {
+                ready_failures: vec![ReadyFailure {
+                    method: "test/status".into(),
+                    when: json!({"failed": true}),
+                    message_pointer: Some("/message".into()),
+                    mode: ReadyMode::Once,
+                }],
+                missing_executable_patterns: vec![MissingExecutablePattern {
+                    prefix: "missing [".into(),
+                    suffix: "]".into(),
+                }],
+                ..client.config()
+            })
+            .expect("valid configuration");
+        lock(&client.status).observe(
+            "test/status",
+            Some(&json!({"failed": true, "message": "missing [builder]"})),
+        );
+        let error = client.check_failures().expect_err("terminal status");
+        let closed = client.close();
+        assert!(
+            matches!(error, LspError::MissingExecutable { executable, message, stderr, .. }
+            if executable == "builder" && message == "missing [builder]" && !stderr.captured)
+        );
+        closed.expect("close");
+    }
+
+    #[test]
+    fn missing_executable_keeps_diagnostic_locations_and_stderr() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_located_server(server_conn, vec![]);
+        let mut client = ready_client(client_conn);
+        client
+            .configure(ClientConfig {
+                diagnostic_failures: vec![DiagnosticFailure {
+                    when: json!({"severity": 1}),
+                    file_name: None,
+                    mode: ReadyMode::Once,
+                }],
+                missing_executable_patterns: vec![MissingExecutablePattern {
+                    prefix: "missing [".into(),
+                    suffix: "]".into(),
+                }],
+                ..client.config()
+            })
+            .expect("valid configuration");
+        lock(&client.status).publish(&json!({"uri": "file:///work/go.mod", "diagnostics": [wire_diagnostic(4, 1, "test", "missing [builder]")]}));
+        lock(&client.stderr).push(b"server details\n");
+        let error = client.check_failures().expect_err("missing tool");
+        let closed = client.close();
+        let LspError::MissingExecutable {
+            locations, stderr, ..
+        } = error
+        else {
+            panic!("{error:?}")
+        };
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].message, "missing [builder]");
+        assert_eq!(stderr.text, "server details\n");
+        closed.expect("close");
+    }
+
+    #[test]
+    fn malformed_missing_executable_patterns_refuse_before_a_request() {
+        let (client_conn, server_conn) = conn_pair();
+        spawn_located_server(server_conn, vec![]);
+        let mut client = ready_client(client_conn);
+        for (prefix, suffix) in [("", "]"), ("[", ""), ("\n", "]"), ("[", "\0")] {
+            client.missing_executable_patterns = vec![MissingExecutablePattern {
+                prefix: prefix.into(),
+                suffix: suffix.into(),
+            }];
+            assert!(matches!(
+                client.check_failures(),
+                Err(LspError::InvalidMissingExecutablePattern)
+            ));
+            let before = client.next_id;
+            assert!(matches!(
+                client.call("test/request", Value::Null, Duration::from_secs(1)),
+                Err(LspError::InvalidMissingExecutablePattern)
+            ));
+            assert_eq!(client.next_id, before);
+        }
+        client.missing_executable_patterns.clear();
+        client.close().expect("close");
+    }
+
     /// A client whose readiness polling is slow enough that a single extra
     /// poll is unmistakable in the elapsed time.
     fn ready_client(conn: (PipeReader, PipeWriter)) -> Client {
@@ -8578,7 +9795,7 @@ mod tests {
         c.ready_deadline = Duration::from_millis(150);
         let mut cfg = c.config();
         cfg.ready_signals = signals;
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         round_trip(&mut c);
         (c, asked)
@@ -8978,7 +10195,7 @@ mod tests {
         c.ready_deadline = deadline;
         let mut cfg = c.config();
         cfg.ready_failures = rules;
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         c
     }
@@ -9122,7 +10339,7 @@ mod tests {
         c.ready_deadline = Duration::from_millis(120);
         let mut cfg = c.config();
         cfg.ready_signals = signals;
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         round_trip(&mut c);
         let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
@@ -9234,7 +10451,7 @@ mod tests {
         c.ready_retry = Duration::from_millis(5);
         let mut cfg = c.config();
         cfg.ready_signals = vec![quiescent_signal()];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         let start = Instant::now();
         let got = c.await_ready("/work/main.rs", "fn main() {}\n", 0, 3);
@@ -9583,7 +10800,7 @@ mod tests {
         c.ready_retry = Duration::from_millis(5);
         let mut cfg = c.config();
         cfg.ready_signals = vec![quiescent_signal()];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         round_trip(&mut c);
         let start = Instant::now();
@@ -10152,7 +11369,7 @@ mod tests {
             diagnostic_rule(json!({"source": "go list"}), None, ReadyMode::Latest),
             diagnostic_rule(json!({"severity": 1}), None, ReadyMode::Latest),
         ];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         round_trip(&mut c);
 
@@ -10535,7 +11752,7 @@ mod tests {
             Some("go.mod"),
             ReadyMode::Latest,
         )];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
         round_trip(&mut c);
         match c.check_failures() {
@@ -10600,7 +11817,7 @@ mod tests {
             None,
             ReadyMode::Latest,
         )];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c.initialize("file:///work").unwrap();
 
         c.await_ready("/work/src/lib.rs", "use missing_crate::Thing;\n", 0, 3)
@@ -11365,7 +12582,7 @@ mod tests {
         let mut c = query_client(conn);
         let mut cfg = c.config();
         cfg.ready_signals = vec![quiescent_signal()];
-        c.configure(cfg);
+        c.configure(cfg).expect("valid configuration");
         c
     }
 
@@ -11936,7 +13153,7 @@ mod tests {
             let mut c = query_client(client_conn);
             let mut cfg = c.config();
             cfg.ready_signals = signals;
-            c.configure(cfg);
+            c.configure(cfg).expect("valid configuration");
             c.initialize("file:///work").unwrap();
             round_trip(&mut c);
             let got = within(Duration::from_secs(10), move || {
