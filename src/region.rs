@@ -227,7 +227,7 @@ pub fn resolve(
         path: r.path.clone(),
         source: e,
     })?;
-    let matches = match_nodes(&tree.root, live, &r.region_hash);
+    let matches = match_nodes(&tree.root, live, &r.region_hash, lang);
     match matches.len() {
         1 => Ok((matches[0].start, matches[0].end, ResolveStatus::Shifted)),
         0 => Err(ResolveError::Conflict {
@@ -263,17 +263,27 @@ fn checked_range(r: &Region) -> Result<(usize, usize), ResolveError> {
 /// to `want`. Each distinct byte range is reported once: a node and an
 /// only-child commonly share a span, and counting that span twice would
 /// falsely report Ambiguous, so spans are de-duplicated.
-fn match_nodes(root: &crate::parser::Node, src: &[u8], want: &str) -> Vec<ByteRange> {
+///
+/// A Markdown candidate is the node's span cut the way the outline cuts it
+/// ([`crate::inspect::md_unit_end`]): a host echoes the listed span's hash,
+/// and the raw node can also own the next line's container prefix. The
+/// normalized hash drops a trailing indent, so the raw node would match and a
+/// replacement would eat the indent; a trailing `>` hashes differently, so a
+/// moved unit would read as a conflict. Only the cut span is a candidate, so
+/// it and its raw node never count as twins.
+fn match_nodes(root: &crate::parser::Node, src: &[u8], want: &str, lang: Lang) -> Vec<ByteRange> {
     let mut matches = Vec::new();
     let mut seen: HashSet<ByteRange> = HashSet::new();
     root.walk(&mut |n| {
-        if n.end_byte <= src.len()
-            && n.start_byte <= n.end_byte
-            && hash_region(src, n.start_byte, n.end_byte) == want
-        {
+        let end = if lang == Lang::Markdown {
+            crate::inspect::md_unit_end(n).0
+        } else {
+            n.end_byte
+        };
+        if end <= src.len() && n.start_byte <= end && hash_region(src, n.start_byte, end) == want {
             let br = ByteRange {
                 start: n.start_byte,
-                end: n.end_byte,
+                end,
             };
             if seen.insert(br) {
                 matches.push(br);

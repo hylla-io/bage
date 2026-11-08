@@ -142,8 +142,9 @@ pub struct Symbol {
 /// declaration node, in source order, with its byte and line ranges. Code
 /// grammars select declaration nodes by named-node kind, so any tree-sitter
 /// grammar works; the data-format grammars (JSON, YAML, TOML, XML, CSS,
-/// HTML) instead list their named-block kinds — pairs, tables, elements,
-/// rule sets — via [`data_decl_kinds`]. For the grammar-free text fallback
+/// HTML) and Markdown instead list their named-block kinds — pairs, tables,
+/// elements, rule sets, document blocks — via [`data_decl_kinds`]. For the
+/// grammar-free text fallback
 /// it returns one symbol per source line.
 ///
 /// The text fallback is identified by the absence of a native engine tree
@@ -202,21 +203,86 @@ fn walk_decls(
         let misread = misread || tc.is_none_or(|t| depth == 0 && t.has_error());
         if c.named && is_outline_kind(lang, &c.kind, depth) {
             let (name, name_range) = symbol_name(lang, c, tc.filter(|_| !misread), src);
+            let (end_byte, end_point) = if lang == Lang::Markdown {
+                md_unit_end(c)
+            } else {
+                (c.end_byte, c.end_point)
+            };
             out.push(Symbol {
                 kind: c.kind.clone(),
                 name,
                 start_byte: c.start_byte,
-                end_byte: c.end_byte,
+                end_byte,
                 start_line: c.start_point.row + 1,
-                end_line: c.end_point.row + 1,
+                end_line: last_line(lang, c.start_byte, end_byte, end_point),
                 start_point: c.start_point,
-                end_point: c.end_point,
+                end_point,
                 name_range,
             });
+        }
+        // A setext heading's text is the heading itself, not a second unit.
+        if lang == Lang::Markdown && c.kind == "setext_heading" {
+            continue;
         }
         walk_decls(c, tc, misread, src, lang, depth + 1, out);
     }
 }
+
+/// The 1-based last line of an outline node. A Markdown block owns the
+/// newline that ends it, so its end point sits at column 0 of the next line;
+/// its last line is the one holding its last byte, or a unit would reach the
+/// line after it.
+fn last_line(lang: Lang, start_byte: usize, end_byte: usize, end_point: Point) -> usize {
+    if lang == Lang::Markdown && end_point.col == 0 && end_byte > start_byte {
+        return end_point.row;
+    }
+    end_point.row + 1
+}
+
+/// Where a Markdown unit ends, and its point. tree-sitter-md puts the next
+/// line's container prefix (a nested list's indent, a quote's `>`) in a
+/// `block_continuation` at the end of the line ending before it, and a
+/// container ends where its last block does, so the prefix can be the last
+/// token of any unit. That prefix belongs to the next line: a unit that
+/// owned it would make a replacement drop it and move the next line out of
+/// its container. So a trailing `block_continuation`, at any depth, is cut
+/// off, and only that. The region resolver uses it too, so a shifted unit
+/// relocates to the span the outline listed.
+pub(crate) fn md_unit_end(n: &Node) -> (usize, Point) {
+    let mut end = (n.end_byte, n.end_point);
+    while let Some(cut) = trailing_continuation(n, end.0) {
+        end = cut;
+    }
+    end
+}
+
+/// The start of the `block_continuation` that is the last non-empty token
+/// of `n` ending at `end`, or `None` when that token is anything else. A
+/// child ending before `end` means bytes no visible node holds close `n`,
+/// so the last token is not a continuation.
+fn trailing_continuation(n: &Node, end: usize) -> Option<(usize, Point)> {
+    let c = n.children.iter().rev().find(|c| c.start_byte < end)?;
+    if c.end_byte != end {
+        return None;
+    }
+    if c.kind == "block_continuation" {
+        return Some((c.start_byte, c.start_point));
+    }
+    trailing_continuation(c, end)
+}
+
+/// The Markdown blocks an agent edits a document by. Containers (section,
+/// list, pipe_table), the delimiter row, cells and inline text are not.
+const MD_BLOCK_KINDS: &[&str] = &[
+    "atx_heading",
+    "setext_heading",
+    "paragraph",
+    "list_item",
+    "pipe_table_header",
+    "pipe_table_row",
+    "fenced_code_block",
+    "block_quote",
+];
 
 /// The substrings whose presence in a node kind marks it a declaration
 /// across the supported grammars.
@@ -317,8 +383,8 @@ fn direct_name(n: &Node, src: &[u8]) -> String {
     String::new()
 }
 
-/// The named-block kinds that form the outline for a data-format grammar,
-/// or `None` for code grammars (which use [`is_decl_kind`]). TOML's
+/// The named-block kinds that form the outline for a data-format grammar
+/// or Markdown, or `None` for code grammars (which use [`is_decl_kind`]). TOML's
 /// top-level bare pairs are handled separately in [`is_outline_kind`]
 /// because they are outline-worthy only at document depth.
 fn data_decl_kinds(lang: Lang) -> Option<&'static [&'static str]> {
@@ -328,6 +394,7 @@ fn data_decl_kinds(lang: Lang) -> Option<&'static [&'static str]> {
         Lang::Toml => &["table"],
         Lang::Xml | Lang::Html => &["element"],
         Lang::Css => &["rule_set"],
+        Lang::Markdown => MD_BLOCK_KINDS,
         _ => return None,
     })
 }
@@ -388,6 +455,8 @@ fn symbol_name(
             child_kind_text(n, src, "selectors").trim().to_string(),
             n.children.iter().find(|c| c.kind == "selectors").map(at),
         ),
+        // A Markdown block has no declared name.
+        Lang::Markdown => (String::new(), None),
         _ => match tn {
             None => (decl_name(n, src), decl_name_node(n, src).map(at)),
             Some(_) if is_body_kind(&n.kind) => (String::new(), None),
@@ -3940,5 +4009,599 @@ Point other(int z);
             "a kind mismatch"
         );
         assert_eq!(named(|c| drop(c.remove(1))), ["Point"], "a count mismatch");
+    }
+
+    // Markdown leaf blocks are the units an agent edits a document by, so the
+    // outline must list each one with a region_hash the resolver can find.
+    // Card board-card-patch-tool-2026-11-08.
+
+    /// One of each listed block kind: an ATX and a setext heading, two
+    /// paragraphs, a tight list, a table with a header and three rows, a
+    /// fenced code block and a block quote.
+    const MD_DOC: &str = "\
+# Title
+
+First paragraph.
+
+Second paragraph.
+
+Subtitle
+========
+
+- item one
+- item two
+
+| a | b |
+| --- | --- |
+| 1 | 2 |
+| 3 | 4 |
+| 5 | 6 |
+
+```rust
+let x = 1;
+```
+
+> Quoted text.
+";
+
+    fn md_open(src: &str) -> OpenedFile {
+        open_bytes(&Adapter::new(), "doc.md", src.as_bytes()).unwrap()
+    }
+
+    fn md_units(src: &str) -> Vec<Block> {
+        read_blocks(&md_open(src), false)
+    }
+
+    /// Each unit as (kind, start_byte, end_byte, start_line, end_line, its
+    /// bytes): the bytes make a wrong expected offset show what it covers.
+    fn kind_spans<'a>(
+        units: &'a [Block],
+        src: &'a str,
+    ) -> Vec<(&'a str, usize, usize, usize, usize, &'a str)> {
+        units
+            .iter()
+            .map(|b| {
+                (
+                    b.kind.as_str(),
+                    b.start_byte,
+                    b.end_byte,
+                    b.start_line,
+                    b.end_line,
+                    &src[b.start_byte..b.end_byte],
+                )
+            })
+            .collect()
+    }
+
+    /// A region anchored the way an agent echoes a listed unit back.
+    fn anchored(b: &Block) -> Region {
+        Region {
+            path: "doc.md".into(),
+            start_byte: b.start_byte as i64,
+            end_byte: b.end_byte as i64,
+            region_hash: b.region_hash.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// A region carrying only a hash: no usable range, so the resolver must
+    /// find the unit by content alone.
+    fn hash_only(hash: &str) -> Region {
+        Region {
+            path: "doc.md".into(),
+            start_byte: LINE_SENTINEL,
+            end_byte: LINE_SENTINEL,
+            region_hash: hash.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn markdown_outline_lists_leaf_blocks_in_document_order() {
+        let units = md_units(MD_DOC);
+        // A unit is the grammar node's true byte span, ending before a
+        // trailing next-line container prefix, so an edit replaces the
+        // block's own bytes and no outer container's. tree-sitter-md ends
+        // every block on its newline; a list item also keeps the blank line
+        // it absorbs before the next block closes it. A table row ends on
+        // its last pipe, because the table owns the row's newline. A block
+        // quote starts at its `>` and its paragraph after the `> ` marker.
+        // A list item and a block quote come before the paragraph inside
+        // them. A setext heading's own text is not listed again as a
+        // paragraph. The table's delimiter row, its cells, the list, the
+        // table and the heading's section are containers or syntax, not
+        // edit units.
+        assert_eq!(
+            kind_spans(&units, MD_DOC),
+            [
+                ("atx_heading", 0, 8, 1, 1, "# Title\n"),
+                ("paragraph", 9, 26, 3, 3, "First paragraph.\n"),
+                ("paragraph", 27, 45, 5, 5, "Second paragraph.\n"),
+                ("setext_heading", 46, 64, 7, 8, "Subtitle\n========\n"),
+                ("list_item", 65, 76, 10, 10, "- item one\n"),
+                ("paragraph", 67, 76, 10, 10, "item one\n"),
+                ("list_item", 76, 88, 11, 12, "- item two\n\n"),
+                ("paragraph", 78, 87, 11, 11, "item two\n"),
+                ("pipe_table_header", 88, 97, 13, 13, "| a | b |"),
+                ("pipe_table_row", 112, 121, 15, 15, "| 1 | 2 |"),
+                ("pipe_table_row", 122, 131, 16, 16, "| 3 | 4 |"),
+                ("pipe_table_row", 132, 141, 17, 17, "| 5 | 6 |"),
+                (
+                    "fenced_code_block",
+                    143,
+                    166,
+                    19,
+                    21,
+                    "```rust\nlet x = 1;\n```\n"
+                ),
+                ("block_quote", 167, 182, 23, 23, "> Quoted text.\n"),
+                ("paragraph", 169, 182, 23, 23, "Quoted text.\n"),
+            ]
+        );
+        let src = MD_DOC.as_bytes();
+        for pair in units.windows(2) {
+            assert!(
+                (pair[0].start_byte, std::cmp::Reverse(pair[0].end_byte))
+                    < (pair[1].start_byte, std::cmp::Reverse(pair[1].end_byte)),
+                "document order, outer before inner: {pair:?}"
+            );
+        }
+        let li = LineIndex::new(src);
+        for u in &units {
+            assert_eq!(u.region_hash.len(), 16, "{u:?}");
+            // The last byte a unit owns names its last line, so a unit that
+            // ends on its newline does not reach the line after it.
+            assert_eq!(u.end_line, li.line_for_byte(u.end_byte - 1), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_units_hash_their_bytes_and_resolve_exact_in_place() {
+        let units = md_units(MD_DOC);
+        let src = MD_DOC.as_bytes();
+        let p = Adapter::new();
+        for kind in [
+            "atx_heading",
+            "setext_heading",
+            "paragraph",
+            "list_item",
+            "pipe_table_header",
+            "pipe_table_row",
+            "fenced_code_block",
+            "block_quote",
+        ] {
+            assert!(units.iter().any(|u| u.kind == kind), "{kind} not listed");
+        }
+        for u in &units {
+            assert_eq!(
+                u.region_hash,
+                region::hash_region(src, u.start_byte, u.end_byte),
+                "{u:?}"
+            );
+            let got = region::resolve(&p, Lang::Markdown, src, &anchored(u)).unwrap();
+            assert_eq!(
+                got,
+                (u.start_byte, u.end_byte, region::ResolveStatus::Exact),
+                "{u:?}"
+            );
+        }
+    }
+
+    /// A hash-anchored address is only useful if it survives a concurrent
+    /// edit above it: the resolver must relocate every listed unit by its
+    /// hash, not only find it where it was.
+    #[test]
+    fn markdown_units_relocate_by_hash_after_a_shift() {
+        let units = md_units(MD_DOC);
+        assert!(units.iter().any(|u| u.kind == "paragraph"), "{units:?}");
+        let old = MD_DOC.as_bytes();
+        let live = format!("Intro line.\n\n{MD_DOC}");
+        let live = live.as_bytes();
+        let p = Adapter::new();
+        for u in &units {
+            let (s, e, st) = region::resolve(&p, Lang::Markdown, live, &anchored(u))
+                .unwrap_or_else(|err| panic!("{u:?}: {err}"));
+            assert_eq!(st, region::ResolveStatus::Shifted, "{u:?}");
+            assert_eq!(&live[s..e], &old[u.start_byte..u.end_byte], "{u:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_twin_paragraphs_are_both_listed_and_addressed_by_bytes() {
+        let text = "Same text.\n\nSame text.\n";
+        let units = md_units(text);
+        assert_eq!(
+            kind_spans(&units, text),
+            [
+                ("paragraph", 0, 11, 1, 1, "Same text.\n"),
+                ("paragraph", 12, 23, 3, 3, "Same text.\n"),
+            ]
+        );
+        assert_eq!(units[0].region_hash, units[1].region_hash);
+        let p = Adapter::new();
+        let src = text.as_bytes();
+
+        let err = region::resolve(&p, Lang::Markdown, src, &hash_only(&units[0].region_hash))
+            .unwrap_err();
+        assert!(
+            matches!(err, region::ResolveError::Ambiguous { count: 2, .. }),
+            "{err}"
+        );
+
+        // The listed bytes, as `bage apply --start/--end` resolves them, are
+        // the unit's exact span, so each twin is addressed without a guess.
+        for u in &units {
+            let (s, e) = (u.start_byte as i64, u.end_byte as i64);
+            let mut r = resolve_range(src, -1, "", s, e).unwrap();
+            assert_eq!((r.start_byte, r.end_byte), (s, e), "{u:?}");
+            r.region_hash = u.region_hash.clone();
+            let got = region::resolve(&p, Lang::Markdown, src, &r).unwrap();
+            assert_eq!(
+                got,
+                (u.start_byte, u.end_byte, region::ResolveStatus::Exact),
+                "{u:?}"
+            );
+        }
+    }
+
+    /// A paragraph inside a list item is its own unit beside the item: the
+    /// item's range starts at its marker and the paragraph's after it, so no
+    /// two listed units share a range or a hash, and each is addressable.
+    /// Both end on the newline they share, which the grammar gives to both.
+    #[test]
+    fn markdown_nested_paragraph_and_its_list_item_are_distinct_units() {
+        let src = "- Inner paragraph.\n- Other.\n";
+        let units = md_units(src);
+        assert_eq!(
+            kind_spans(&units, src),
+            [
+                ("list_item", 0, 19, 1, 1, "- Inner paragraph.\n"),
+                ("paragraph", 2, 19, 1, 1, "Inner paragraph.\n"),
+                ("list_item", 19, 28, 2, 2, "- Other.\n"),
+                ("paragraph", 21, 28, 2, 2, "Other.\n"),
+            ]
+        );
+        let (item, para) = (&units[0], &units[1]);
+        assert_eq!(para.start_byte, item.start_byte + "- ".len());
+        assert_eq!(para.end_byte, item.end_byte);
+        assert_ne!(item.region_hash, para.region_hash);
+        let mut ranges: Vec<_> = units.iter().map(|u| (u.start_byte, u.end_byte)).collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        assert_eq!(ranges.len(), units.len(), "two units share a range");
+
+        let p = Adapter::new();
+        let bytes = src.as_bytes();
+
+        let live = format!("Intro.\n\n{src}");
+        let live = live.as_bytes();
+        for u in &units {
+            let got = region::resolve(&p, Lang::Markdown, bytes, &anchored(u)).unwrap();
+            assert_eq!(got.2, region::ResolveStatus::Exact, "{u:?}");
+            let (s, e, st) = region::resolve(&p, Lang::Markdown, live, &hash_only(&u.region_hash))
+                .unwrap_or_else(|err| panic!("{u:?}: {err}"));
+            assert_eq!(st, region::ResolveStatus::Shifted, "{u:?}");
+            assert_eq!(&live[s..e], &bytes[u.start_byte..u.end_byte], "{u:?}");
+        }
+    }
+
+    /// `src` with `unit`'s listed bytes replaced, the way a patch addressed
+    /// by the outline's start_byte/end_byte applies.
+    fn splice(src: &str, unit: &Block, with: &str) -> String {
+        format!("{}{with}{}", &src[..unit.start_byte], &src[unit.end_byte..])
+    }
+
+    /// Every unit's last line holds its last byte, and its points are the
+    /// row and column of its own bytes, so a host placing a unit by
+    /// `end_point` lands exactly on `end_byte`.
+    fn assert_md_positions(src: &str) {
+        let li = LineIndex::new(src.as_bytes());
+        for placed in read_placed_blocks(&md_open(src), false) {
+            let b = &placed.block;
+            assert_eq!(b.start_line, li.line_for_byte(b.start_byte), "{b:?}");
+            assert_eq!(b.end_line, li.line_for_byte(b.end_byte - 1), "{b:?}");
+            assert_eq!(placed.start_point, li.point_for_byte(b.start_byte), "{b:?}");
+            assert_eq!(placed.end_point, li.point_for_byte(b.end_byte), "{b:?}");
+        }
+    }
+
+    /// The grammar ends a paragraph on `_newline`, which also holds the next
+    /// line's `block_continuation`: here the two-space indent that keeps `b`
+    /// inside the outer item. A unit stops before that prefix, so replacing
+    /// the paragraph leaves the nested list where it was.
+    #[test]
+    fn markdown_nested_list_paragraph_ends_before_the_next_lines_indent() {
+        let src = "- a\n  - b\n";
+        let units = md_units(src);
+        assert_eq!(
+            kind_spans(&units, src),
+            [
+                ("list_item", 0, 10, 1, 2, "- a\n  - b\n"),
+                ("paragraph", 2, 4, 1, 1, "a\n"),
+                ("list_item", 6, 10, 2, 2, "- b\n"),
+                ("paragraph", 8, 10, 2, 2, "b\n"),
+            ]
+        );
+        assert_md_positions(src);
+
+        let edited = splice(src, &units[1], "x\n");
+        assert_eq!(edited, "- x\n  - b\n");
+        let again = md_units(&edited);
+        assert_eq!(
+            kind_spans(&again, &edited),
+            [
+                ("list_item", 0, 10, 1, 2, "- x\n  - b\n"),
+                ("paragraph", 2, 4, 1, 1, "x\n"),
+                ("list_item", 6, 10, 2, 2, "- b\n"),
+                ("paragraph", 8, 10, 2, 2, "b\n"),
+            ]
+        );
+        let (outer, inner) = (&again[0], &again[2]);
+        assert!(
+            outer.start_byte < inner.start_byte && inner.end_byte <= outer.end_byte,
+            "b left the outer item: {again:?}"
+        );
+    }
+
+    /// A quote's `>` on the next line is the paragraph's trailing
+    /// `block_continuation`. Owning it would make a replacement drop the
+    /// marker and split the quote in two.
+    #[test]
+    fn markdown_quote_paragraph_ends_before_the_next_lines_marker() {
+        let src = "> a\n>\n> b\n";
+        let units = md_units(src);
+        assert_eq!(
+            kind_spans(&units, src),
+            [
+                ("block_quote", 0, 10, 1, 3, "> a\n>\n> b\n"),
+                ("paragraph", 2, 4, 1, 1, "a\n"),
+                ("paragraph", 8, 10, 3, 3, "b\n"),
+            ]
+        );
+        assert_md_positions(src);
+
+        let edited = splice(src, &units[1], "x\n");
+        assert_eq!(edited, "> x\n>\n> b\n");
+        let again = md_units(&edited);
+        assert_eq!(
+            kind_spans(&again, &edited),
+            [
+                ("block_quote", 0, 10, 1, 3, "> x\n>\n> b\n"),
+                ("paragraph", 2, 4, 1, 1, "x\n"),
+                ("paragraph", 8, 10, 3, 3, "b\n"),
+            ]
+        );
+    }
+
+    /// A container ends where its last block ends, so when that block's
+    /// newline carries the next line's prefix for an outer container, the
+    /// container carries it too: here the item would own the `> ` that keeps
+    /// the heading inside the quote. A container stops before it by the same
+    /// rule as a leaf, so either unit can be replaced without moving the
+    /// heading out of the quote.
+    #[test]
+    fn markdown_container_ends_before_its_parents_next_line_prefix() {
+        let src = "> - a\n> # h\n";
+        let units = md_units(src);
+        assert_eq!(
+            kind_spans(&units, src),
+            [
+                ("block_quote", 0, 12, 1, 2, "> - a\n> # h\n"),
+                ("list_item", 2, 6, 1, 1, "- a\n"),
+                ("paragraph", 4, 6, 1, 1, "a\n"),
+                ("atx_heading", 8, 12, 2, 2, "# h\n"),
+            ]
+        );
+        assert_md_positions(src);
+
+        let expected_after = |text: &str| {
+            let again = md_units(text);
+            assert_eq!(
+                kind_spans(&again, text),
+                [
+                    ("block_quote", 0, 12, 1, 2, "> - x\n> # h\n"),
+                    ("list_item", 2, 6, 1, 1, "- x\n"),
+                    ("paragraph", 4, 6, 1, 1, "x\n"),
+                    ("atx_heading", 8, 12, 2, 2, "# h\n"),
+                ]
+            );
+        };
+        let by_item = splice(src, &units[1], "- x\n");
+        assert_eq!(by_item, "> - x\n> # h\n");
+        expected_after(&by_item);
+        let by_para = splice(src, &units[2], "x\n");
+        assert_eq!(by_para, "> - x\n> # h\n");
+        expected_after(&by_para);
+    }
+
+    /// The text a concurrent edit puts above every unit in the shift tests.
+    const SHIFT: &str = "x\n\n";
+
+    /// Relocates `unit`, listed from `src`, in `src` shifted down by
+    /// [`SHIFT`], and replaces what it resolves to with `with`. A host echoes
+    /// the listed span and hash back, so after a shift the resolver must land
+    /// on that same trimmed span moved by the shift. Landing on the raw
+    /// grammar node instead would also take the next line's container prefix,
+    /// and the replacement would silently delete it.
+    fn relocate_and_replace(src: &str, unit: &Block, with: &str) -> String {
+        let live = format!("{SHIFT}{src}");
+        let p = Adapter::new();
+        let got = region::resolve(&p, Lang::Markdown, live.as_bytes(), &anchored(unit))
+            .unwrap_or_else(|err| panic!("{unit:?}: {err}"));
+        let (s, e) = (unit.start_byte + SHIFT.len(), unit.end_byte + SHIFT.len());
+        assert_eq!(
+            got,
+            (s, e, region::ResolveStatus::Shifted),
+            "{unit:?} resolved to {:?}, listed bytes moved are {:?}",
+            &live[got.0.min(live.len())..got.1.min(live.len())],
+            &live[s..e],
+        );
+        format!("{}{with}{}", &live[..got.0], &live[got.1..])
+    }
+
+    /// Every unit of `kind` in `units`.
+    fn of_kind<'a>(units: &'a [Block], kind: &str) -> Vec<&'a Block> {
+        units.iter().filter(|u| u.kind == kind).collect()
+    }
+
+    /// `outer` holds `inner` within its bytes.
+    fn holds(outer: &Block, inner: &Block) -> bool {
+        outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
+    }
+
+    /// The paragraph's grammar node also owns the next line's two-space
+    /// indent, and the normalized hash ignores that trailing whitespace, so a
+    /// match on the raw node would replace the indent too and pull `b` out
+    /// of the outer item.
+    #[test]
+    fn a_trimmed_list_paragraph_relocates_to_its_trimmed_span_after_a_shift() {
+        let src = "- q\n  - b\n";
+        let units = md_units(src);
+        let para = &units[1];
+        assert_eq!(
+            (para.kind.as_str(), &src[para.start_byte..para.end_byte]),
+            ("paragraph", "q\n")
+        );
+        let edited = relocate_and_replace(src, para, "EDITED\n");
+        assert_eq!(edited, "x\n\n- EDITED\n  - b\n");
+        let again = md_units(&edited);
+        let items = of_kind(&again, "list_item");
+        assert_eq!(items.len(), 2, "{again:?}");
+        assert!(
+            holds(items[0], items[1]),
+            "b left the outer item: {again:?}"
+        );
+    }
+
+    /// The paragraph's grammar node owns the next line's `>`, which is not
+    /// whitespace, so a match on raw nodes finds nothing and the shifted
+    /// unit reads as a conflict although its bytes never changed.
+    #[test]
+    fn a_trimmed_quote_paragraph_relocates_after_a_shift() {
+        let src = "> a\n>\n> b\n";
+        let units = md_units(src);
+        let para = &units[1];
+        assert_eq!(
+            (para.kind.as_str(), &src[para.start_byte..para.end_byte]),
+            ("paragraph", "a\n")
+        );
+        let edited = relocate_and_replace(src, para, "EDITED\n");
+        assert_eq!(edited, "x\n\n> EDITED\n>\n> b\n");
+        let again = md_units(&edited);
+        let quotes = of_kind(&again, "block_quote");
+        assert_eq!(quotes.len(), 1, "the quote split: {again:?}");
+        let paras: Vec<_> = of_kind(&again, "paragraph")
+            .into_iter()
+            .filter(|u| holds(quotes[0], u))
+            .collect();
+        assert_eq!(paras.len(), 2, "{again:?}");
+    }
+
+    /// A container trimmed through its last descendant and that descendant
+    /// both end before the `> ` that keeps the heading in the quote. Each
+    /// must relocate to its listed span, or a replacement moves the heading
+    /// out of the quote.
+    #[test]
+    fn a_container_trimmed_through_its_last_child_relocates_after_a_shift() {
+        let src = "> - a\n> # h\n";
+        let units = md_units(src);
+        let (item, para) = (&units[1], &units[2]);
+        assert_eq!(
+            (item.kind.as_str(), &src[item.start_byte..item.end_byte]),
+            ("list_item", "- a\n")
+        );
+        assert_eq!(
+            (para.kind.as_str(), &src[para.start_byte..para.end_byte]),
+            ("paragraph", "a\n")
+        );
+        for (unit, with) in [(item, "- EDITED\n"), (para, "EDITED\n")] {
+            let edited = relocate_and_replace(src, unit, with);
+            assert_eq!(edited, "x\n\n> - EDITED\n> # h\n", "{unit:?}");
+            let again = md_units(&edited);
+            let quotes = of_kind(&again, "block_quote");
+            assert_eq!(quotes.len(), 1, "{unit:?}: {again:?}");
+            let heads = of_kind(&again, "atx_heading");
+            assert_eq!(heads.len(), 1, "{unit:?}: {again:?}");
+            assert!(
+                holds(quotes[0], heads[0]),
+                "{unit:?}: the heading left the quote: {again:?}"
+            );
+        }
+    }
+
+    /// A paragraph may end on end of file (the grammar's `_eof`), so a last
+    /// line without a newline is still a whole unit on its own line.
+    #[test]
+    fn markdown_paragraph_at_eof_without_newline_ends_on_its_last_byte() {
+        let src = "para";
+        assert_eq!(
+            kind_spans(&md_units(src), src),
+            [("paragraph", 0, 4, 1, 1, "para")]
+        );
+        assert_md_positions(src);
+    }
+
+    /// The grammar's ATX heading must end on `_newline` and has no `_eof`
+    /// arm, so `# T` at end of file is not a clean parse: tree-sitter
+    /// recovers by inserting a zero-width missing line ending. The heading
+    /// must still be listed over exactly the bytes present, on one line.
+    // tree-sitter-md 0.5.3 has no end-of-file arm for ATX headings, so "# T" parses as an ERROR; fixed upstream, not in bage.
+    #[test]
+    #[ignore = "turn back on and fix once the feature is built; card bage-md-atx-heading-at-eof-not-listed-2026-11-08"]
+    fn markdown_atx_heading_at_eof_without_newline_is_listed_over_its_bytes() {
+        let src = "# T";
+        assert_eq!(
+            kind_spans(&md_units(src), src),
+            [("atx_heading", 0, 3, 1, 1, "# T")]
+        );
+        assert_md_positions(src);
+    }
+
+    /// The scanner accepts a setext underline only when a line ending
+    /// follows it, so an underline on the last line with no newline reads as
+    /// a lazy second line of the paragraph above. The outline reports what
+    /// the grammar parsed, as one paragraph over both lines.
+    #[test]
+    fn markdown_setext_underline_at_eof_without_newline_reads_as_a_paragraph() {
+        let src = "T\n=";
+        assert_eq!(
+            kind_spans(&md_units(src), src),
+            [("paragraph", 0, 3, 1, 2, "T\n=")]
+        );
+        assert_md_positions(src);
+    }
+
+    /// A unit owns its whole `\r\n`, and lines count by `\n`, so a CRLF file
+    /// lists the same lines as its LF twin. The continuation rule cuts after
+    /// the `\r\n`, never inside it.
+    #[test]
+    fn markdown_crlf_units_own_their_whole_line_ending() {
+        let src = "# T\r\n\r\npara\r\n";
+        assert_eq!(
+            kind_spans(&md_units(src), src),
+            [
+                ("atx_heading", 0, 5, 1, 1, "# T\r\n"),
+                ("paragraph", 7, 13, 3, 3, "para\r\n"),
+            ]
+        );
+        assert_md_positions(src);
+
+        let nested = "- a\r\n  - b\r\n";
+        assert_eq!(
+            kind_spans(&md_units(nested), nested),
+            [
+                ("list_item", 0, 12, 1, 2, "- a\r\n  - b\r\n"),
+                ("paragraph", 2, 5, 1, 1, "a\r\n"),
+                ("list_item", 7, 12, 2, 2, "- b\r\n"),
+                ("paragraph", 9, 12, 2, 2, "b\r\n"),
+            ]
+        );
+        assert_md_positions(nested);
+    }
+
+    #[test]
+    fn markdown_empty_file_has_an_empty_outline() {
+        let units = md_units("");
+        assert!(units.is_empty(), "{units:?}");
     }
 }

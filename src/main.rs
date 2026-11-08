@@ -1525,6 +1525,100 @@ mod tests {
         }
     }
 
+    /// `bage show --format json` is how an agent learns a Markdown file's
+    /// edit units, so each block unit must reach its outline with its true
+    /// byte span, its lines and region_hash. Card
+    /// board-card-patch-tool-2026-11-08.
+    #[test]
+    fn show_json_lists_markdown_leaf_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(
+            &path,
+            "# Title\n\nA paragraph.\n\n- item\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n```\ncode\n```\n\n> Quote.\n",
+        )
+        .unwrap();
+        let a = ShowArgs {
+            file: path.to_str().unwrap().into(),
+            format: "json".into(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_show(a, &mut out, &mut err).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let outline = v["outline"].as_array().unwrap();
+        let got: Vec<(&str, u64, u64, u64, u64)> = outline
+            .iter()
+            .map(|b| {
+                (
+                    b["kind"].as_str().unwrap(),
+                    b["start_byte"].as_u64().unwrap(),
+                    b["end_byte"].as_u64().unwrap(),
+                    b["start_line"].as_u64().unwrap(),
+                    b["end_line"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        // True grammar spans, ending before a trailing next-line container
+        // prefix: a block ends after its newline, a list
+        // item keeps the blank line it absorbs, a table row ends on its last
+        // pipe, and `end_line` is the line of the last byte a unit owns.
+        assert_eq!(
+            got,
+            [
+                ("atx_heading", 0, 8, 1, 1),
+                ("paragraph", 9, 22, 3, 3),
+                ("list_item", 23, 31, 5, 6),
+                ("paragraph", 25, 30, 5, 5),
+                ("pipe_table_header", 31, 40, 7, 7),
+                ("pipe_table_row", 55, 64, 9, 9),
+                ("fenced_code_block", 66, 79, 11, 13),
+                ("block_quote", 80, 89, 15, 15),
+                ("paragraph", 82, 89, 15, 15),
+            ]
+        );
+        for b in outline {
+            let hash = b["region_hash"].as_str().unwrap();
+            assert_eq!(hash.len(), 16, "{b}");
+            assert!(hash.bytes().all(|c| c.is_ascii_hexdigit()), "{b}");
+        }
+    }
+
+    /// An agent edits a Markdown unit by echoing the span and hash that
+    /// `bage show` listed. When a concurrent edit has moved the unit, apply
+    /// must replace only the listed bytes at their new place; replacing the
+    /// paragraph's raw grammar node would also take the indent that keeps `b`
+    /// nested, a silent wrong edit.
+    #[test]
+    fn apply_on_a_shifted_markdown_list_paragraph_keeps_the_nested_indent() {
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("orig.md");
+        std::fs::write(&orig, "- q\n  - b\n").unwrap();
+        let a = ShowArgs {
+            file: orig.to_str().unwrap().into(),
+            format: "json".into(),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        run_show(a, &mut out, &mut err).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let para = &v["outline"].as_array().unwrap()[1];
+        assert_eq!(para["kind"], "paragraph", "{v}");
+        let (start, end) = (
+            para["start_byte"].as_i64().unwrap(),
+            para["end_byte"].as_i64().unwrap(),
+        );
+        assert_eq!((start, end), (2, 4), "{v}");
+        let hash = para["region_hash"].as_str().unwrap().to_string();
+
+        let got = apply_to_file("x\n\n- q\n  - b\n", |a| {
+            a.start = start;
+            a.end = end;
+            a.region_hash = hash;
+            a.text = "EDITED\n".into();
+        });
+        assert!(got.contains("\n  - b\n"), "b lost its indent: {got:?}");
+        assert_eq!(got, "x\n\n- EDITED\n  - b\n");
+    }
+
     #[test]
     fn apply_region_insertion_is_zero_width_without_region_hash() {
         let live = b"one\ntwo\n";
