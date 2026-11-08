@@ -56,7 +56,7 @@ file-located CST region (concept/paper nodes; OOXML/pandoc doc nodes — see §3
 | `start_byte` | int | `TextLocator.StartByte` — the locator anchor | `NodeCore.Position` |
 | `end_byte` | int | `TextLocator.EndByte` | `NodeCore.Position` |
 | `start_line` | int (1-indexed) | display + LSP `Range.start.line` | `NodeCore.Position` |
-| `end_line` | int (1-indexed) | display + LSP `Range.end.line` | `NodeCore.Position` |
+| `end_line` | int (1-indexed) | display + LSP `Range.end.line`. For a Markdown unit it is the line of the unit's last byte, so the unit never reaches the line after its newline; a host takes the exclusive end position from `end_point`, never from (`end_line`, `end_col`) | `NodeCore.Position` |
 | `start_col` | int (0-indexed, UTF-8 byte-col) | LSP `Range.start.character` (convert to UTF-16 at LSP boundary) | `NodeCore.Position` |
 | `end_col` | int (0-indexed, UTF-8 byte-col) | LSP `Range.end.character` | `NodeCore.Position` |
 | `region_hash` | string (hex) | per-node drift check (Båge `Node.Hash`) | `NodeCore` (universal) |
@@ -67,6 +67,7 @@ file-located CST region (concept/paper nodes; OOXML/pandoc doc nodes — see §3
 | `visibility` | enum | public/private/protected/internal/package/unknown | `CodeNodeExt` (code-only; promote to universal-code) |
 
 Notes:
+- **A Markdown unit's `end_byte`, `end_point` and `region_hash` cover the listed (trimmed) span**, which can end before its grammar node does (before the next line's container prefix). A host relocates a unit by its listed spans, never by raw grammar node spans.
 - **`content` already exists** in Hylla's current schema (`summary`, `content`, `docstring` are universal fields today). Båge uses the raw region `content`, NOT the LLM `summary`, as the round-trip display/edit text.
 - **Byte range is authoritative**; line/col are derived conveniences. Tree-sitter provides all of them for free on every node (`start_byte`/`end_byte`/`start_point`/`end_point`), so populating them costs nothing at parse time.
 - **Points and the name node come with the block.** `inspect::read_placed_blocks` returns each `read_blocks` block with tree-sitter's `start_point`/`end_point` (zero-based row and byte column: `start_col`/`end_col` as they are, `start_line - 1` as the row) and `name_range`, the bytes of the grammar node the block's `name` was read from. `name_range` is `None` when `name` is empty or is no single node's text (a TypeScript construct signature's `new()`, a C# indexer's `this`); for a TypeScript/JavaScript function or class expression it is the binding that names it, outside the block's own bytes. A host asks a language server about `name_range.start`, never about a text search for the name. Positions between blocks come from one `region::LineIndex` per file, and LSP positions from one `lsp::TextIndex` per file: no host-side scan of the text per position.
