@@ -262,20 +262,17 @@ there is no native tree, `changed_ranges` degrades to a full reparse. This is th
 makes the grammar-less open→edit→write path corruption-proof.
 
 ### §9.3 Grammar + LSP coverage matrix
-- **20 tree-sitter grammars** (real parse + round-trip fixtures): Go, TypeScript, TSX,
-  JavaScript, Python, Rust, Java, C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile,
-  Bash, **Markdown**.
-- **Hylla's MVP code languages** are a subset: Rust, TypeScript/TSX, JavaScript, Python, Go.
-  Every grammar above is still parsed, outlined and edited by Båge.
-- **Outline names are verified** against each language's server for those five only. C and C++
-  names are unreliable on macro-heavy code and on code the grammar misreads (C++ in a `.h` is
-  read as C); C# names are lightly measured; Java and Ruby names are unmeasured.
+- **15 tree-sitter grammars** (real parse + round-trip fixtures). Code: Go, TypeScript, TSX,
+  JavaScript, Python, Rust — Hylla's MVP code languages. Data and documents: JSON, HTML, CSS,
+  YAML, TOML, XML, Makefile, Bash, **Markdown**. Båge parses, outlines and edits every one.
+- **Outline names are verified** against each code language's server.
 - **Text fallback** (lossless, no grammar): MDX, SCSS, Dockerfile, `.txt`, dotfiles, and any
-  unknown type.
+  unknown type. A source language with no grammar here is an unknown type: `.c`, `.h`, `.cc`,
+  `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.cs`, `.java` and `.rb` are `Lang::Text`, and their
+  LSP languageId is `plaintext`. The host decides whether to refuse such a file.
 - **LSP rename availability VARIES by design** — it is an accelerator, not a precondition (the
   graph/LLM path covers what an LSP can't). gopls and rust-analyzer do full cross-file rename
-  natively; clangd is carried across translation units by a generated `compile_commands.json`
-  and pyright across files by workspace priming (§12.5); single-file rename is available wherever
+  natively, and pyright across files by workspace priming (§12.5); single-file rename is available wherever
   a server exposes it. No LSP rename by design for data/markup/build/script types and `Lang::Text`.
 
 ### §9.4 Inspect surface (`inspect`)
@@ -288,37 +285,19 @@ makes the grammar-less open→edit→write path corruption-proof.
 - **Clean parse or misread — one rule, every code grammar.** A code `Symbol` is named by the
   field rules below only when the top-level item holding it (the root's child it sits in)
   contains no ERROR or MISSING node and the root itself is not an ERROR (an unbalanced
-  include guard makes it one, and then no top-level item is a unit the grammar read, however
   clean its own nodes). Otherwise the grammar misread the code around it, and the
   block keeps EXACTLY the name v0.11.0 gave it: the text of its first identifier-kind direct
-  child, else of the first one a level down — raw, so it may be a keyword, a type, a macro, or
-  text spanning lines with comments in it. Why: the grammar cannot expand macros and reads
-  every `.h` as C, so inside a misread its fields hold whatever word landed there (a keyword, a
-  macro, a parameter, a callee), and per-shape recovery rules fixed the cases they were written
-  for and broke code nobody had read. Keeping v0.11.0's name there changes nothing a host
-  already relied on. The rule is coarse by design: one ERROR anywhere in an include-guarded
-  header or an `extern "C" {` block puts every declaration in it on the v0.11.0 name.
-- On a clean parse, a code `Symbol`'s `name` is read from the grammar's FIELDS, never from the
-  first identifier child, because a C-family declaration starts with its type. In order: the `name` field (kept
-  whole, so qualified names survive: `Fixture.Geo`, `inner::deep`); else the `declarator` field,
-  followed through pointer / reference / array / function / parenthesized / init declarators to
-  the declared identifier (`char *dup()` → `dup`, `Point Shape::area()` → `Shape::area`,
-  `int (*get_cmp(void))(int, int)` → `get_cmp`); a declaration with several declarators takes the
-  first. An MSVC calling convention is not a declarator: `static void __cdecl f(void);` → `f`.
-  Template ids, structured bindings, nested namespaces and specializations are kept whole:
-  `f<int>`, `Vec<int>`, `[a, b]`, `a::b::c`, `Box<int>`; operator names are written as declared,
-  so `operator/` and `operator/=` contain a `/`.
-- On a clean parse a C or C++ name is one line: whitespace runs collapse to one space and
-  comments are dropped; a field-free fallback name that still holds a comment is `""`.
-- Wrappers name what they wrap: a Python `decorated_definition`, a C++ `template_declaration`
-  and a C++ `friend_declaration` take the name of what they hold (`friend class Vec<int>;` →
-  `Vec<int>`).
-- C# members without a name field are named `~Point` (destructor), `operator +`,
-  `implicit operator int`, and `this` (indexer).
-- A C++ conversion operator is `operator` plus its target type, pointer and reference kept, never
-  its parameters or qualifiers: `operator const char *() const` → `operator const char *`,
-  `operator int &()` → `operator int &`, `Widget::operator bool() const` →
-  `Widget::operator bool`.
+  child, else of the first one a level down — raw, so it may be a keyword, a type, or
+  text spanning lines with comments in it. Why: inside a misread the grammar's fields hold
+  whatever word landed there (a keyword, a parameter, a callee), and per-shape recovery rules
+  fix the cases they were written for and break code nobody has read. Keeping v0.11.0's name
+  there changes nothing a host already relied on. The rule is coarse by design: one ERROR
+  anywhere in a top-level item puts every declaration in it on the v0.11.0 name.
+- On a clean parse, a code `Symbol`'s `name` is read from the grammar's `name` FIELD, never
+  from the first identifier child, so a declaration is never named after a type it mentions.
+  The kinds below name themselves another way.
+- Wrappers name what they wrap: a Python `decorated_definition` takes the name of the
+  definition it holds.
 - A TypeScript/JavaScript member keyed by a string, number or computed key loses its brackets
   and quotes ONLY when what is left is a plain ASCII identifier or a number: `['KEY']` → `KEY`,
   `[42]` → `42`, `"field"` → `field`. Every other key stays exactly as written: `['a-b']`,
@@ -346,19 +325,9 @@ makes the grammar-less open→edit→write path corruption-proof.
   that keys a member by its containers' names can tell them apart only when the impls' names
   differ. Two impls with the same type AND trait (different generic bounds) can still share a
   name.
-- **A clean C or C++ parse can still be a misread**: the grammar reads some unexpanded macros and
-  C++-in-a-`.h` without any ERROR. Three shapes are handled, each seen in the corpora:
-  - the declarator chain ends on a keyword (for C, the C keywords plus `operator`, which a C++
-    `operator()` read as C leaves there; other C++ keywords stay valid C names) or on a builtin
-    type spelling: `""`, except a typedef defining one (`typedef _Bool bool;` → `bool`);
-  - a keyword that names no type sits in the type slot (`export C_LIB_NAMESPACE {…}`): `""`;
-  - a definition whose declarator is bare parentheses (`do_library_init(void) {…}` after a
-    macro return type on the line before): the parentheses are the parameter list and the type
-    word is the function, `do_library_init`.
-- Named `""` besides, on a clean parse: an anonymous declaration (a C++ `namespace { }`); a
-  class, interface or enum BODY (`class_body`, `interface_body`, `enum_body`, Java
-  `enum_body_declarations`), which declares nothing, so it never takes its first member's name;
-  and a declarator chain that ends without a name. None falls back to the type.
+- Named `""` besides, on a clean parse: a class, interface or enum BODY (`class_body`,
+  `interface_body`, `enum_body`), which declares nothing, so it never takes its first member's
+  name. None falls back to a type.
 - Only a node whose grammar has no naming field falls back to the first-identifier search.
 
 ## 10. File-lifecycle ops: create / delete / move / batch (ADR-0004)
@@ -484,17 +453,16 @@ declares the root both as `rootUri` and as the single entry of `workspaceFolders
 `rootUri` and renames across files only with the folder declared. The dynamic
 `workspace.workspaceFolders` capability is not claimed. `processId` is declared per client
 (`ClientConfig::process_id`, default this process's id, `None` = `null`); a server in another pid
-namespace needs `None`, or it exits when it cannot see the pid. For clangd, a minimal `compile_commands.json` is generated when absent (and removed
-on close) so a rename crosses translation units. A server still indexing may answer with a
-non-empty but partial edit (a cold clangd returns the target TU alone), which no wire signal
+namespace needs `None`, or it exits when it cannot see the pid. Bage writes no build files
+into the root for any server. A server still indexing may answer with a
+non-empty but partial edit (only the target file), which no wire signal
 distinguishes from a complete one; a caller needing every reference passes `Client::await_ready`
 at a position inside a referencing file first. The probe alone is necessary, not sufficient:
 readiness is not monotonic while a server loads its workspace — rust-analyzer can pass the probe,
 then answer empty until its load finishes, so an empty result after a probe-only gate is still not
 proof of "none". A declared ready signal (§12.6) narrows that window to what the server reports;
 it cannot close a reload the server has not yet announced.
-Container-verified for gopls, pyright, and clangd
-(`BAGE_DOCKER_LSP=1`), the clangd case behind that readiness gate.
+Container-verified for gopls and pyright (`BAGE_DOCKER_LSP=1`).
 
 ### §12.6 Declared LSP session
 A consumer declares every time bound of a session, and what the handshake says; none is fixed
@@ -678,6 +646,6 @@ empty answer. Before a handshake nothing is known, so the request goes out. All 
 declared `call_timeout`, `query_deadline` and `query_retry` (§12.6); an empty result still carries
 no readiness, so gate with `await_ready` first — and even past that gate an empty answer is not
 proof of "none" while rust-analyzer is still loading its workspace (§12.5). Measured on the local servers: rust-analyzer
-advertises implementation but NOT type hierarchy; gopls and clangd advertise both; pyright advertises
+advertises implementation but NOT type hierarchy; gopls advertises both; pyright advertises
 neither. Real-server proof: `tests/lsp_hierarchy.rs` (`BAGE_LSP_REAL_TEST=1`); a server that starts
 advertising a capability fails its `Unsupported` row loudly so it moves to the positive rows.

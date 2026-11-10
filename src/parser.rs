@@ -25,11 +25,6 @@ pub enum Lang {
     JavaScript,
     Python,
     Rust,
-    Java,
-    C,
-    Cpp,
-    CSharp,
-    Ruby,
     Json,
     Html,
     Css,
@@ -48,18 +43,13 @@ pub enum Lang {
 
 impl Lang {
     /// Every language, in the Go implementation's declaration order.
-    pub const ALL: [Lang; 21] = [
+    pub const ALL: [Lang; 16] = [
         Lang::Go,
         Lang::TypeScript,
         Lang::Tsx,
         Lang::JavaScript,
         Lang::Python,
         Lang::Rust,
-        Lang::Java,
-        Lang::C,
-        Lang::Cpp,
-        Lang::CSharp,
-        Lang::Ruby,
         Lang::Json,
         Lang::Html,
         Lang::Css,
@@ -81,11 +71,6 @@ impl Lang {
             Lang::JavaScript => "javascript",
             Lang::Python => "python",
             Lang::Rust => "rust",
-            Lang::Java => "java",
-            Lang::C => "c",
-            Lang::Cpp => "cpp",
-            Lang::CSharp => "csharp",
-            Lang::Ruby => "ruby",
             Lang::Json => "json",
             Lang::Html => "html",
             Lang::Css => "css",
@@ -133,11 +118,6 @@ impl Lang {
             ".js" | ".jsx" | ".mjs" | ".cjs" => Lang::JavaScript,
             ".py" | ".pyi" => Lang::Python,
             ".rs" => Lang::Rust,
-            ".java" => Lang::Java,
-            ".c" | ".h" => Lang::C,
-            ".cc" | ".cpp" | ".cxx" | ".hpp" | ".hh" | ".hxx" => Lang::Cpp,
-            ".cs" => Lang::CSharp,
-            ".rb" => Lang::Ruby,
             ".json" => Lang::Json,
             ".html" | ".htm" => Lang::Html,
             ".css" => Lang::Css,
@@ -309,7 +289,7 @@ impl Adapter {
     /// it polyglot. TypeScript and TSX both come from the
     /// tree-sitter-typescript crate via its two distinct language constants.
     pub fn new() -> Adapter {
-        let langs: [(Lang, ts::Language); 20] = [
+        let langs: [(Lang, ts::Language); 15] = [
             (Lang::Go, tree_sitter_go::LANGUAGE.into()),
             (
                 Lang::TypeScript,
@@ -319,11 +299,6 @@ impl Adapter {
             (Lang::JavaScript, tree_sitter_javascript::LANGUAGE.into()),
             (Lang::Python, tree_sitter_python::LANGUAGE.into()),
             (Lang::Rust, tree_sitter_rust::LANGUAGE.into()),
-            (Lang::Java, tree_sitter_java::LANGUAGE.into()),
-            (Lang::C, tree_sitter_c::LANGUAGE.into()),
-            (Lang::Cpp, tree_sitter_cpp::LANGUAGE.into()),
-            (Lang::CSharp, tree_sitter_c_sharp::LANGUAGE.into()),
-            (Lang::Ruby, tree_sitter_ruby::LANGUAGE.into()),
             (Lang::Json, tree_sitter_json::LANGUAGE.into()),
             (Lang::Html, tree_sitter_html::LANGUAGE.into()),
             (Lang::Css, tree_sitter_css::LANGUAGE.into()),
@@ -621,11 +596,6 @@ mod tests {
             ("a.mjs", Lang::JavaScript),
             ("x.PY", Lang::Python),
             ("lib.rs", Lang::Rust),
-            ("A.java", Lang::Java),
-            ("h.h", Lang::C),
-            ("v.hpp", Lang::Cpp),
-            ("p.cs", Lang::CSharp),
-            ("r.rb", Lang::Ruby),
             ("data.json", Lang::Json),
             ("index.html", Lang::Html),
             ("style.css", Lang::Css),
@@ -643,6 +613,15 @@ mod tests {
             ("notes.txt", Lang::Text),
             ("component.mdx", Lang::Text),
             ("style.scss", Lang::Text),
+            // A source language bage has no grammar for is an unknown file,
+            // so the caller decides whether to refuse it.
+            ("A.java", Lang::Text),
+            ("h.h", Lang::Text),
+            ("u.c", Lang::Text),
+            ("v.hpp", Lang::Text),
+            ("w.cpp", Lang::Text),
+            ("p.cs", Lang::Text),
+            ("r.rb", Lang::Text),
             ("noext", Lang::Text),
             ("", Lang::Text),
             ("dir/sub/file.go", Lang::Go),
@@ -661,11 +640,6 @@ mod tests {
             (Lang::JavaScript, b"function f() { return 1; }\n"),
             (Lang::Python, b"def f():\n    return 1\n"),
             (Lang::Rust, b"fn main() { println!(\"hi\"); }\n"),
-            (Lang::Java, b"class A { void m() {} }\n"),
-            (Lang::C, b"int main(void) { return 0; }\n"),
-            (Lang::Cpp, b"int main() { return 0; }\n"),
-            (Lang::CSharp, b"class A { void M() {} }\n"),
-            (Lang::Ruby, b"def f\n  1\nend\n"),
             (Lang::Json, b"{\"a\": [1, 2]}\n"),
             (Lang::Html, b"<html><body>hi</body></html>\n"),
             (Lang::Css, b"body { color: red; }\n"),
@@ -790,10 +764,6 @@ mod tests {
             (
                 Lang::Markdown,
                 b"# T\n\n- a\n- b\n\n```rs\nfn x() {}\n```\n",
-            ),
-            (
-                Lang::Cpp,
-                b"template <class T> struct S { operator bool() const; };\n",
             ),
             (Lang::Yaml, b"a: [1, 2]\nb:\n  - {c: d}\n"),
         ];

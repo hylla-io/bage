@@ -41,7 +41,6 @@ pub use crate::lsp_trace::{RequestTraceEvent, RequestTraceHop, RequestTraceSink}
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -1443,15 +1442,6 @@ fn is_fatal_transport(e: &LspError) -> bool {
     matches!(e, LspError::Closed { .. } | LspError::Io(_))
 }
 
-/// Stable-within-process content fingerprint used to decide whether a
-/// bage-generated `compile_commands.json` is still the file we wrote before
-/// removing it on close — never clobber a database a caller replaced.
-fn content_hash(bytes: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
-}
-
 // ---------------------------------------------------------------------------
 // Pure conversion (Go convert.go)
 // ---------------------------------------------------------------------------
@@ -1915,11 +1905,6 @@ fn language_id_for_path(path: &str) -> &'static str {
         "tsx" => "typescriptreact",
         "js" | "jsx" => "javascript",
         "rs" => "rust",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "cxx" | "hpp" => "cpp",
-        "cs" => "csharp",
-        "rb" => "ruby",
         "swift" => "swift",
         "json" => "json",
         "html" => "html",
@@ -1929,7 +1914,7 @@ fn language_id_for_path(path: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace priming + clangd compilation database (issue #23)
+// Workspace priming
 // ---------------------------------------------------------------------------
 
 /// Cap on how many same-language sibling files workspace priming will
@@ -1939,17 +1924,6 @@ const PRIME_FILE_CAP: usize = 200;
 
 /// Environment variable that disables workspace priming when set to `"1"`.
 pub const NO_PRIME_ENV: &str = "BAGE_LSP_NO_PRIME";
-
-/// Basename of the clang compilation database consulted (and, when missing,
-/// generated) for clangd.
-const COMPILE_COMMANDS: &str = "compile_commands.json";
-
-/// Reports whether the server command runs clangd. Detection is a substring
-/// scan over every token so wrappers survive it: `clangd`, `clangd-18`,
-/// `/usr/bin/clangd`, and `docker run … sh -c "… exec clangd"` all match.
-fn command_is_clangd(command: &[String]) -> bool {
-    command.iter().any(|t| t.contains("clangd"))
-}
 
 /// Walks `root` depth-first collecting the files `keep` accepts, capped at
 /// `cap` results. Hidden (dot-prefixed) directories plus `target/` and
@@ -1987,56 +1961,6 @@ fn discover_same_language_files(root: &Path, language_id: &str, cap: usize) -> V
     walk_files(root, cap, &|p| {
         language_id_for_path(&p.to_string_lossy()) == language_id
     })
-}
-
-/// Ensures `root` has a `compile_commands.json` for clangd. Without a
-/// compilation database clangd treats every file as an isolated translation
-/// unit and a rename never crosses TUs. When the database already exists (or
-/// no C/C++ sources are found) nothing is written and `Ok(None)` is
-/// returned; otherwise a minimal database covering every `.c`/`.cc`/`.cpp`/
-/// `.cxx` file under `root` is written — one `{directory, file, command:
-/// "clang -c <file>"}` entry each — and `Ok(Some((path, hash)))` is returned
-/// (`hash` fingerprints the bytes written) so the creator
-/// ([`Client::initialize`] via [`Client::close`]/Drop) removes the file it
-/// added ONLY while it still matches — never clobbering a caller's
-/// replacement. A pre-existing database is never touched or removed.
-///
-/// OWNERSHIP CAVEAT (honest note): the database is keyed by `root`, but the
-/// pool keys servers by (root, language). Today only clangd (C/C++) generates
-/// one, so per-root ownership is unambiguous. If a future mixed-language root
-/// ran two clangd servers over the same directory, the first to close would
-/// remove a database the second still relies on (only when it still matches
-/// what bage wrote). Robust shared-root ownership (refcount / per-server temp
-/// database) is DESIGN-ROUTED to B2 (mixed-language-root work), not solved here.
-pub fn ensure_compile_commands(root: &Path) -> io::Result<Option<(PathBuf, u64)>> {
-    let db = root.join(COMPILE_COMMANDS);
-    if db.exists() {
-        return Ok(None);
-    }
-    let tus = walk_files(root, usize::MAX, &|p| {
-        matches!(
-            p.extension().and_then(|e| e.to_str()),
-            Some("c" | "cc" | "cpp" | "cxx")
-        )
-    });
-    if tus.is_empty() {
-        return Ok(None);
-    }
-    let entries: Vec<Value> = tus
-        .iter()
-        .map(|f| {
-            json!({
-                "directory": root.to_string_lossy(),
-                "file": f.to_string_lossy(),
-                "command": format!("clang -c {}", f.to_string_lossy()),
-            })
-        })
-        .collect();
-    let body = serde_json::to_vec_pretty(&entries)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let hash = content_hash(&body);
-    fs::write(&db, body)?;
-    Ok(Some((db, hash)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,9 +2628,6 @@ pub struct Client {
     next_id: u64,
     ver: i32,
     child: Option<Child>,
-    /// The full server command (set by `new_stdio`, empty for `from_conn`),
-    /// kept for clangd detection.
-    command: Vec<String>,
     /// Workspace root recorded at initialize — the base directory workspace
     /// priming walks before a rename.
     root: Option<PathBuf>,
@@ -2715,11 +2636,6 @@ pub struct Client {
     /// text sends nothing; a re-open `didClose`s first, so a pooled server
     /// never receives a spec-illegal duplicate `didOpen`.
     open_docs: HashMap<String, String>,
-    /// A compile_commands.json bage generated for clangd (path + content
-    /// fingerprint at creation), removed again on close/Drop ONLY if the file
-    /// still matches — never clobber a caller's replacement. `None` when the
-    /// database pre-existed or was never needed.
-    created_compile_commands: Option<(PathBuf, u64)>,
     /// The `capabilities` member of the server's `initialize` answer; `None`
     /// until a handshake succeeds. Bage advertises no dynamic registration for
     /// the gated methods, so this static set is authoritative.
@@ -2888,7 +2804,6 @@ impl Client {
             }
         });
         client.child = Some(child);
-        client.command = command.to_vec();
         Ok(client)
     }
 
@@ -2959,10 +2874,8 @@ impl Client {
             next_id: 0,
             ver: 0,
             child: None,
-            command: Vec::new(),
             root: None,
             open_docs: HashMap::new(),
-            created_compile_commands: None,
             server_capabilities: None,
             rename_deadline: DEFAULT_RENAME_DEADLINE,
             rename_retry: DEFAULT_RENAME_RETRY,
@@ -3209,18 +3122,10 @@ impl Client {
 
     /// Performs the LSP initialize/initialized handshake rooted at `root_uri`
     /// (a `file://` URI for the workspace root). The root path is recorded
-    /// as the base for workspace priming, and when the server command runs
-    /// clangd a missing compile_commands.json is generated at the root first
-    /// (see [`ensure_compile_commands`]; a generation failure is swallowed —
-    /// clangd then just stays single-TU, exactly as before). A declared
+    /// as the base for workspace priming. A declared
     /// [`Client::initialization_options`] rides along verbatim.
     pub fn initialize(&mut self, root_uri: &str) -> Result<(), LspError> {
         let root = PathBuf::from(uri_str_to_path(root_uri));
-        if command_is_clangd(&self.command)
-            && let Ok(Some(created)) = ensure_compile_commands(&root)
-        {
-            self.created_compile_commands = Some(created);
-        }
         let folder_name = root
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3383,7 +3288,7 @@ impl Client {
     ///
     /// A NON-EMPTY EDIT CARRIES NO READINESS INFORMATION EITHER. A server
     /// whose index has not yet reached a referencing file answers with the
-    /// edits it can already see — a cold clangd returns the target file
+    /// edits it can already see — a cold server can return the target file
     /// alone — and that partial edit is indistinguishable on the wire from a
     /// complete one. A caller needing every reference first passes
     /// [`Client::await_ready`] at a position inside a referencing file.
@@ -4630,14 +4535,11 @@ impl Client {
     }
 
     /// Requests an orderly LSP shutdown (shutdown + exit) and reaps the
-    /// subprocess, killing it if it does not exit promptly. Removes a
-    /// compile_commands.json bage generated for clangd — but only while it
-    /// still matches what bage wrote (a pre-existing OR caller-replaced
-    /// database is never touched). Best-effort: a failed shutdown still
-    /// proceeds to exit and reaping, and the first error encountered is
-    /// returned. Worst case blocks `shutdown_timeout + exit_deadline`.
+    /// subprocess, killing it if it does not exit promptly. Best-effort: a
+    /// failed shutdown still proceeds to exit and reaping, and the first
+    /// error encountered is returned. Worst case blocks
+    /// `shutdown_timeout + exit_deadline`.
     pub fn close(&mut self) -> Result<(), LspError> {
-        remove_generated_compile_commands(self.created_compile_commands.take());
         let shutdown = self.call("shutdown", Value::Null, self.shutdown_timeout);
         let exit = self.notify("exit", Value::Null);
         if let Some(mut child) = self.child.take() {
@@ -4676,29 +4578,12 @@ impl Client {
 }
 
 impl Drop for Client {
-    /// Backstop: kill and reap the server subprocess if `close` was skipped,
-    /// and remove a compile_commands.json bage created (only if it still
-    /// matches what bage wrote).
+    /// Backstop: kill and reap the server subprocess if `close` was skipped.
     fn drop(&mut self) {
-        remove_generated_compile_commands(self.created_compile_commands.take());
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
-}
-
-/// Removes a bage-generated `compile_commands.json` ONLY while its bytes still
-/// hash to what bage wrote — a caller may have replaced the database, and
-/// clobbering foreign content is never acceptable. A read failure or hash
-/// mismatch leaves the file untouched.
-fn remove_generated_compile_commands(created: Option<(PathBuf, u64)>) {
-    if let Some((db, hash)) = created
-        && fs::read(&db)
-            .map(|b| content_hash(&b) == hash)
-            .unwrap_or(false)
-    {
-        let _ = fs::remove_file(db);
     }
 }
 
@@ -6648,16 +6533,16 @@ mod tests {
             ("x.js", "javascript"),
             ("x.jsx", "javascript"),
             ("x.rs", "rust"),
-            ("x.java", "java"),
-            ("x.c", "c"),
-            ("x.h", "c"),
-            ("x.cpp", "cpp"),
-            ("x.cs", "csharp"),
-            ("x.rb", "ruby"),
             ("x.swift", "swift"),
             ("x.json", "json"),
             ("x.html", "html"),
             ("x.css", "css"),
+            // A source language bage has no grammar for is unknown here too.
+            ("x.java", "plaintext"),
+            ("x.c", "plaintext"),
+            ("x.cpp", "plaintext"),
+            ("x.cs", "plaintext"),
+            ("x.rb", "plaintext"),
             ("x.weird", "plaintext"),
             ("noext", "plaintext"),
         ] {
@@ -6675,7 +6560,7 @@ mod tests {
         assert_eq!(file_uri("/t/a#b.go").as_str(), "file:///t/a%23b.go");
     }
 
-    // ---- workspace priming + compile_commands (issue #23) ----
+    // ---- workspace priming ----
 
     /// Serializes tests that read or write [`NO_PRIME_ENV`] so the process
     /// environment mutation cannot race a concurrent priming rename.
@@ -6720,104 +6605,6 @@ mod tests {
         }
         let got = discover_same_language_files(dir.path(), "python", 3);
         assert_eq!(got.len(), 3, "discovery must stop at the cap");
-    }
-
-    #[test]
-    fn ensure_compile_commands_generates_minimal_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("deep")).unwrap();
-        for f in ["main.c", "util.cc", "deep/x.cpp"] {
-            std::fs::write(root.join(f), "// tu\n").unwrap();
-        }
-        std::fs::write(root.join("skip.h"), "// header\n").unwrap();
-        std::fs::write(root.join("skip.py"), "x = 1\n").unwrap();
-
-        let (created, created_hash) = ensure_compile_commands(root)
-            .unwrap()
-            .expect("database must be created");
-        assert_eq!(created, root.join(COMPILE_COMMANDS));
-
-        let body = std::fs::read(&created).unwrap();
-        assert_eq!(
-            content_hash(&body),
-            created_hash,
-            "returned hash must fingerprint the written bytes"
-        );
-        let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            entries.len(),
-            3,
-            "one entry per TU, headers/other langs skipped"
-        );
-        let mut files: Vec<String> = entries
-            .iter()
-            .map(|e| e["file"].as_str().unwrap().to_string())
-            .collect();
-        files.sort();
-        let want: Vec<String> = ["deep/x.cpp", "main.c", "util.cc"]
-            .iter()
-            .map(|f| root.join(f).to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(files, want);
-        for e in &entries {
-            assert_eq!(e["directory"].as_str().unwrap(), root.to_string_lossy());
-            let cmd = e["command"].as_str().unwrap();
-            assert!(cmd.starts_with("clang -c "), "got command {cmd:?}");
-        }
-
-        // Second call: the database now exists, so nothing is created and
-        // the content is untouched.
-        assert!(ensure_compile_commands(root).unwrap().is_none());
-        assert_eq!(std::fs::read(&created).unwrap(), body);
-    }
-
-    #[test]
-    fn ensure_compile_commands_no_sources_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(ensure_compile_commands(dir.path()).unwrap().is_none());
-        assert!(!dir.path().join(COMPILE_COMMANDS).exists());
-    }
-
-    #[test]
-    fn close_removes_bage_created_compile_commands() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join(COMPILE_COMMANDS);
-        std::fs::write(&db, b"[]").unwrap();
-
-        let (client_conn, server_conn) = conn_pair();
-        spawn_fake_server(server_conn, || Ok(json!({})), Vec::new());
-        let mut c = test_client(client_conn);
-        c.created_compile_commands = Some((db.clone(), content_hash(b"[]")));
-        let _ = c.close();
-        assert!(!db.exists(), "close must remove the database bage created");
-    }
-
-    #[test]
-    fn close_preserves_caller_replaced_compile_commands() {
-        // A database whose content no longer matches what bage wrote (a caller
-        // replaced it) must be LEFT UNTOUCHED — never clobber foreign content.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join(COMPILE_COMMANDS);
-        std::fs::write(&db, b"[]").unwrap();
-
-        let (client_conn, server_conn) = conn_pair();
-        spawn_fake_server(server_conn, || Ok(json!({})), Vec::new());
-        let mut c = test_client(client_conn);
-        // Fingerprint the ORIGINAL bytes bage "wrote", then the caller replaces
-        // the file with different content.
-        c.created_compile_commands = Some((db.clone(), content_hash(b"[]")));
-        std::fs::write(&db, b"[{\"caller\":\"owned\"}]").unwrap();
-        let _ = c.close();
-        assert!(
-            db.exists(),
-            "a caller-replaced database must not be removed"
-        );
-        assert_eq!(
-            std::fs::read(&db).unwrap(),
-            b"[{\"caller\":\"owned\"}]",
-            "content must be left intact"
-        );
     }
 
     /// A fake server that records every didOpen URI, for priming assertions.

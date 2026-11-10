@@ -128,8 +128,8 @@ Beyond definition and call hierarchy, the client resolves implementations and th
 `implementation(path, text, line, col)`, then `prepare_type_hierarchy(..)` → `supertypes(&t)` /
 `subtypes(&t)`. A server that does not advertise the capability yields
 `LspError::Unsupported { method, capability }` with nothing sent — never an empty answer, which
-would read as "nothing implements this". rust-analyzer advertises no type hierarchy; gopls and
-clangd do (SPEC §12.7).
+would read as "nothing implements this". rust-analyzer advertises no type hierarchy; gopls
+does (SPEC §12.7).
 
 Errors carry a machine-branchable kind so a wrapper never parses English:
 `SessionError::kind()` → `conflict | drift | exists | not-found | usage | io`, and
@@ -166,19 +166,13 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
 
 ## Languages
 
-- **Grammars (20, parse + round-trip):** Go, TypeScript, TSX, JavaScript, Python, Rust, Java,
-  C, C++, C#, Ruby, JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
-- **Hylla's MVP code languages** are a subset of these: Rust, TypeScript/TSX, JavaScript,
-  Python and Go. Båge still parses, outlines and edits every grammar above.
-- **Outline names are verified** against each language's own server for those five only:
-  Rust, TypeScript/TSX, JavaScript, Python, Go.
-- **Known unreliable:** C and C++ names on macro-heavy code, and on code the grammar misreads
-  (C++ in a `.h` is read as C). C# names are lightly measured. Java and Ruby are unmeasured.
-- **Outline names** come from the grammar's own fields (`name`, `declarator`), so a C, C++, C#
-  or Java declaration is named after what it declares, never its return or field type:
-  `Point make_point()` → `make_point`, `Point Shape::area()` → `Shape::area`,
-  `namespace Fixture.Geo;` → `Fixture.Geo`, `int a, b;` → `a` (the first declarator),
-  `operator const char *() const` → `operator const char *`. A TypeScript/JavaScript member key
+- **Code grammars:** Go, TypeScript, TSX, JavaScript, Python, Rust — Hylla's MVP code
+  languages.
+- **Data and document grammars:** JSON, HTML, CSS, YAML, TOML, XML, Makefile, Bash, Markdown.
+- Every grammar above (15) parses and round-trips; Båge parses, outlines and edits each one.
+- **Outline names are verified** against each code language's own server.
+- **Outline names** come from the grammar's own fields (`name`), never from a return or field
+  type. A Python decorated definition takes the name of what it decorates. A TypeScript/JavaScript member key
   loses its brackets and quotes only when a plain identifier or number is left (`['KEY']` →
   `KEY`); others stay as written (`['a-b']`). A TypeScript/JavaScript arrow, function or class
   expression takes the name it is bound to (`const f = () => …` → `f`,
@@ -186,20 +180,20 @@ inserts at `--at-byte`, `--append` (EOF), or `--before-line` / `--after-line`, s
   Rust impl is named by its type (`BlobRef`), a trait impl as `<BlobRef as Validate>`. A class,
   interface or enum body is unnamed. These
   rules apply to a clean parse: a block whose top-level item holds a parse ERROR, or whose whole
-  file parses to an ERROR root (an unexpanded macro, C++ in a `.h` read as C), keeps exactly its
-  v0.11.0 name. Full rule: SPEC §9.4.
-- **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, anything else.
+  file parses to an ERROR root, keeps exactly its v0.11.0 name. Full rule: SPEC §9.4.
+- **Text fallback (lossless, no grammar):** MDX, SCSS, Dockerfile, `.txt`, dotfiles, and any
+  file whose language has no grammar here (C, C++, C#, Java and Ruby sources included): the
+  file is one `document` of `line` blocks, and `Lang::for_path` returns `Lang::Text`.
 - **LSP rename:** UTF-16-aware client driving any stdio language server. gopls and
-  rust-analyzer do full cross-file rename natively; clangd is carried across translation
-  units by a generated `compile_commands.json`, and pyright across files because the
+  rust-analyzer do full cross-file rename natively, and pyright across files because the
   handshake declares the root as a workspace folder (pyright ignores the deprecated
   `rootUri`). A rename also primes the workspace by opening same-language siblings
   first, for servers that only see open files. A server still indexing can answer with
-  a partial edit (a cold clangd renames the target TU alone), so a caller needing every
+  a partial edit (only the target file), so a caller needing every
   reference passes `Client::await_ready` inside a referencing file first. That gate is
   necessary, not sufficient: while rust-analyzer is still loading its workspace it can
   pass the probe and then answer empty, so an empty result is not proof of "none". Cross-file
-  rename is container-verified for gopls, pyright, and clangd (`BAGE_DOCKER_LSP=1`).
+  rename is container-verified for gopls and pyright (`BAGE_DOCKER_LSP=1`).
 
 ## Build gates
 
@@ -209,7 +203,7 @@ All via cargo:
 cargo fmt --check                          # formatting
 cargo clippy --all-targets -- -D warnings  # lints
 cargo test                                 # unit + property + concurrency + TOON goldens
-BAGE_LSP_REAL_TEST=1 cargo test            # + real-server tier (rust-analyzer, gopls, clangd, pyright on PATH)
+BAGE_LSP_REAL_TEST=1 cargo test            # + real-server tier (rust-analyzer, gopls, pyright on PATH)
 ```
 
 ## Dogfooding

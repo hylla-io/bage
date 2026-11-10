@@ -9,11 +9,9 @@
 # orchestrator builds + `docker exec`s into to drive bage on the mounted repo.
 #
 # Language servers included: gopls (Go), rust-analyzer (Rust), pyright (Python),
-# typescript-language-server (TS/TSX/JS/JSX), clangd (C/C++).
-# Java/C#/Swift LSPs are intentionally omitted here (heavy to install); their
-# real-LSP rename is covered by the testcontainers matrix (`mage lsp`). Those
-# langs are still exercised for create/show/apply/diagnose through bage's
-# built-in tree-sitter grammars — no server required.
+# typescript-language-server (TS/TSX/JS/JSX). The data and document grammars
+# are exercised for create/show/apply/diagnose through bage's built-in
+# tree-sitter grammars — no server required.
 
 FROM debian:bookworm-slim
 
@@ -21,10 +19,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GOPATH=/root/go \
     PATH=/usr/local/go/bin:/root/go/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
-# --- base tooling + clangd (C/C++ LSP) + python + node ---
+# --- base tooling + python + node ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git xz-utils build-essential pkg-config \
-        clangd \
         python3 python3-pip \
         nodejs npm \
     && rm -rf /var/lib/apt/lists/*

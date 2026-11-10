@@ -138,34 +138,6 @@ const CASES: &[Case] = &[
         }),
     },
     Case {
-        name: "clangd",
-        server: &["clangd"],
-        files: &[(
-            "main.cpp",
-            "struct Base {\n  virtual ~Base();\n};\n\nstruct Derived : Base {};\n\nint main() { Derived d; return 0; }\n",
-        )],
-        probe: Some(At {
-            file: "main.cpp",
-            line: 6,
-            needle: "Derived",
-        }),
-        implementation: None,
-        type_hierarchy: Some(TypeHierarchy::Pair {
-            sub: At {
-                file: "main.cpp",
-                line: 4,
-                needle: "Derived",
-            },
-            sub_name: "Derived",
-            sup: At {
-                file: "main.cpp",
-                line: 0,
-                needle: "Base",
-            },
-            sup_name: "Base",
-        }),
-    },
-    Case {
         name: "pyright",
         server: &["pyright-langserver", "--stdio"],
         files: &[("a.py", "class A:\n    def f(self) -> int: ...\n")],
