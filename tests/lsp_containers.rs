@@ -6,9 +6,9 @@
 //! ignored rather than passed: a case that returns early still scores `ok`,
 //! which is indistinguishable from a real cross-file rename having succeeded.
 //! Each case mounts a temp fixture into
-//! the container AT THE SAME ABSOLUTE PATH as on the host, so `file://` URIs,
-//! workspace priming's filesystem walk, and the generated
-//! compile_commands.json all resolve identically on both sides. Images are
+//! the container AT THE SAME ABSOLUTE PATH as on the host, so `file://` URIs
+//! and workspace priming's filesystem walk resolve identically on both
+//! sides. Images are
 //! pinned; servers not baked into an image are installed at container start,
 //! hence the generous timeouts. Wrappers use plain `sh -c`, never a login
 //! shell: `/etc/profile` resets `PATH` and drops the image's toolchain
@@ -60,9 +60,8 @@ struct Case {
 /// Runs one case end-to-end: builds the fixture, spawns the server container
 /// over stdio, initializes at the fixture root, passes the case's declared
 /// readiness gate, requests the rename through the production
-/// `Client::rename` path (which primes the workspace and, for
-/// clangd, generates compile_commands.json), and asserts every expected file
-/// received an edit.
+/// `Client::rename` path (which primes the workspace), and asserts every
+/// expected file received an edit.
 fn run_case(case: &Case) {
     // Reaching here means the operator selected an `#[ignore]`d case on
     // purpose, so a missing gate is their mistake to see, not one to swallow
@@ -149,39 +148,6 @@ fn run_case(case: &Case) {
     }
 
     client.close().expect("close");
-    assert!(
-        !root.join("compile_commands.json").exists() || !command_mentions_clangd(&command),
-        "{}: a bage-generated compile_commands.json must be removed on close",
-        case.name
-    );
-}
-
-/// Mirror of the client's clangd detection, for the cleanup assertion.
-fn command_mentions_clangd(command: &[String]) -> bool {
-    command.iter().any(|t| t.contains("clangd"))
-}
-
-/// Verifies the generated compile_commands.json really referenced the
-/// fixture TUs before the rename ran (spot check via a fresh generation in a
-/// copy — the live one is removed by close). Kept host-only: no docker.
-#[test]
-fn compile_commands_generation_covers_fixture() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    for (rel, content) in C_FILES {
-        let p = dir.path().join(rel);
-        fs::write(&p, content).expect("fixture file");
-    }
-    let (created, _hash) = lsp::ensure_compile_commands(dir.path())
-        .expect("generate")
-        .expect("created");
-    let body = fs::read_to_string(&created).expect("read db");
-    for tu in ["util.c", "main.c"] {
-        assert!(body.contains(tu), "database must cover {tu}: {body}");
-    }
-    assert!(
-        !body.contains("util.h"),
-        "headers are not translation units: {body}"
-    );
 }
 
 /// gopls fixture: a two-file module where `Hello` is defined in a.go and
@@ -199,23 +165,9 @@ const PY_FILES: &[(&str, &str)] = &[
     ("main.py", "from lib import greet\n\nprint(greet())\n"),
 ];
 
-/// clangd fixture: two translation units sharing a header — cross-TU rename
-/// requires the generated compile_commands.json.
-const C_FILES: &[(&str, &str)] = &[
-    ("util.h", "int add(int a, int b);\n"),
-    (
-        "util.c",
-        "#include \"util.h\"\n\nint add(int a, int b) { return a + b; }\n",
-    ),
-    (
-        "main.c",
-        "#include \"util.h\"\n\nint main(void) { return add(1, 2); }\n",
-    ),
-];
-
 /// gopls: cross-file rename must land in both a.go (definition) and b.go
 /// (reference). gopls does full-workspace rename natively; this case anchors
-/// the baseline the pyright/clangd fixes are measured against.
+/// the baseline the pyright fix is measured against.
 #[test]
 #[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
 fn gopls_cross_file_rename() {
@@ -258,34 +210,5 @@ fn pyright_cross_file_rename_with_priming() {
         new_name: "hello",
         expect_in: &["lib.py", "main.py"],
         ready: None,
-    });
-}
-
-/// clangd: without a compilation database each file is an isolated TU and
-/// the rename stays single-file; the bage-generated compile_commands.json
-/// plus priming must carry it into main.c — the issue #23 fix under test.
-/// Every run starts cold: clangd persists its index under the root, and a
-/// fresh tempdir holds none.
-#[test]
-#[ignore = "needs docker: BAGE_DOCKER_LSP=1 cargo test --test lsp_containers -- --ignored"]
-fn clangd_cross_tu_rename_with_generated_compile_commands() {
-    run_case(&Case {
-        name: "clangd",
-        image: "debian:bookworm-slim",
-        server: &[
-            "sh",
-            "-c",
-            "apt-get update 1>&2 && apt-get install -y --no-install-recommends clangd 1>&2 && exec clangd",
-        ],
-        files: C_FILES,
-        target: "util.c",
-        line: 2,
-        col: 4,
-        new_name: "sum",
-        expect_in: &["util.c", "main.c"],
-        // The `add` call in main.c: resolving it means clangd has parsed and
-        // indexed the referencing TU. Without the gate a cold clangd answers
-        // with util.c's edits alone.
-        ready: Some(("main.c", 2, 24)),
     });
 }

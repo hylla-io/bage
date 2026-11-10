@@ -12,7 +12,7 @@ It is built *expressly for Hylla* (graph-driven development) but stays graph-agn
 ## Current state — GREEN
 - `mage ci` = 0, `mage race` = 0. **292 tests / 14 packages, ~78.7% coverage.** Nothing committed (dev owns git).
 - Packages: `internal/{atomicwrite, normalize, hashing(XXHasher %016x), locator, parser(+treesitter: 14 langs), wal, edit, format, session, lsp, region}`, `cmd/bage` (apply, rename), `pkg/bage` (PUBLIC API).
-- Polyglot: Go, TS, TSX, JS, Python, Rust, Java, C, C++, C#, Ruby, JSON, HTML, CSS (parse + round-trip tested; LSP rename proven live with gopls; testcontainers harness exists for containerized LSPs).
+- Polyglot: Go, TS, TSX, JS, Python, Rust, JSON, HTML, CSS (parse + round-trip tested; LSP rename proven live with gopls; testcontainers harness exists for containerized LSPs).
 
 ## Key decisions (ADRs)
 - **0001** — Båge is a linked library (not sidecar, not built-in); files-as-truth two-phase `Prepare/Commit/Rollback` + WAL; the cross-store graph+file coordinator lives in **Hylla**; Båge is **ID-blind / locator-addressed**.

@@ -109,9 +109,9 @@ pub fn open_bytes(
 /// One entry in a file's [`outline`]: a named declaration node (or, for the
 /// grammar-free text fallback, a single line). Bytes are the half-open CST
 /// range; lines are 1-based to match `EditResult` line numbering. `name` is
-/// read from the grammar's naming fields where it has them, so a C-family
-/// declaration is named after its declarator, never its return type; it is
-/// empty for an anonymous declaration or when no name is found.
+/// read from the grammar's naming fields where it has them, never from a
+/// return or field type; it is empty for an anonymous declaration or when no
+/// name is found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Symbol {
     /// The grammar node kind (e.g. "function_declaration"), or "line" for
@@ -419,9 +419,8 @@ fn is_outline_kind(lang: Lang, kind: &str, depth: usize) -> bool {
 ///
 /// A code node with no engine twin is one the grammar misread (see
 /// [`walk_decls`]) and is named by [`decl_name`] alone, exactly as v0.11.0
-/// named every code node. The grammar cannot expand macros and reads every
-/// `.h` as C, so in misread code its fields hold whatever word landed in
-/// them — a keyword, a macro, a parameter, a callee — and no field-based
+/// named every code node. In misread code the grammar's fields hold whatever
+/// word landed in them — a keyword, a parameter, a callee — and no field-based
 /// rule tells those from a name without inventing a guess per shape. Keeping
 /// the old name there changes nothing a host already relied on.
 ///
@@ -460,54 +459,29 @@ fn symbol_name(
         _ => match tn {
             None => (decl_name(n, src), decl_name_node(n, src).map(at)),
             Some(_) if is_body_kind(&n.kind) => (String::new(), None),
-            Some(t) => {
-                let (name, range) = match field_name(lang, t, src) {
-                    Some(name) => (
-                        name,
-                        field_name_node(lang, t, src).map(|x| ByteRange {
-                            start: x.start_byte(),
-                            end: x.end_byte(),
-                        }),
-                    ),
-                    None => (decl_name(n, src), decl_name_node(n, src).map(at)),
-                };
-                if is_c_family(lang) {
-                    (one_line(&name), range)
-                } else {
-                    (name, range)
-                }
-            }
+            Some(t) => match field_name(lang, t, src) {
+                Some(name) => (
+                    name,
+                    field_name_node(lang, t).map(|x| ByteRange {
+                        start: x.start_byte(),
+                        end: x.end_byte(),
+                    }),
+                ),
+                None => (decl_name(n, src), decl_name_node(n, src).map(at)),
+            },
         },
     };
     let range = range.filter(|_| !name.is_empty());
     (name, range)
 }
 
-/// C and C++, where declarations are named by following declarators.
-fn is_c_family(lang: Lang) -> bool {
-    matches!(lang, Lang::C | Lang::Cpp)
-}
-
-/// A C-family name on one line: whitespace runs collapse to one space, so a
-/// name written across lines (`operator const\n    char *`) reads as one
-/// line. A name that still holds a comment (the field-free fallback reads
-/// raw text, `class B : public ns /* why */ ::Base`) is no name: a comment
-/// is never part of a declared identifier.
-fn one_line(name: &str) -> String {
-    if name.contains("//") || name.contains("/*") {
-        return String::new();
-    }
-    name.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Whether a code node kind is the member body of a class, interface or
-/// enum (`class_body`, `interface_body`, `enum_body`, Java's
-/// `enum_body_declarations`). A body declares nothing, so it is unnamed:
-/// the name belongs to the declaration that owns the body, and borrowing the
-/// first member's name would tie the body, and every member nested under it,
-/// to whichever member happens to come first.
+/// enum (`class_body`, `interface_body`, `enum_body`). A body declares
+/// nothing, so it is unnamed: the name belongs to the declaration that owns
+/// the body, and borrowing the first member's name would tie the body, and
+/// every member nested under it, to whichever member happens to come first.
 fn is_body_kind(kind: &str) -> bool {
-    kind.ends_with("_body") || kind.ends_with("_body_declarations")
+    kind.ends_with("_body")
 }
 
 /// The TypeScript/JavaScript outline kinds whose name is a property KEY,
@@ -684,36 +658,13 @@ fn is_decimal(s: &str) -> bool {
 /// A declaration's name read from the grammar's FIELDS, or `None` when the
 /// node carries no naming field and the caller must fall back.
 ///
-/// Fields are the only reliable signal in the C family: a C, C++, C# or Java
-/// declaration starts with its return or field TYPE, so the first identifier
-/// child is the type (`Point make_point()` is not named `Point`). The `name`
-/// field wins; otherwise a `declarator` field is followed down to the
-/// declared identifier. `Some("")` means the grammar was consulted and the
-/// declarator chain ends without a name, which must not fall back to a type
-/// name.
+/// The `name` field wins where the grammar gives one; a few kinds name
+/// themselves another way (a decorator's definition, a bound expression, a
+/// property key, a Rust impl's type).
 fn field_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
     match (lang, n.kind()) {
         (Lang::Python, "decorated_definition") => {
             return field_name(lang, n.child_by_field_name("definition")?, src);
-        }
-        (Lang::Cpp, "template_declaration" | "friend_declaration") => {
-            let inner = n.named_children(&mut n.walk()).find(|c| {
-                !matches!(
-                    c.kind(),
-                    "template_parameter_list" | "requires_clause" | "comment"
-                )
-            })?;
-            // A befriended type (`friend class Vec<int>;`) is itself the name;
-            // a befriended or templated declaration is named like any other.
-            let is_type = matches!(
-                inner.kind(),
-                "type_identifier" | "template_type" | "qualified_identifier"
-            );
-            if is_type {
-                return declarator_name(lang, inner, false, src);
-            }
-            return field_name(lang, inner, src)
-                .or_else(|| declarator_name(lang, inner, false, src));
         }
         // A construct signature has no name; TypeScript's own navigation
         // tree names it `new()` (`getItemName` in `services/navigationBar`),
@@ -735,70 +686,19 @@ fn field_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
                 .or_else(|| n.child_by_field_name("property"))?;
             return Some(member_key_name(key, src));
         }
-        (Lang::CSharp, "field_declaration" | "event_field_declaration") => {
-            let decl = n
-                .named_children(&mut n.walk())
-                .find(|c| c.kind() == "variable_declaration")?;
-            return field_name(lang, decl, src);
-        }
-        (Lang::CSharp, "variable_declaration") => {
-            let first = n
-                .named_children(&mut n.walk())
-                .find(|c| c.kind() == "variable_declarator")?;
-            return Some(ts_text(first.child_by_field_name("name")?, src));
-        }
-        (Lang::CSharp, "destructor_declaration") => {
-            return Some(format!("~{}", ts_text(n.child_by_field_name("name")?, src)));
-        }
-        (Lang::CSharp, "operator_declaration") => {
-            let start = keyword_start(n, &["operator"])?;
-            let end = n.child_by_field_name("operator")?.end_byte();
-            return Some(slice_text(src, start, end));
-        }
-        (Lang::CSharp, "conversion_operator_declaration") => {
-            let start = keyword_start(n, &["implicit", "explicit", "operator"])?;
-            let end = n.child_by_field_name("type")?.end_byte();
-            return Some(slice_text(src, start, end));
-        }
-        (Lang::CSharp, "indexer_declaration") => return Some("this".to_string()),
         _ => {}
     }
-    if is_c_family(lang) {
-        return c_decl_name(lang, n, src);
-    }
-    if let Some(name) = n.child_by_field_name("name") {
-        return Some(ts_text(name, src));
-    }
-    let declarator = declarator_child(n)?;
-    Some(declarator_name(lang, declarator, false, src).unwrap_or_default())
+    n.child_by_field_name("name").map(|name| ts_text(name, src))
 }
 
 /// The node [`field_name`] reads a declaration's name from, so a host can ask
 /// a language server about the name itself rather than search the text for
 /// it. `None` where [`field_name`] falls back to [`decl_name`], and where the
-/// name is no node's text (a TypeScript construct signature's `new()`, a C#
-/// indexer's `this`).
-fn field_name_node<'t>(lang: Lang, n: TsNode<'t>, src: &[u8]) -> Option<TsNode<'t>> {
+/// name is no node's text (a TypeScript construct signature's `new()`).
+fn field_name_node(lang: Lang, n: TsNode<'_>) -> Option<TsNode<'_>> {
     match (lang, n.kind()) {
         (Lang::Python, "decorated_definition") => {
-            return field_name_node(lang, n.child_by_field_name("definition")?, src);
-        }
-        (Lang::Cpp, "template_declaration" | "friend_declaration") => {
-            let inner = n.named_children(&mut n.walk()).find(|c| {
-                !matches!(
-                    c.kind(),
-                    "template_parameter_list" | "requires_clause" | "comment"
-                )
-            })?;
-            let is_type = matches!(
-                inner.kind(),
-                "type_identifier" | "template_type" | "qualified_identifier"
-            );
-            if is_type {
-                return declarator_target(lang, inner, false, src);
-            }
-            return field_name_node(lang, inner, src)
-                .or_else(|| declarator_target(lang, inner, false, src));
+            return field_name_node(lang, n.child_by_field_name("definition")?);
         }
         (Lang::TypeScript | Lang::Tsx, "construct_signature") => return None,
         (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, kind)
@@ -814,43 +714,9 @@ fn field_name_node<'t>(lang: Lang, n: TsNode<'t>, src: &[u8]) -> Option<TsNode<'
                 .child_by_field_name("name")
                 .or_else(|| n.child_by_field_name("property"));
         }
-        (Lang::CSharp, "field_declaration" | "event_field_declaration") => {
-            let decl = n
-                .named_children(&mut n.walk())
-                .find(|c| c.kind() == "variable_declaration")?;
-            return field_name_node(lang, decl, src);
-        }
-        (Lang::CSharp, "variable_declaration") => {
-            let first = n
-                .named_children(&mut n.walk())
-                .find(|c| c.kind() == "variable_declarator")?;
-            return first.child_by_field_name("name");
-        }
-        (Lang::CSharp, "operator_declaration") => return n.child_by_field_name("operator"),
-        (Lang::CSharp, "conversion_operator_declaration") => return n.child_by_field_name("type"),
-        (Lang::CSharp, "indexer_declaration") => return None,
         _ => {}
     }
-    if let Some(name) = n.child_by_field_name("name") {
-        return Some(name);
-    }
-    if is_c_family(lang)
-        && n.child_by_field_name("type").is_some_and(|t| {
-            let word = ts_text(t, src);
-            is_word(t) && is_reserved(lang, &word) && !TYPE_KEYWORDS.contains(&word.as_str())
-        })
-    {
-        return None;
-    }
-    let decl = declarator_child(n)?;
-    if is_c_family(lang)
-        && n.kind() == "function_definition"
-        && decl.kind() == "parenthesized_declarator"
-    {
-        return n.child_by_field_name("type").filter(|t| is_word(*t));
-    }
-    let builtin_ok = is_c_family(lang) && n.kind() == "type_definition";
-    declarator_target(lang, decl, builtin_ok, src)
+    n.child_by_field_name("name")
 }
 
 /// The node [`js_expression_name`] reads its name from.
@@ -887,341 +753,9 @@ fn js_expression_name_node(n: TsNode<'_>) -> Option<TsNode<'_>> {
     bound.or_else(own)
 }
 
-/// A C or C++ declaration's name: the `name` field kept whole, else the
-/// declarator chain down to the declared identifier. A typedef may define a
-/// builtin type spelling (`typedef _Bool bool;`); no other declaration may.
-/// `None` when the node has neither a `name` nor a `declarator` field.
-///
-/// The grammar can read code it cannot expand WITHOUT an ERROR, so a clean
-/// parse still meets two shapes where the declarator slot is not the name:
-/// a keyword that names no type in the type slot (`export C_LIB_NAMESPACE
-/// {…}`, `return x;`), which declares nothing; and a definition whose
-/// declarator is bare parentheses (`do_library_init(void) {…}` after a
-/// macro return type on the line before), where the parentheses are the
-/// parameter list and the type word is the function.
-fn c_decl_name(lang: Lang, n: TsNode, src: &[u8]) -> Option<String> {
-    if let Some(name) = n.child_by_field_name("name") {
-        return Some(uncommented_text(
-            name,
-            name.start_byte(),
-            name.end_byte(),
-            src,
-        ));
-    }
-    let decl = declarator_child(n)?;
-    let ty = n.child_by_field_name("type");
-    let keyword_type = |t: TsNode| {
-        let word = ts_text(t, src);
-        is_word(t) && is_reserved(lang, &word) && !TYPE_KEYWORDS.contains(&word.as_str())
-    };
-    if ty.is_some_and(keyword_type) {
-        return Some(String::new());
-    }
-    if n.kind() == "function_definition" && decl.kind() == "parenthesized_declarator" {
-        let word = ty.filter(|t| is_word(*t)).map(|t| ts_text(t, src));
-        return Some(word.filter(|w| !is_reserved(lang, w)).unwrap_or_default());
-    }
-    let builtin_ok = n.kind() == "type_definition";
-    Some(declarator_name(lang, decl, builtin_ok, src).unwrap_or_default())
-}
-
-/// Whether `n` is a bare word: an identifier the grammar may have filed as a
-/// type.
-fn is_word(n: TsNode) -> bool {
-    matches!(n.kind(), "type_identifier" | "identifier")
-}
-
-/// The C keywords that spell a type the grammar may file as a type word
-/// (`typedef _Bool bool;`), so one in the type slot is a type, not a
-/// statement.
-const TYPE_KEYWORDS: &[&str] = &[
-    "_BitInt",
-    "_Bool",
-    "_Complex",
-    "_Decimal128",
-    "_Decimal32",
-    "_Decimal64",
-    "_Imaginary",
-    "bool",
-    "char",
-    "double",
-    "float",
-    "int",
-    "long",
-    "short",
-    "signed",
-    "unsigned",
-    "void",
-];
-
-/// The builtin type names the C and C++ grammars lex as `primitive_type` in
-/// a type position (tree-sitter-c's `primitive_type` rule). A declarator word
-/// spelled as one is no name: code the grammar read without an ERROR but
-/// could not expand leaves one in the slot (`do_library_init(void)` holds
-/// `void`). A typedef defining one holds a `primitive_type`, never a word.
-const BUILTIN_TYPES: &[&str] = &[
-    "bool",
-    "char",
-    "int",
-    "float",
-    "double",
-    "void",
-    "size_t",
-    "ssize_t",
-    "ptrdiff_t",
-    "intptr_t",
-    "uintptr_t",
-    "charptr_t",
-    "nullptr_t",
-    "max_align_t",
-    "int8_t",
-    "int16_t",
-    "int32_t",
-    "int64_t",
-    "uint8_t",
-    "uint16_t",
-    "uint32_t",
-    "uint64_t",
-    "char8_t",
-    "char16_t",
-    "char32_t",
-];
-
-/// C keywords (through C23). A declarator that reads as one is no name.
-const C_RESERVED: &[&str] = &[
-    "_Alignas",
-    "_Alignof",
-    "_Atomic",
-    "_BitInt",
-    "_Bool",
-    "_Complex",
-    "_Decimal128",
-    "_Decimal32",
-    "_Decimal64",
-    "_Generic",
-    "_Imaginary",
-    "_Noreturn",
-    "_Static_assert",
-    "_Thread_local",
-    "alignas",
-    "alignof",
-    "auto",
-    "bool",
-    "break",
-    "case",
-    "char",
-    "const",
-    "constexpr",
-    "continue",
-    "default",
-    "do",
-    "double",
-    "else",
-    "enum",
-    "extern",
-    "false",
-    "float",
-    "for",
-    "goto",
-    "if",
-    "inline",
-    "int",
-    "long",
-    "nullptr",
-    "register",
-    "restrict",
-    "return",
-    "short",
-    "signed",
-    "sizeof",
-    "static",
-    "static_assert",
-    "struct",
-    "switch",
-    "thread_local",
-    "true",
-    "typedef",
-    "typeof",
-    "typeof_unqual",
-    "union",
-    "unsigned",
-    "void",
-    "volatile",
-    "while",
-];
-
-/// The C++ keywords C lacks. They stay usable names in C: aws-lc declares
-/// variables called `template`, `public` and `this` in `.c` files.
-const CPP_RESERVED: &[&str] = &[
-    "and",
-    "and_eq",
-    "asm",
-    "bitand",
-    "bitor",
-    "catch",
-    "class",
-    "co_await",
-    "co_return",
-    "co_yield",
-    "compl",
-    "concept",
-    "const_cast",
-    "consteval",
-    "constinit",
-    "decltype",
-    "delete",
-    "dynamic_cast",
-    "explicit",
-    "export",
-    "friend",
-    "mutable",
-    "namespace",
-    "new",
-    "noexcept",
-    "not",
-    "not_eq",
-    "operator",
-    "or",
-    "or_eq",
-    "private",
-    "protected",
-    "public",
-    "reinterpret_cast",
-    "requires",
-    "static_cast",
-    "template",
-    "this",
-    "throw",
-    "try",
-    "typeid",
-    "typename",
-    "using",
-    "virtual",
-    "xor",
-    "xor_eq",
-];
-
-/// Whether `word` is a keyword of `lang`, so never a declared name. The
-/// character types C++ reserves (`wchar_t`, `char8_t`, …) are left out: they
-/// are typedefs in C, and the grammar files them as type words in both. C
-/// also refuses `operator`: C++ operator overloads in a `.h` read as C
-/// (`float operator()(uint8_t x)`) can parse without an ERROR and leave it
-/// in the declarator slot, at the cost of a C variable literally named
-/// `operator`.
-fn is_reserved(lang: Lang, word: &str) -> bool {
-    match lang {
-        Lang::C => C_RESERVED.contains(&word) || word == "operator",
-        Lang::Cpp => C_RESERVED.contains(&word) || CPP_RESERVED.contains(&word),
-        _ => false,
-    }
-}
-
-/// The first child in `n`'s `declarator` field that is a declarator. The C
-/// grammar also files an MSVC calling convention (`void __cdecl f(void);`)
-/// under that field, ahead of the real declarator, so it is passed over.
-fn declarator_child(n: TsNode) -> Option<TsNode> {
-    n.children_by_field_name("declarator", &mut n.walk())
-        .find(|c| c.kind() != "ms_call_modifier")
-}
-
-/// The identifier a C/C++/Java declarator declares, following the grammar's
-/// `declarator` field through pointer, reference, array, function,
-/// parenthesized and init declarators. Qualified, template and operator
-/// names are kept whole (`Shape::area`, `f<int>`, `operator==`). `None` when
-/// the chain ends without a name, on a keyword, or on a builtin type: a word
-/// spelled as one always, a `primitive_type` unless `builtin_ok` (a typedef
-/// may define one: `typedef _Bool bool;` files `bool` as a `primitive_type`).
-fn declarator_name(lang: Lang, d: TsNode, builtin_ok: bool, src: &[u8]) -> Option<String> {
-    let target = declarator_target(lang, d, builtin_ok, src)?;
-    Some(match target.kind() {
-        "identifier" | "field_identifier" | "type_identifier" | "primitive_type" => {
-            ts_text(target, src)
-        }
-        "qualified_identifier" => qualified_name(target, src),
-        "operator_cast" => conversion_name(target, target, src),
-        _ => uncommented_text(target, target.start_byte(), target.end_byte(), src),
-    })
-}
-
-/// The node [`declarator_name`] reads the declared name from, following the
-/// same chain and refusing the same keywords and builtin types.
-fn declarator_target<'t>(
-    lang: Lang,
-    mut d: TsNode<'t>,
-    builtin_ok: bool,
-    src: &[u8],
-) -> Option<TsNode<'t>> {
-    loop {
-        match d.kind() {
-            "identifier" | "field_identifier" | "type_identifier" => {
-                let text = ts_text(d, src);
-                let builtin = is_c_family(lang) && BUILTIN_TYPES.contains(&text.as_str());
-                return (!builtin && !is_reserved(lang, &text)).then_some(d);
-            }
-            "primitive_type" => return builtin_ok.then_some(d),
-            "operator_name"
-            | "destructor_name"
-            | "template_function"
-            | "template_method"
-            | "template_type"
-            | "structured_binding_declarator"
-            | "qualified_identifier"
-            | "operator_cast" => return Some(d),
-            // A parenthesized declarator may open with a calling convention;
-            // an attributed one carries its attributes after the declarator.
-            "parenthesized_declarator" | "reference_declarator" | "attributed_declarator" => {
-                d = d
-                    .named_children(&mut d.walk())
-                    .find(|c| c.kind() != "ms_call_modifier")?;
-            }
-            _ => match declarator_child(d) {
-                Some(next) => d = next,
-                None => d = d.child_by_field_name("name")?,
-            },
-        }
-    }
-}
-
-/// A qualified name kept whole (`Shape::area`, `inner::deep`), except that a
-/// conversion operator stops before its parameter list, as an unqualified
-/// one does: `Widget::operator bool() const` is `Widget::operator bool`.
-fn qualified_name(q: TsNode, src: &[u8]) -> String {
-    let mut inner = q;
-    while let Some(name) = inner.child_by_field_name("name") {
-        if name.kind() == "operator_cast" {
-            return conversion_name(q, name, src);
-        }
-        if name.kind() != "qualified_identifier" {
-            break;
-        }
-        inner = name;
-    }
-    uncommented_text(q, q.start_byte(), q.end_byte(), src)
-}
-
-/// A C++ conversion operator's name: from the start of `from` through the
-/// target type of the `operator_cast` `cast`, keeping any pointer or
-/// reference on it and stopping at the parameter list, so `operator const
-/// char *() const` is `operator const char *` and `operator int &()` stays
-/// distinct from `operator int()`.
-fn conversion_name(from: TsNode, cast: TsNode, src: &[u8]) -> String {
-    let mut end = cast.end_byte();
-    let mut abs = cast.child_by_field_name("declarator");
-    while let Some(a) = abs {
-        if a.kind() == "abstract_function_declarator" {
-            end = a.start_byte();
-            break;
-        }
-        abs = a
-            .named_children(&mut a.walk())
-            .find(|c| c.kind().starts_with("abstract_"));
-    }
-    uncommented_text(from, from.start_byte(), end, src)
-}
-
 /// `src[start..end]` inside node `n` with each of `n`'s comments replaced by
-/// a space, so a comment written inside a name (`Box</*n*/3>`) is not part
-/// of it. [`one_line`] then collapses the whitespace.
+/// a space, so a comment written inside a name (`Wrapper</*n*/T>`) is not
+/// part of it.
 fn uncommented_text(n: TsNode, start: usize, end: usize, src: &[u8]) -> String {
     let mut comments = Vec::new();
     collect_comments(n, &mut comments);
@@ -1248,13 +782,6 @@ fn collect_comments(n: TsNode, out: &mut Vec<(usize, usize)>) {
     for c in n.children(&mut n.walk()) {
         collect_comments(c, out);
     }
-}
-
-/// The start byte of `n`'s first anonymous keyword child among `keywords`.
-fn keyword_start(n: TsNode, keywords: &[&str]) -> Option<usize> {
-    n.children(&mut n.walk())
-        .find(|c| !c.is_named() && keywords.contains(&c.kind()))
-        .map(|c| c.start_byte())
 }
 
 /// The source text of an engine node, bounds-guarded.
@@ -2507,349 +2034,6 @@ impl !Send for BlobRef {}
             .collect()
     }
 
-    const C_SRC: &str = "\
-typedef struct Point { int x; int y; } Point;
-struct Node { struct Node *next; int (*cb)(int); };
-typedef int (*cmp_fn)(int, int);
-typedef unsigned long ulong;
-int count;
-int first, second;
-static const char *names[4];
-Point origin = {0, 0};
-int total(void) { return 0; }
-Point make_point(int x, int y) { Point p = {x, y}; return p; }
-struct Point make_struct(void) { struct Point p; return p; }
-char *dup(const char *s) { return 0; }
-unsigned long long big(void) { return 0; }
-int (*get_cmp(void))(int, int) { return 0; }
-Point decl_only(int x);
-Point *ptr_decl(void);
-";
-
-    #[test]
-    fn c_function_names_skip_the_return_type() {
-        assert_eq!(
-            names_of("a.c", C_SRC, "function_definition"),
-            [
-                "total",
-                "make_point",
-                "make_struct",
-                "dup",
-                "big",
-                "get_cmp"
-            ]
-        );
-    }
-
-    #[test]
-    fn c_declaration_names_come_from_the_declarator() {
-        assert_eq!(
-            names_of("a.c", C_SRC, "declaration"),
-            [
-                "count",
-                "first",
-                "names",
-                "origin",
-                "p",
-                "p",
-                "decl_only",
-                "ptr_decl"
-            ]
-        );
-    }
-
-    #[test]
-    fn c_typedef_and_field_names_come_from_the_declarator() {
-        assert_eq!(
-            names_of("a.c", C_SRC, "type_definition"),
-            ["Point", "cmp_fn", "ulong"]
-        );
-        assert_eq!(
-            names_of("a.c", C_SRC, "field_declaration"),
-            ["x", "y", "next", "cb"]
-        );
-    }
-
-    const CPP_SRC: &str = "\
-namespace geo {
-namespace inner::deep {
-struct Point { int x; int y; };
-}
-class Shape : public Base {
-public:
-    Shape();
-    ~Shape();
-    Point area() const;
-    virtual std::string name() const = 0;
-    Shape &operator=(const Shape &o);
-    bool operator==(const Shape &o) const;
-    operator bool() const;
-    int count;
-    static const int kMax = 4;
-    Point *ptr;
-    int &ref();
-};
-Point make_point(int x, int y) { return Point{x, y}; }
-std::string label() { return \"\"; }
-const Point &ref_point() { static Point p; return p; }
-Point *ptr_point() { return nullptr; }
-Point Shape::area() const { return Point{}; }
-Shape::Shape() {}
-Shape::~Shape() {}
-bool Shape::operator==(const Shape &o) const { return true; }
-template <typename T> T identity(T t) { return t; }
-template <typename T> class Box { T v; };
-std::vector<int> vec() { return {}; }
-auto trailing() -> int { return 0; }
-using Alias = int;
-}
-namespace {
-int hidden() { return 0; }
-}
-";
-
-    #[test]
-    fn cpp_function_names_skip_the_return_type() {
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "function_definition"),
-            [
-                "make_point",
-                "label",
-                "ref_point",
-                "ptr_point",
-                "Shape::area",
-                "Shape::Shape",
-                "Shape::~Shape",
-                "Shape::operator==",
-                "identity",
-                "vec",
-                "trailing",
-                "hidden",
-            ]
-        );
-    }
-
-    #[test]
-    fn cpp_member_names_come_from_the_declarator() {
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "field_declaration"),
-            [
-                "x",
-                "y",
-                "area",
-                "name",
-                "operator=",
-                "operator==",
-                "count",
-                "kMax",
-                "ptr",
-                "ref",
-                "v",
-            ]
-        );
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "declaration"),
-            ["Shape", "~Shape", "operator bool", "p"]
-        );
-    }
-
-    #[test]
-    fn cpp_namespaces_templates_and_aliases_are_named() {
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "namespace_definition"),
-            ["geo", "inner::deep", ""]
-        );
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "template_declaration"),
-            ["identity", "Box"]
-        );
-        assert_eq!(
-            names_of("a.cpp", CPP_SRC, "class_specifier"),
-            ["Shape", "Box"]
-        );
-        assert_eq!(names_of("a.cpp", CPP_SRC, "alias_declaration"), ["Alias"]);
-    }
-
-    const CS_FILE_SCOPED_SRC: &str = "\
-namespace Fixture.Geo;
-
-public class Point<T> : Base, IShape
-{
-    private int count;
-    private string label = \"x\", other;
-    public List<string> Items;
-    public int Prop { get; set; }
-    public event EventHandler Changed;
-    public Point(int c) { count = c; }
-    ~Point() {}
-    Point Make() { return null; }
-    int Total() { return 0; }
-    List<string> Names() { return null; }
-    int[] Arr() { return null; }
-    System.Text.StringBuilder Qualified() { return null; }
-    void IShape.Explicit() {}
-    public static Point operator +(Point a, Point b) { return a; }
-    public static implicit operator int(Point p) { return 0; }
-    public int this[int i] => 0;
-    public delegate Point Del(int x);
-}
-";
-
-    const CS_BLOCK_SRC: &str = "\
-namespace Block.Scoped
-{
-    struct S { }
-    interface IShape { Point Area(); }
-    enum Color { Red, Green }
-    record R(int A);
-}
-namespace Outer { namespace Inner { class C { } } }
-";
-
-    #[test]
-    fn csharp_method_names_skip_the_return_type() {
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "method_declaration"),
-            ["Make", "Total", "Names", "Arr", "Qualified", "Explicit"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_BLOCK_SRC, "method_declaration"),
-            ["Area"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "delegate_declaration"),
-            ["Del"]
-        );
-    }
-
-    #[test]
-    fn csharp_namespaces_keep_their_qualified_name() {
-        assert_eq!(
-            names_of(
-                "a.cs",
-                CS_FILE_SCOPED_SRC,
-                "file_scoped_namespace_declaration"
-            ),
-            ["Fixture.Geo"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_BLOCK_SRC, "namespace_declaration"),
-            ["Block.Scoped", "Outer", "Inner"]
-        );
-    }
-
-    #[test]
-    fn csharp_fields_are_named_after_their_first_declarator() {
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "field_declaration"),
-            ["count", "label", "Items"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "event_field_declaration"),
-            ["Changed"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "variable_declaration"),
-            ["count", "label", "Items", "Changed"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "property_declaration"),
-            ["Prop"]
-        );
-    }
-
-    #[test]
-    fn csharp_constructors_destructors_and_operators_are_named() {
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "constructor_declaration"),
-            ["Point"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "destructor_declaration"),
-            ["~Point"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "operator_declaration"),
-            ["operator +"]
-        );
-        assert_eq!(
-            names_of(
-                "a.cs",
-                CS_FILE_SCOPED_SRC,
-                "conversion_operator_declaration"
-            ),
-            ["implicit operator int"]
-        );
-        assert_eq!(
-            names_of("a.cs", CS_FILE_SCOPED_SRC, "indexer_declaration"),
-            ["this"]
-        );
-    }
-
-    const JAVA_SRC: &str = "\
-package fixture.geo;
-
-public class Geo<T> extends Base implements Shape {
-    private int count;
-    private String label = \"x\", other;
-    public static final List<String> NAMES = null;
-    int[] grid;
-    public Geo(int c) { this.count = c; }
-    String report() { return \"\"; }
-    int total() { return 0; }
-    List<String> names() { return null; }
-    <U> Map<String, U> generic(U u) { return null; }
-    int[] arr() { return null; }
-    java.util.List<String> qualified() { return null; }
-    void run() {}
-    interface Inner { Point make(); int CONST = 1; }
-    enum Color { RED, GREEN }
-    record Pair(int a, int b) { Pair { } }
-    @interface Ann { String value(); }
-}
-";
-
-    #[test]
-    fn java_method_names_skip_the_return_type() {
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "method_declaration"),
-            [
-                "report",
-                "total",
-                "names",
-                "generic",
-                "arr",
-                "qualified",
-                "run",
-                "make"
-            ]
-        );
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "annotation_type_element_declaration"),
-            ["value"]
-        );
-    }
-
-    #[test]
-    fn java_fields_and_constructors_are_named() {
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "field_declaration"),
-            ["count", "label", "NAMES", "grid"]
-        );
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "constant_declaration"),
-            ["CONST"]
-        );
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "constructor_declaration"),
-            ["Geo"]
-        );
-        assert_eq!(
-            names_of("A.java", JAVA_SRC, "compact_constructor_declaration"),
-            ["Pair"]
-        );
-    }
-
     #[test]
     fn python_decorated_definitions_take_the_definition_name() {
         let src = "\
@@ -2976,53 +2160,6 @@ class Keep {
         );
     }
 
-    /// `static void __cdecl do_library_init(void);` is aws-lc
-    /// `crypto/crypto.c:52`.
-    const MSVC_CALL_SRC: &str = "\
-static void __cdecl do_library_init(void);
-static void __cdecl f(void);
-void __stdcall g(int);
-int __fastcall *h(void);
-void __cdecl k(void) {}
-int (__stdcall *fp)(int);
-";
-
-    #[test]
-    fn c_msvc_calling_convention_declarations_are_named() {
-        assert_eq!(
-            names_of("a.c", MSVC_CALL_SRC, "declaration"),
-            ["do_library_init", "f", "g", "h", "fp"]
-        );
-        assert_eq!(names_of("a.c", MSVC_CALL_SRC, "function_definition"), ["k"]);
-    }
-
-    #[test]
-    fn cpp_conversion_operators_keep_their_target_type() {
-        let src = "\
-class Widget {
-public:
-    operator const char *() const;
-    operator int &();
-    operator int();
-    operator bool() const { return true; }
-};
-Widget::operator bool() const { return true; }
-Widget::operator const char *() const { return nullptr; }
-";
-        assert_eq!(
-            names_of("a.cpp", src, "declaration"),
-            ["operator const char *", "operator int &", "operator int"]
-        );
-        assert_eq!(
-            names_of("a.cpp", src, "function_definition"),
-            [
-                "operator bool",
-                "Widget::operator bool",
-                "Widget::operator const char *"
-            ]
-        );
-    }
-
     #[test]
     fn member_bodies_are_unnamed() {
         let ts = "\
@@ -3037,71 +2174,6 @@ enum E { A, B = 2 }
         assert_eq!(
             names_of("a.js", "class Box { m() {} }\n", "class_body"),
             [""]
-        );
-        let java = "\
-class Geo { int count; void run() {} }
-interface Shape { void area(); }
-enum Color { RED, GREEN; void paint() {} }
-";
-        assert_eq!(names_of("A.java", java, "class_body"), [""]);
-        assert_eq!(names_of("A.java", java, "interface_body"), [""]);
-        assert_eq!(names_of("A.java", java, "enum_body"), [""]);
-        assert_eq!(names_of("A.java", java, "enum_body_declarations"), [""]);
-        assert_eq!(names_of("A.java", java, "class_declaration"), ["Geo"]);
-    }
-
-    const CPP_ARMS_SRC: &str = "\
-struct A {
-    friend class Other;
-    friend void swap(A &a, A &b);
-    friend class Vec<int>;
-    template <> void f<int>(int);
-    void m<int>();
-    int x [[maybe_unused]];
-};
-auto [first, second] = pair();
-int y [[maybe_unused]] = 1;
-template <typename T> requires Small<T> T twice(T t) { return t; }
-template <typename T> /* doc */ T id(T t) { return t; }
-";
-
-    #[test]
-    fn cpp_friend_declarations_name_what_they_befriend() {
-        assert_eq!(
-            names_of("a.cpp", CPP_ARMS_SRC, "friend_declaration"),
-            ["Other", "swap", "Vec<int>"]
-        );
-    }
-
-    #[test]
-    fn cpp_template_ids_are_kept_whole() {
-        assert_eq!(
-            names_of("a.cpp", CPP_ARMS_SRC, "template_declaration"),
-            ["f<int>", "twice", "id"]
-        );
-        assert_eq!(
-            names_of("a.cpp", CPP_ARMS_SRC, "field_declaration"),
-            ["m<int>", "x"]
-        );
-    }
-
-    #[test]
-    fn cpp_structured_and_attributed_declarators_are_named() {
-        assert_eq!(
-            names_of("a.cpp", CPP_ARMS_SRC, "declaration"),
-            ["swap", "f<int>", "[first, second]", "y"]
-        );
-    }
-
-    #[test]
-    fn c_typedef_of_a_builtin_spelling_is_named_after_it() {
-        assert_eq!(
-            names_of("a.c", "typedef _Bool bool;\n", "type_definition"),
-            ["bool"]
-        );
-        assert_eq!(
-            names_of("a.c", "typedef SSIZE_T ssize_t;\n", "type_definition"),
-            ["ssize_t"]
         );
     }
 
@@ -3126,79 +2198,6 @@ class Box {
             names_of("a.ts", src, "construct_signature"),
             ["new()", "new()"]
         );
-    }
-
-    #[test]
-    fn cpp_nested_qualified_conversion_operator_stops_at_its_parameters() {
-        let src = "\
-namespace ns { struct Widget { operator bool() const; }; }
-ns::Widget::operator bool() const { return true; }
-";
-        assert_eq!(
-            names_of("a.cpp", src, "function_definition"),
-            ["ns::Widget::operator bool"]
-        );
-    }
-
-    #[test]
-    fn cpp_conversion_operator_written_across_lines_is_one_line() {
-        let src = "\
-class Widget {
-public:
-    operator const
-        char *() const;
-    operator   int  &();
-};
-";
-        assert_eq!(
-            names_of("a.cpp", src, "declaration"),
-            ["operator const char *", "operator int &"]
-        );
-    }
-
-    /// aws-lc `ssl/ssl_test.cc:1779` writes a base class across lines; the
-    /// field-free fallback reads raw text, so its name is put on one line,
-    /// and a comment inside it leaves no name at all.
-    #[test]
-    fn cpp_fallback_names_are_one_line_and_hold_no_comment() {
-        let src = "\
-class A : public testing::TestWithParam<
-          std::tuple<int, long>> {};
-class B : public ns /* why */ ::Base {};
-";
-        assert_eq!(
-            names_of("a.cpp", src, "base_class_clause"),
-            ["testing::TestWithParam< std::tuple<int, long>>", ""]
-        );
-    }
-
-    #[test]
-    fn cpp_whole_names_for_nested_namespaces_specializations_and_division() {
-        let src = "\
-namespace a::b::c { int x; }
-template <> struct Box<int> { int v; };
-struct Frac {
-    Frac operator/(Frac b) const;
-    Frac &operator/=(Frac b);
-};
-";
-        assert_eq!(names_of("a.cpp", src, "namespace_definition"), ["a::b::c"]);
-        assert_eq!(names_of("a.cpp", src, "struct_specifier")[0], "Box<int>");
-        assert_eq!(
-            names_of("a.cpp", src, "field_declaration")[1..],
-            ["operator/", "operator/="]
-        );
-    }
-
-    #[test]
-    fn c_names_that_are_cpp_keywords_stay_names_in_c() {
-        let src = "\
-void f(void) {
-  CONF_VALUE template;
-  const vec_t this = prod[0];
-}
-";
-        assert_eq!(names_of("a.c", src, "declaration"), ["template", "this"]);
     }
 
     /// The first outline symbol of `kind` starting on 1-based `line` of a
@@ -3236,574 +2235,8 @@ void f(void) {
         name
     }
 
-    /// aws-lc `crypto/crypto.c:62`: the macro return type ends a misread
-    /// item of its own, and the definition after it is a clean item the
-    /// grammar reads with `do_library_init` as the type and `(void)` as a
-    /// parenthesized declarator holding `void`.
-    #[test]
-    fn c_definition_with_a_macro_return_type_is_named_after_the_function() {
-        let src = "\
-static void OPENSSL_CDECL do_library_init(void) {
-#if defined(NEED_CPUID)
-  OPENSSL_cpuid_setup();
-#endif
-}
-";
-        let (name, misread) = symbol_at("a.c", src, "function_definition", 1);
-        assert_eq!((name.as_str(), misread), ("do_library_init", false));
-    }
-
-    /// libFuzzer `FuzzerCommand.h`, a C++ header read as C: a constructor's
-    /// member initializer, two lambdas and an `auto` variable.
-    const FUZZER_COMMAND_H: &str = "\
-namespace fuzzer {
-
-class Command final {
-public:
-  static inline const char *ignoreRemainingArgs() {
-    return \"-ignore_remaining_args=1\";
-  }
-
-  Command() : CombinedOutAndErr(false) {}
-
-  bool hasFlag(const std::string &Flag) const {
-    std::string Arg(\"-\" + Flag + \"=\");
-    auto IsMatch = [&](const std::string &Other) {
-      return Arg.compare(0, std::string::npos, Other, 0, Arg.length()) == 0;
-    };
-    return std::any_of(Args.begin(), endMutableArgs(), IsMatch);
-  }
-
-  std::string getFlagValue(const std::string &Flag) const {
-    auto i = endMutableArgs();
-    auto j = std::find_if(Args.begin(), i, IsMatch);
-    return result;
-  }
-};
-
-}  // namespace fuzzer
-";
-
-    /// Every expected name in the misread tests below is what the bage
-    /// 0.11.0 binary's `show --format json` names that block of the same
-    /// bytes: a misread keeps its v0.11.0 name exactly, whatever word that
-    /// was.
-    #[test]
-    fn cpp_read_as_c_keeps_its_v0_11_0_names() {
-        let f = "FuzzerCommand.h";
-        assert_eq!(
-            misread_name_at(f, FUZZER_COMMAND_H, "function_definition", 9),
-            "CombinedOutAndErr"
-        );
-        assert_eq!(
-            misread_name_at(f, FUZZER_COMMAND_H, "function_definition", 13),
-            "IsMatch"
-        );
-        assert_eq!(misread_name_at(f, FUZZER_COMMAND_H, "declaration", 21), "j");
-    }
-
-    /// libFuzzer `FuzzerTracePC.h:272`.
-    #[test]
-    fn cpp_lambda_read_as_c_keeps_its_v0_11_0_name() {
-        let src = "\
-class TracePC {
-  // Step function, grows similar to 8 * Log_2(A).
-  auto StackDepthStepFunction = [](size_t A) -> size_t {
-    if (!A)
-      return A;
-    auto Log2 = Log(A);
-    return (Log2 + 1) * 8 + ((A >> Log2) & 7);
-  };
-};
-";
-        assert_eq!(
-            misread_name_at("FuzzerTracePC.h", src, "function_definition", 3),
-            "StackDepthStepFunction"
-        );
-    }
-
-    /// aws-lc `include/openssl/span.h:89`: the constructors read as C run
-    /// into one declaration whose declarator slot holds `typename`.
-    #[test]
-    fn cpp_constructor_read_as_c_keeps_its_v0_11_0_name() {
-        let src = "\
-extern \"C++\" {
-
-BSSL_NAMESPACE_BEGIN
-
-template <typename T>
-class Span : private internal::SpanBase<const T> {
- private:
-  static const size_t npos = static_cast<size_t>(-1);
-
- public:
-  constexpr Span() : Span(nullptr, 0) {}
-  constexpr Span(T *ptr, size_t len) : data_(ptr), size_(len) {}
-
-  template <size_t N>
-  constexpr Span(T (&array)[N]) : Span(array, N) {}
-
-  template <
-      typename C,
-      typename = typename std::enable_if<
-          std::is_convertible<decltype(std::declval<C>().data()), T *>::value &&
-          std::is_integral<decltype(std::declval<C>().size())>::value>::type,
-      typename = typename std::enable_if<std::is_const<T>::value, C>::type>
-  Span(const C &container) : data_(container.data()), size_(container.size()) {}
-};
-
-BSSL_NAMESPACE_END
-
-}  // extern C++
-";
-        assert_eq!(misread_name_at("span.h", src, "declaration", 11), "Span");
-        // abseil `numeric/int128.h:354-356`.
-        let int128 = "\
-class int128 {
- public:
-  int128() = default;
-
-  // Constructors from arithmetic types
-  constexpr int128(int v);                 // NOLINT(runtime/explicit)
-  constexpr int128(long v);                // NOLINT(runtime/int)
-};
-";
-        for line in [6, 7] {
-            assert_eq!(
-                misread_name_at("int128.h", int128, "declaration", line),
-                "int128"
-            );
-        }
-    }
-
-    /// aws-lc `crypto/test/file_util.h:83`: the grammar invents the
-    /// declarator of `auto x = …`, so the chain ends on a MISSING node.
-    #[test]
-    fn c_auto_variable_with_an_invented_declarator_keeps_its_v0_11_0_name() {
-        let src = "\
-class TemporaryFile {
- public:
-  TemporaryFile& operator=(TemporaryFile&&other) {
-    auto old_other_path = other.path_;
-    other.path_ = {};
-    return *this;
-  }
-};
-";
-        assert_eq!(
-            misread_name_at("file_util.h", src, "declaration", 4),
-            "old_other_path"
-        );
-    }
-
-    /// libFuzzer `FuzzerTracePC.cpp:492`: the attribute macros read as a
-    /// scope, a missing `::` and an ERROR holding the comments. v0.11.0
-    /// named the declarator after that whole text, lines and comments
-    /// included, and a misread keeps it.
-    #[test]
-    fn a_qualified_name_around_an_error_keeps_its_v0_11_0_name() {
-        let src = "\
-ATTRIBUTE_INTERFACE
-ATTRIBUTE_NO_SANITIZE_ALL
-ATTRIBUTE_TARGET_POPCNT
-// Now the __sanitizer_cov_trace_const_cmp[1248] callbacks just mimic
-// the behaviour of __sanitizer_cov_trace_cmp[1248] ones.
-void __sanitizer_cov_trace_const_cmp8(uint64_t Arg1, uint64_t Arg2) {
-  fuzzer::TPC.HandleCmp(PC, Arg1, Arg2);
-}
-";
-        let f = "FuzzerTracePC.cpp";
-        assert_eq!(
-            misread_name_at(f, src, "function_definition", 1),
-            "ATTRIBUTE_INTERFACE"
-        );
-        assert_eq!(
-            misread_name_at(f, src, "function_declarator", 2),
-            "ATTRIBUTE_NO_SANITIZE_ALL\nATTRIBUTE_TARGET_POPCNT\n\
-             // Now the __sanitizer_cov_trace_const_cmp[1248] callbacks just mimic\n\
-             // the behaviour of __sanitizer_cov_trace_cmp[1248] ones.\n\
-             void __sanitizer_cov_trace_const_cmp8"
-        );
-    }
-
-    /// aws-lc `ssl/ssl_version_test.cc:15`: `class` read as a scope, so the
-    /// base class is the `name` field of the definition's declarator.
-    #[test]
-    fn a_class_head_misread_as_a_qualified_definition_keeps_its_v0_11_0_name() {
-        let src = "\
-BSSL_NAMESPACE_BEGIN
-
-// SSLVersionTest executes its test cases under all available protocol
-// versions.
-class SSLVersionTest
-    : public ::testing::TestWithParam<::std::tuple<VersionParam, int>> {
- protected:
-  void SetUp() { ResetContexts(); }
-};
-";
-        assert_eq!(
-            misread_name_at("ssl_version_test.cc", src, "function_definition", 1),
-            "BSSL_NAMESPACE_BEGIN"
-        );
-    }
-
-    /// aws-lc ML-DSA `poly.c:659` and `builtin_curves.h:16`: an unexpanded
-    /// alignment or unused macro leaves the builtin type in the declarator
-    /// slot.
-    #[test]
-    fn a_misread_builtin_type_in_the_declarator_slot_keeps_its_v0_11_0_name() {
-        let src = "\
-void mld_poly_uniform(mld_poly *a)
-{
-  unsigned int ctr;
-  MLD_ALIGN uint8_t buf[MLD_POLY_UNIFORM_NBLOCKS * MLD_STREAM128_BLOCKBYTES];
-  mld_xof128_ctx state;
-}
-";
-        assert_eq!(
-            misread_name_at("poly.c", src, "declaration", 4),
-            "MLD_ALIGN"
-        );
-        let curves = "\
-OPENSSL_UNUSED static const uint64_t kP224B[] = {
-    0x270b39432355ffb4, 0x5044b0b7d7bfd8ba,
-};
-";
-        assert_eq!(
-            misread_name_at("builtin_curves.h", curves, "declaration", 1),
-            "OPENSSL_UNUSED"
-        );
-    }
-
-    /// aws-lc `crypto/test/file_test.h:81`: an enum in a class read as C
-    /// gets an invented declarator; the declaration still declares its tag.
-    #[test]
-    fn a_tag_with_an_invented_declarator_keeps_its_v0_11_0_name() {
-        let src = "\
-class FileTest {
- public:
-  enum ReadResult {
-    kReadSuccess,
-    kReadEOF,
-    kReadError,
-  };
-};
-";
-        assert_eq!(
-            misread_name_at("file_test.h", src, "declaration", 3),
-            "ReadResult"
-        );
-    }
-
-    /// libFuzzer `FuzzerCorpus.h:52-65, 171-174`: statements read as field
-    /// declarations, and a range-for.
-    #[test]
-    fn statements_read_as_declarations_keep_their_v0_11_0_names() {
-        let src = "\
-struct InputCorpus {
-  bool DeleteFeatureFreq(uint32_t Idx) {
-    if (FeatureFreqs.empty())
-      return false;
-    auto Lower = std::lower_bound(FeatureFreqs.begin(), FeatureFreqs.end(),
-                                  std::pair<uint32_t, uint16_t>(Idx, 0));
-    if (Lower != FeatureFreqs.end() && Lower->first == Idx) {
-      FeatureFreqs.erase(Lower);
-      return true;
-    }
-    return false;
-  }
-  ~InputCorpus() {
-    for (auto II : Inputs)
-      delete II;
-  }
-};
-";
-        let f = "FuzzerCorpus.h";
-        for (kind, line, name) in [
-            ("field_declaration", 4, "return"),
-            ("field_declaration", 5, "Lower"),
-            ("field_declaration", 7, "if"),
-            ("field_declaration", 9, "return"),
-            ("declaration", 14, "II"),
-        ] {
-            assert_eq!(misread_name_at(f, src, kind, line), name, "line {line}");
-        }
-    }
-
-    /// aws-lc `crypto/test/abi_test.h:40-41`: C++ operators in a `.h` read
-    /// as C.
-    #[test]
-    fn cpp_operators_read_as_c_keep_their_v0_11_0_names() {
-        let src = "\
-struct alignas(16) Reg128 {
-  bool operator==(const Reg128 &x) const { return x.lo == lo && x.hi == hi; }
-  uint64_t lo, hi;
-};
-";
-        assert_eq!(
-            misread_name_at("abi_test.h", src, "function_definition", 2),
-            "operator"
-        );
-        let index = "\
-struct Corpus {
-  const Unit &operator[] (size_t Idx) const { return Inputs[Idx]->U; }
-};
-";
-        for (kind, name) in [
-            ("field_declaration", "Unit"),
-            ("function_declarator", "operator"),
-        ] {
-            assert_eq!(misread_name_at("FuzzerCorpus.h", index, kind, 2), name);
-        }
-    }
-
-    /// aws-lc `ssl/internal.h:4161`, `crypto/test/test_util.h:34`,
-    /// `ssl/test/settings_writer.h:15`; libFuzzer `FuzzerDictionary.h:56`,
-    /// `FuzzerCorpus.h:31`.
-    #[test]
-    fn cpp_members_read_as_c_keep_their_v0_11_0_names() {
-        let init = "struct ssl_st {\n  long verify_result = X509_V_ERR_INVALID_CALL;\n};\n";
-        assert_eq!(
-            misread_name_at("internal.h", init, "field_declaration", 2),
-            "X509_V_ERR_INVALID_CALL"
-        );
-        let label =
-            "struct SettingsWriter {\n public:\n  SettingsWriter();\n\n  bool Commit();\n};\n";
-        assert_eq!(
-            misread_name_at("settings_writer.h", label, "field_declaration", 2),
-            "public"
-        );
-        let ctor = "\
-class DictionaryEntry {
- public:
-  DictionaryEntry() {}
-  DictionaryEntry(Word W) : W(W) {}
-  DictionaryEntry(Word W, size_t PositionHint)
-      : W(W), PositionHint(PositionHint) {}
-  const Word &GetW() const { return W; }
-
-  bool HasPositionHint() const {
-    return PositionHint != std::numeric_limits<size_t>::max();
-  }
-  size_t GetPositionHint() const {
-    assert(HasPositionHint());
-    return PositionHint;
-  }
-};
-";
-        assert_eq!(
-            misread_name_at("FuzzerDictionary.h", ctor, "function_definition", 4),
-            "DictionaryEntry"
-        );
-        assert_eq!(
-            misread_name_at("FuzzerDictionary.h", ctor, "declaration", 14),
-            "return"
-        );
-        let bytes = "\
-struct Bytes {
-  Bytes(const uint8_t *data_arg, size_t len_arg) : span_(data_arg, len_arg) {}
-  Bytes(const char *data_arg, size_t len_arg)
-      : span_(reinterpret_cast<const uint8_t *>(data_arg), len_arg) {}
-
-  explicit Bytes(const char *str)
-      : span_(reinterpret_cast<const uint8_t *>(str), strlen(str)) {}
-  explicit Bytes(const std::string &str)
-      : span_(reinterpret_cast<const uint8_t *>(str.data()), str.size()) {}
-  explicit Bytes(bssl::Span<const uint8_t> span) : span_(span) {}
-
-  bssl::Span<const uint8_t> span_;
-};
-";
-        for (line, name) in [(2, "data_arg"), (6, "Bytes")] {
-            assert_eq!(
-                misread_name_at("test_util.h", bytes, "field_declaration", line),
-                name,
-                "line {line}"
-            );
-        }
-        let scoped = "\
-namespace fuzzer {
-
-struct InputInfo {
-  Unit U;  // The actual input data.
-  std::chrono::microseconds TimeOfUnit;
-  uint8_t Sha1[kSHA1NumBytes];  // Checksum.
-};
-
-}  // namespace fuzzer
-";
-        assert_eq!(
-            misread_name_at("FuzzerCorpus.h", scoped, "field_declaration", 5),
-            "std"
-        );
-        let options = "\
-struct FuzzingOptions {
-  bool EntropicScalePerExecTime = false;
-  std::string OutputCorpus;
-  std::string ArtifactPrefix = \"./\";
-};
-";
-        for line in [3, 4] {
-            assert_eq!(
-                misread_name_at("FuzzerOptions.h", options, "field_declaration", line),
-                "std"
-            );
-        }
-    }
-
-    /// libFuzzer `FuzzerTracePC.h:238`: a method defined out of line, glued
-    /// to a `::` the C grammar cannot read.
-    #[test]
-    fn cpp_out_of_line_method_read_as_c_keeps_its_v0_11_0_name() {
-        let src = "\
-class TracePC {
- public:
-  size_t CollectFeatures(Callback HandleFeature) const;
-};
-
-inline size_t TracePC::CollectFeatures(Callback HandleFeature) const {
-  return 0;
-}
-";
-        assert_eq!(
-            misread_name_at("FuzzerTracePC.h", src, "function_definition", 6),
-            "TracePC"
-        );
-    }
-
-    /// aws-lc `ssl/ssl_common_test.h:143`, libFuzzer `FuzzerCommand.h:37`,
-    /// aws-lc `crypto/test/test_util.h:97`: what lands in the declarator slot
-    /// is a template argument, a member being initialized, or a callee.
-    #[test]
-    fn cpp_heads_read_as_c_keep_their_v0_11_0_names() {
-        let head = "class SSLTest : public testing::TestWithParam<SSLTestParam> {};\n";
-        assert_eq!(
-            misread_name_at("ssl_common_test.h", head, "function_definition", 1),
-            "class"
-        );
-        // aws-lc `ssl/internal.h:1288`: the export macro lands in the slot
-        // and the class name in the ERROR after it.
-        let exported = "\
-#define SSLBUFFER_MAX_CAPACITY INT_MAX
-class OPENSSL_EXPORT SSLBuffer {
- public:
-  SSLBuffer() {}
-  ~SSLBuffer() { Clear(); }
-};
-";
-        assert_eq!(
-            misread_name_at("internal.h", exported, "function_definition", 2),
-            "class"
-        );
-        let init = "\
-class Command final {
-public:
-  Command() : CombinedOutAndErr(false) {}
-
-  explicit Command(const std::vector<std::string> &ArgsToAdd)
-      : Args(ArgsToAdd), CombinedOutAndErr(false) {}
-};
-";
-        assert_eq!(
-            misread_name_at("FuzzerCommand.h", init, "function_definition", 5),
-            "explicit"
-        );
-        let body = "\
-struct FileCloser {
-  void operator()(FILE *f) const { fclose(f); }
-};
-";
-        assert_eq!(
-            misread_name_at("test_util.h", body, "field_declaration", 2),
-            "const"
-        );
-    }
-
-    /// aws-lc `ssl/ssl_x509.cc:1259`: the macro return type ends a
-    /// declaration of its own, its `;` invented, with the macro argument in
-    /// the declarator slot.
-    #[test]
-    fn a_macro_call_cut_off_as_a_declaration_keeps_its_v0_11_0_name() {
-        let src = "\
-static void set_client_CA_list(void) {
-  sk_X509_NAME_pop_free(name_list, X509_NAME_free);
-}
-
-static STACK_OF(X509_NAME) *buffer_names_to_x509(
-    const STACK_OF(CRYPTO_BUFFER) *names, STACK_OF(X509_NAME) **cached) {
-  if (names == NULL) {
-    return NULL;
-  }
-  return NULL;
-}
-";
-        assert_eq!(
-            misread_name_at("ssl_x509.cc", src, "declaration", 5),
-            "STACK_OF"
-        );
-    }
-
-    /// aws-lc `crypto/rand_extra/windows.c:58`: the unexpanded `WINAPI`
-    /// macro makes the declarator an ERROR, and v0.11.0 named the typedef
-    /// after its return type.
-    #[test]
-    fn a_misread_typedef_keeps_its_v0_11_0_name() {
-        let src = "typedef BOOL (WINAPI *ProcessPrngFunction)(PBYTE pbData, SIZE_T cbData);\n";
-        assert_eq!(misread_name_at("a.c", src, "type_definition", 1), "BOOL");
-    }
-
-    /// mimalloc `include/mimalloc.h:183`: the calling-convention macro
-    /// inside the parentheses is an ERROR.
-    #[test]
-    fn a_macro_calling_convention_in_parentheses_keeps_its_v0_11_0_name() {
-        let src = "typedef void (mi_cdecl mi_output_fun)(const char* msg, void* arg);\n";
-        let f = "mimalloc.h";
-        assert_eq!(misread_name_at(f, src, "type_definition", 1), "");
-        assert_eq!(
-            misread_name_at(f, src, "function_declarator", 1),
-            "mi_output_fun"
-        );
-    }
-
-    /// c-ares `ares.h:495, 566`: the deprecation macro makes the grammar
-    /// read on past the declaration, and `struct iovec;` gets an invented
-    /// declarator.
-    #[test]
-    fn a_tag_declaration_with_an_invented_declarator_keeps_its_v0_11_0_name() {
-        let src = "\
-CARES_EXTERN CARES_DEPRECATED_FOR(ares_init_options) int ares_init(
-  ares_channel_t **channelptr);
-
-CARES_EXTERN int ares_library_initialized(void);
-
-struct iovec;
-
-struct ares_socket_functions {
-  ares_socket_t (*asocket)(int, int, int, void *);
-};
-";
-        assert_eq!(misread_name_at("ares.h", src, "declaration", 6), "iovec");
-    }
-
-    /// c-ares `ares.h:1208`: a declaration whose own nodes are all sound
-    /// but which sits inside an ERROR.
-    #[test]
-    fn a_declaration_inside_an_error_keeps_its_v0_11_0_name() {
-        let src = "\
-CARES_EXTERN CARES_DEPRECATED_FOR(ares_dns_record_create) int ares_mkquery(
-  const char *name, int dnsclass, int type, unsigned short id, int rd,
-  unsigned char **buf, int *buflen);
-
-CARES_EXTERN ares_bool_t
-ares_threadsafety(void);
-";
-        assert_eq!(
-            misread_name_at("ares.h", src, "declaration", 6),
-            "ares_threadsafety"
-        );
-    }
-
-    /// The rule is the same for every grammar: a TypeScript interface
+    /// A misread keeps the name the bage 0.11.0 binary's `show --format
+    /// json` gave that block of the same bytes: a TypeScript interface
     /// holding a syntax error keeps the names v0.11.0 gave its members.
     #[test]
     fn a_misread_typescript_interface_keeps_its_v0_11_0_names() {
@@ -3820,195 +2253,121 @@ interface Ctor {
         );
     }
 
-    /// A misread is scoped to the top-level item holding it: the item
-    /// beside it is named from its fields, and every block inside the
-    /// misread item keeps its v0.11.0 name, even one whose own nodes are
-    /// sound.
-    #[test]
-    fn a_misread_is_scoped_to_its_top_level_item() {
-        let src = "\
-typedef void (mi_cdecl mi_output_fun)(const char* msg, void* arg);
-Point make_point(int x, int y);
-";
-        assert!(symbol_at("a.h", src, "type_definition", 1).1);
-        let (name, misread) = symbol_at("a.h", src, "declaration", 2);
-        assert_eq!((name.as_str(), misread), ("make_point", false));
-        let cpp = "\
-namespace geo {
-Point make_point(int x, int y);
-int broken( ;
-}
-";
-        assert_eq!(
-            misread_name_at("a.cpp", cpp, "declaration", 2),
-            "Point",
-            "a sound declaration in a misread namespace"
-        );
-    }
-
-    /// aws-lc `include/openssl/pool.h:4-5, 23-27, 80-97`: the `extern "C"`
-    /// braces split across `#if` arms inside the include guard leave the
-    /// whole root an ERROR, so no top-level item is a unit the grammar read,
-    /// however clean its own nodes. The declaration here holds no ERROR yet
-    /// keeps its v0.11.0 name.
-    #[test]
-    fn every_item_under_an_error_root_keeps_its_v0_11_0_name() {
-        let src = "\
-#ifndef OPENSSL_HEADER_POOL_H
-#define OPENSSL_HEADER_POOL_H
-
-#if defined(__cplusplus)
-extern \"C\" {
-#endif
-
-DEFINE_STACK_OF(CRYPTO_BUFFER)
-
-OPENSSL_EXPORT CRYPTO_BUFFER_POOL* CRYPTO_BUFFER_POOL_new(void);
-
-#if defined(__cplusplus)
-}  // extern C
-
-extern \"C++\" {
-
-BSSL_NAMESPACE_BEGIN
-
-BORINGSSL_MAKE_DELETER(CRYPTO_BUFFER_POOL, CRYPTO_BUFFER_POOL_free)
-
-BSSL_NAMESPACE_END
-
-}  // extern C++
-
-#endif
-
-#endif  // OPENSSL_HEADER_POOL_H
-";
-        let dir = tempfile::tempdir().unwrap();
-        let opened = open_file(&write_temp(&dir, "pool.h", src.as_bytes())).unwrap();
-        let root = opened.tree.native_root().expect("a code grammar");
-        assert!(root.is_error(), "the root must be an ERROR");
-        let item = root
-            .children(&mut root.walk())
-            .find(|c| c.kind() == "declaration" && c.start_position().row == 9)
-            .expect("the declaration is a top-level item");
-        assert!(!item.has_error(), "the item itself must read clean");
-        assert_eq!(
-            misread_name_at("pool.h", src, "declaration", 10),
-            "CRYPTO_BUFFER_POOL"
-        );
-    }
-
-    /// The grammar can read code it cannot expand without an ERROR, leaving
-    /// a keyword or builtin type where the name goes: aws-lc
-    /// `crypto/evp_extra/p_dh_asn1.c:173` reads a macro statement and an
-    /// `if` as a nested definition, mlx's `backend/cpu/unary_ops.h:171` a C++
-    /// `operator()` and `backend/metal/kernels/fp8.h:74` `operator float()`
-    /// in a `.h` read as C, libstdc++'s `bits/std.cc:3826` `export
-    /// C_LIB_NAMESPACE {…}` with `export` in the type slot, and a macro
-    /// call read as a declaration of `uint8_t`. None is named after the
-    /// keyword, the builtin or the type; v0.11.0 named them
-    /// `SET_DIT_AUTO_RESET`, `operator`, `operator`, `export` and
-    /// `CONSTEXPR_ARRAY`.
-    #[test]
-    fn a_clean_parse_is_never_named_after_a_keyword_or_builtin_type() {
-        let evp = "\
-int EVP_PKEY_set1_DH(EVP_PKEY *pkey, DH *key) {
-  SET_DIT_AUTO_RESET
-  if (EVP_PKEY_assign_DH(pkey, key)) {
-    DH_up_ref(key);
-    return 1;
-  }
-  return 0;
-}
-";
-        assert_eq!(
-            names_of("a.c", evp, "function_definition"),
-            ["EVP_PKEY_set1_DH", ""]
-        );
-        let op = "float operator()(uint8_t x) {\n  return 0;\n}\n";
-        assert_eq!(names_of("a.h", op, "function_definition"), [""]);
-        let cast = "operator float() thread {\n  return 0;\n}\n";
-        assert_eq!(names_of("fp8.h", cast, "function_definition"), [""]);
-        let builtin = "static CONSTEXPR_ARRAY(uint8_t);\n";
-        assert_eq!(names_of("a.h", builtin, "declaration"), [""]);
-        let export = "export C_LIB_NAMESPACE\n{\n  using std::isalnum;\n}\n";
-        assert_eq!(names_of("a.cc", export, "function_definition"), [""]);
-    }
-
-    /// A definition whose declarator is bare parentheses reads cleanly when
-    /// its return type is a macro on the line before (aws-lc
-    /// `crypto/crypto.c:61-62`, mimalloc `src/init.c:575`): the parentheses
-    /// are the parameter list and the word in the type slot is the function.
-    #[test]
-    fn a_clean_definition_with_bare_parentheses_is_named_after_the_type_word() {
-        let src = "do_library_init(void) {\n}\n_mi_preloading(void) {\n  return 0;\n}\n";
-        assert_eq!(
-            names_of("a.c", src, "function_definition"),
-            ["do_library_init", "_mi_preloading"]
-        );
-    }
-
-    /// A type keyword the grammar files as a type word is a type, never a
-    /// function, so bare parentheses after one name nothing.
-    #[test]
-    fn a_type_keyword_before_bare_parentheses_is_no_name() {
-        let src = "_Bool (x) {\n  return 0;\n}\n";
-        assert_eq!(names_of("a.c", src, "function_definition"), [""]);
-    }
-
-    /// A builtin type in the name slot outside a typedef declares nothing,
-    /// so a specialization that only spells one is unnamed.
-    #[test]
-    fn a_builtin_type_outside_a_typedef_is_no_name() {
-        assert_eq!(
-            names_of("a.cpp", "template <> int;\n", "template_declaration"),
-            [""]
-        );
-    }
-
-    /// A comment inside a name is not part of it, and the space it leaves
-    /// keeps the tokens on either side apart.
-    #[test]
-    fn a_comment_inside_a_cpp_name_is_left_out_of_it() {
-        let src = "\
-template <> struct Box</*n*/3> { int v; };
-void ns /* why */ ::f() {}
-struct F { F &operator /* x */ =(const F &); };
-";
-        assert_eq!(names_of("a.cpp", src, "struct_specifier")[0], "Box< 3>");
-        assert_eq!(names_of("a.cpp", src, "function_definition"), ["ns ::f"]);
-        assert_eq!(names_of("a.cpp", src, "field_declaration")[1], "operator =");
-    }
-
     /// `Tree::root` is public, so a caller can hand [`outline`] a tree that
     /// no longer matches its engine tree. A node is then never named from
     /// another node's fields: one whose twin is missing or of another kind
-    /// keeps its v0.11.0 name.
+    /// keeps its v0.11.0 name, which for a decorated definition is its
+    /// decorator's.
     #[test]
     fn a_node_is_never_named_from_a_twin_that_does_not_line_up() {
         let src = "\
-int f(void) {
-  return 0;
-}
-Point make_point(int x, int y);
-Point other(int z);
+x = 1
+@deco
+def make_point():
+    pass
+@deco
+def other():
+    pass
 ";
         let dir = tempfile::tempdir().unwrap();
         let named = |edit: fn(&mut Vec<Node>)| {
-            let mut opened = open_file(&write_temp(&dir, "a.c", src.as_bytes())).unwrap();
+            let mut opened = open_file(&write_temp(&dir, "a.py", src.as_bytes())).unwrap();
             edit(&mut opened.tree.root.children);
             outline(&opened.tree, opened.lang)
                 .into_iter()
-                .filter(|s| s.kind == "declaration")
+                .filter(|s| s.kind == "decorated_definition")
                 .map(|s| s.name)
                 .collect::<Vec<_>>()
         };
         assert_eq!(named(|_| {}), ["make_point", "other"]);
         assert_eq!(
             named(|c| c.swap(0, 1)),
-            ["Point", "other"],
+            ["deco", "other"],
             "a kind mismatch"
         );
-        assert_eq!(named(|c| drop(c.remove(1))), ["Point"], "a count mismatch");
+        assert_eq!(named(|c| drop(c.remove(1))), ["deco"], "a count mismatch");
+    }
+
+    /// A misread is scoped to the top-level item holding it: the item
+    /// beside it is named from its fields, and every block inside the
+    /// misread item keeps its v0.11.0 name, even one whose own nodes are
+    /// sound. A decorated definition shows which rule named it: its fields
+    /// name the def, its first identifier is the decorator.
+    #[test]
+    fn a_misread_is_scoped_to_its_top_level_item() {
+        let src = "\
+@deco
+def make_point():
+    pass
+class Geo:
+    @deco
+    def inner(self):
+        pass
+    def broken(:
+        pass
+";
+        assert_eq!(
+            symbol_at("a.py", src, "decorated_definition", 1),
+            ("make_point".to_string(), false),
+            "a clean item beside a misread one"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let opened = open_file(&write_temp(&dir, "a.py", src.as_bytes())).unwrap();
+        let root = opened.tree.native_root().expect("a code grammar");
+        let body = root
+            .child(1)
+            .and_then(|class| class.child_by_field_name("body"))
+            .expect("the class has a body");
+        let inner = body
+            .children(&mut body.walk())
+            .find(|c| c.kind() == "decorated_definition")
+            .expect("the class holds a decorated definition");
+        assert!(!inner.has_error(), "the inner block itself must read clean");
+        assert_eq!(
+            misread_name_at("a.py", src, "decorated_definition", 5),
+            "deco",
+            "a sound block in a misread class"
+        );
+        let clean = src.replace("    def broken(:\n        pass\n", "");
+        assert_eq!(
+            symbol_at("a.py", &clean, "decorated_definition", 5),
+            ("inner".to_string(), false),
+            "the same block in a clean class"
+        );
+    }
+
+    /// Brackets left open deeper than tree-sitter's error recovery looks
+    /// back leave the parser still recovering at the end of the file, so it
+    /// wraps the whole file in an ERROR root. No top-level item is then a
+    /// unit the grammar read, however clean its own nodes: the decorated
+    /// definition here holds no ERROR yet keeps its v0.11.0 name.
+    #[test]
+    fn every_item_under_an_error_root_keeps_its_v0_11_0_name() {
+        let clean = "\
+@deco
+def make_point():
+    pass
+";
+        let src = format!("{clean}x = ((((((((((((((((((((1 :\n");
+        let dir = tempfile::tempdir().unwrap();
+        let opened = open_file(&write_temp(&dir, "a.py", src.as_bytes())).unwrap();
+        let root = opened.tree.native_root().expect("a code grammar");
+        assert!(root.is_error(), "the root must be an ERROR");
+        let item = root
+            .children(&mut root.walk())
+            .find(|c| c.kind() == "decorated_definition" && c.start_position().row == 0)
+            .expect("the decorated definition is a top-level item");
+        assert!(!item.has_error(), "the item itself must read clean");
+        assert_eq!(
+            misread_name_at("a.py", &src, "decorated_definition", 1),
+            "deco",
+            "a clean item under an ERROR root"
+        );
+        assert_eq!(
+            symbol_at("a.py", clean, "decorated_definition", 1),
+            ("make_point".to_string(), false),
+            "the same item under a clean root"
+        );
     }
 
     // Markdown leaf blocks are the units an agent edits a document by, so the

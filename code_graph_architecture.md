@@ -107,9 +107,6 @@ One language server per language, spoken to over JSON-RPC. Use LSPs for:
 | TypeScript | `typescript-language-server`        |
 | Python     | `pyright` or `ruff` / `pylsp`       |
 | Rust       | `rust-analyzer`                     |
-| C / C++    | `clangd`                            |
-| Java       | `jdtls`                             |
-| Ruby       | `solargraph` or `ruby-lsp`          |
 | YAML       | `yaml-language-server`              |
 | JSON       | `vscode-json-languageserver`        |
 | TOML       | `taplo`                             |

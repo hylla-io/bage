@@ -41,7 +41,7 @@ advisory and does not gate a merge.
 
 ### Docker-gated LSP suite
 
-`tests/lsp_containers.rs` drives real language servers (gopls, pyright, clangd)
+`tests/lsp_containers.rs` drives real language servers (gopls, pyright)
 in containers over stdio. The container cases are `#[ignore]`d because they
 need a running Docker daemon and pull images, so run them explicitly:
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.21.0 — C, C++, C#, Java and Ruby leave bage (source breaks)
+
+### Source breaks
+
+- `parser::Lang` drops `Java`, `C`, `Cpp`, `CSharp` and `Ruby`. An exhaustive match drops
+  their arms. `Lang::ALL` holds 16 languages; `Lang::from_name` no longer knows `java`, `c`,
+  `cpp`, `csharp` or `ruby`.
+- `lsp::ensure_compile_commands` is gone. Bage writes no build files into a server's root.
+- The `tree-sitter-c`, `tree-sitter-c-sharp`, `tree-sitter-cpp`, `tree-sitter-java` and
+  `tree-sitter-ruby` dependencies are gone.
+
+### Behaviour
+
+- `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.cs`, `.java` and `.rb` files are
+  unknown files: `Lang::for_path` returns `Lang::Text`, they parse as lossless `line` blocks, and
+  their LSP languageId is `plaintext`. A host that refuses code it cannot parse refuses them as
+  it refuses any `Lang::Text` file.
+- Outline names on the remaining code grammars are unchanged: their declarations name
+  themselves by the `name` field, and none carries a `declarator` field.
+- Every dependency is pinned exactly (`=X.Y.Z`), at the version the lock already resolved.
+
 ## 0.19.0 — declared missing tools and opt-in LSP metadata (source breaks)
 
 ### Source breaks
